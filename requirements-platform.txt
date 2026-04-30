@@ -1,0 +1,23 @@
+# Reference pins from the competition platform environment.
+# Intended for Linux/CUDA 12.6 style runners. Do not use this file directly on
+# macOS; the CUDA wheels below are not available there.
+
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+numpy==2.2.5
+pandas==2.3.3
+pyarrow==23.0.1
+pyarrow-hotfix==0.7
+datasets==2.14.7
+dill==0.3.7
+fsspec==2023.10.0
+huggingface-hub==0.17.3
+scikit-learn==1.7.2
+scipy==1.15.3
+tensorboard==2.19.0
+tqdm==4.67.3
+torch==2.7.1+cu126
+torchaudio==2.7.1+cu126
+torchvision==0.22.1+cu126
+torchmetrics==1.0.3
+transformers==4.35.0
