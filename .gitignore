@@ -21,3 +21,4 @@ env/
 .cache/
 data/
 tmp/
+runs/
