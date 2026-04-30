@@ -67,6 +67,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device', type=str,
                         default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Training device, e.g. cuda or cpu')
+    parser.add_argument('--use_compile', action='store_true', default=False,
+                        help='Enable torch.compile for the model')
+    parser.add_argument('--compile_mode', type=str, default='reduce-overhead',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode')
 
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
@@ -304,6 +309,15 @@ def main() -> None:
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
+    if args.use_compile:
+        if hasattr(torch, 'compile'):
+            try:
+                logging.info(f"Compiling model.forward with torch.compile(mode={args.compile_mode})")
+                model.forward = torch.compile(model.forward, mode=args.compile_mode)
+            except Exception:
+                logging.exception("torch.compile failed; falling back to eager model")
+        else:
+            logging.warning("torch.compile is not available in this PyTorch build")
 
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)
