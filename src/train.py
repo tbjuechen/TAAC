@@ -213,6 +213,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
+
     # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
