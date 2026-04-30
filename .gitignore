@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local environments
+.env
+.venv/
+venv/
+env/
+
+# Data/cache artifacts
+.cache/
+data/
+tmp/
