@@ -507,6 +507,6 @@ class PCVRHyFormerRankingTrainer:
             'cuda', enabled=self.use_amp, dtype=torch.bfloat16
         ):
             logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
-        logits = logits.squeeze(-1)  # (B,)
+        logits = logits.squeeze(-1).float()  # (B,)
 
         return logits, label
