@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -58,6 +59,8 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        profile_train_steps: int = 0,
+        profile_warmup_steps: int = 2,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -107,10 +110,19 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.profile_train_steps: int = profile_train_steps
+        self.profile_warmup_steps: int = max(0, profile_warmup_steps)
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        if self.profile_train_steps > 0:
+            logging.info("Training profiler enabled: steps=%s, warmup_steps=%s",
+                         self.profile_train_steps, self.profile_warmup_steps)
+
+    def _sync_if_cuda(self) -> None:
+        if self.device.startswith('cuda') and torch.cuda.is_available():
+            torch.cuda.synchronize()
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -294,14 +306,25 @@ class PCVRHyFormerRankingTrainer:
         print("Start training (PCVRHyFormer)")
         self.model.train()
         total_step = 0
+        profile_records = []
 
         for epoch in range(1, self.num_epochs + 1):
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                               dynamic_ncols=True)
             loss_sum = 0.0
+            last_step_end = time.perf_counter()
 
             for step, batch in train_pbar:
-                loss = self._train_step(batch)
+                self._sync_if_cuda()
+                batch_wait_seconds = time.perf_counter() - last_step_end
+
+                if self.profile_train_steps > 0:
+                    loss, step_profile = self._train_step(batch, profile=True)
+                    step_profile['batch_wait'] = batch_wait_seconds
+                    step_profile['total'] = batch_wait_seconds + step_profile['train_compute_total']
+                    profile_records.append(step_profile)
+                else:
+                    loss = self._train_step(batch)
                 total_step += 1
                 loss_sum += loss
 
@@ -328,6 +351,14 @@ class PCVRHyFormerRankingTrainer:
                     if self.early_stopping.early_stop:
                         logging.info(f"Early stopping at step {total_step}")
                         return
+
+                if self.profile_train_steps > 0 and total_step >= self.profile_train_steps:
+                    self._log_profile_summary(profile_records)
+                    logging.info("Training profiler reached %s steps; exiting early",
+                                 self.profile_train_steps)
+                    return
+
+                last_step_end = time.perf_counter()
 
             logging.info(f"Epoch {epoch}, Average Loss: {loss_sum / len(self.train_loader)}")
 
@@ -399,16 +430,56 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets=seq_time_buckets,
         )
 
-    def _train_step(self, batch: Dict[str, Any]) -> float:
+    def _log_profile_summary(self, records: list) -> None:
+        if not records:
+            return
+
+        warmup = min(self.profile_warmup_steps, len(records) - 1)
+        measured = records[warmup:]
+        keys = [
+            'batch_wait',
+            'to_device',
+            'make_model_input',
+            'zero_grad',
+            'forward_loss',
+            'backward',
+            'clip_grad',
+            'optimizer_step',
+            'train_compute_total',
+            'total',
+        ]
+        logging.info("Training profiler summary (%s measured steps, %s warmup skipped):",
+                     len(measured), warmup)
+        total_avg = sum(r['total'] for r in measured) / len(measured)
+        for key in keys:
+            avg = sum(r[key] for r in measured) / len(measured)
+            pct = 100.0 * avg / total_avg if total_avg > 0 else 0.0
+            logging.info("  %-20s %.4fs/step (%5.1f%%)", key, avg, pct)
+
+    def _train_step(self, batch: Dict[str, Any], profile: bool = False) -> Any:
         """Run a single training step and return the scalar loss value."""
+        profile_times: Dict[str, float] = {}
+        step_start = time.perf_counter()
+
+        t0 = time.perf_counter()
         device_batch = self._batch_to_device(batch)
+        self._sync_if_cuda()
+        profile_times['to_device'] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         label = device_batch['label'].float()
 
         self.dense_optimizer.zero_grad()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.zero_grad()
+        profile_times['zero_grad'] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         model_input = self._make_model_input(device_batch)
+        self._sync_if_cuda()
+        profile_times['make_model_input'] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         logits = self.model(model_input)  # (B, 1)
         logits = logits.squeeze(-1)  # (B,)
 
@@ -416,15 +487,31 @@ class PCVRHyFormerRankingTrainer:
             loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
         else:
             loss = F.binary_cross_entropy_with_logits(logits, label)
+        self._sync_if_cuda()
+        profile_times['forward_loss'] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         loss.backward()
+        self._sync_if_cuda()
+        profile_times['backward'] = time.perf_counter() - t0
+
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
+        t0 = time.perf_counter()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+        self._sync_if_cuda()
+        profile_times['clip_grad'] = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         self.dense_optimizer.step()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
+        self._sync_if_cuda()
+        profile_times['optimizer_step'] = time.perf_counter() - t0
+        profile_times['train_compute_total'] = time.perf_counter() - step_start
 
+        if profile:
+            return loss.item(), profile_times
         return loss.item()
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:

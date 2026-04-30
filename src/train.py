@@ -81,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
+    parser.add_argument('--profile_train_steps', type=int, default=0,
+                        help='If >0, profile the first N training steps and '
+                             'exit after printing timing breakdowns')
+    parser.add_argument('--profile_warmup_steps', type=int, default=2,
+                        help='Number of profiled steps excluded from the '
+                             'average timing summary')
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
@@ -350,6 +356,8 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        profile_train_steps=args.profile_train_steps,
+        profile_warmup_steps=args.profile_warmup_steps,
     )
 
     trainer.train()
