@@ -1,0 +1,87 @@
+# TAAC 2026 PCVR Baseline
+
+**Comp**: WWW 2026 Tencent Advertising Algorithm Competition — "Towards Unifying Sequence Modeling and Feature Interaction for Large-scale Recommendation"
+**Task**: PCVR (Post-Click Conversion Rate) binary classification, metric = AUC
+**Deadline**: 2026-05-23 AOE
+**Goal**: 单模型 test AUC 从 0.811492 → ≥ 0.825（top1 当前 0.82879）
+**Constraint**: 单模型 only（ensemble 比赛规则疑似禁止）
+
+## 主要 spec（先读这个）
+
+`docs/superpowers/specs/2026-05-01-taac-improvement-plan.md` —— 当前 v0.3，包含 W1-W3 完整作战图、关键事实表（F1-F17）、附录 A-D。**任何后续工作都从这份 spec 起步**，不要重新规划。
+
+## 仓库布局
+
+```
+src/                  ← 平台上传的代码（除 taac2026_schema.json）
+├── model.py          PCVRHyFormer 架构（multi-domain seq encoder + RankMixer + dual optimizer）
+├── dataset.py        IterableDataset，按 row group 切 train/val
+├── trainer.py        训练循环 + AMP + reinit
+├── train.py          CLI 入口
+├── run.sh            平台启动脚本
+├── utils.py          EarlyStopping / 日志
+├── ns_groups.json    NS grouping 配置（当前 run.sh 禁用它）
+└── taac2026_schema.json   ⚠️ 本地 codex 生成的 mock，**不要上传**
+
+data/demo/            1000 行 demo 数据 + mock schema.json（codex 生成，不是线上 schema）
+docs/superpowers/specs/   spec 文档主目录
+output/                本地 ckpt / log / tensorboard（gitignored）
+```
+
+## 算力 & 性能基线
+
+- **硬件**：2×H20-20%×19G，**time-slicing 虚拟化**（半夜独占可冲到 500%，白天稳定 20%）
+- **每日 test 提交配额**：3 次，**省着用**
+- **Baseline 速度**（v0.3 实测）：
+  - 原始 fp32：52 min/epoch、15-16G 显存、val 0.862173 / test 0.811492
+  - AMP only：34 min/epoch（-35%）、10-11G、val 0.862202
+  - **compile only：20 min/epoch（-62%）、val 0.862024** ← compile 是主加速器
+  - AMP+compile 叠加：**待测**（计划中 daily driver）
+- **实验预算**：理论 30-50 次完整训练；考虑虚拟化高峰损耗按 **15-25 次** 算
+
+## 当前活跃工作
+
+**Branch**：`feature/compile-training`（已合并 AMP / compile / tf32）
+**最高优先级**：W1.0.1 reinit_cardinality_threshold A/B（4h）—— 见下文 known issues
+**待跑实验**：
+1. AMP+compile 叠加 baseline（兼 W1.0.1 Run X）
+2. `--reinit_cardinality_threshold 10000`（W1.0.1 Run Y）
+3. 用 1 次每日 test 提交验证 AMP+compile 不掉点
+
+## 已知 baseline 问题（v0.3 spec F15-F17）
+
+未修，影响后续实验解读：
+
+1. **F15 / W1.0.1**：`train.py:158` CLI help 写 `0 = never reset`，但 `model.py:1498` 实际 `vs > 0` 即全员重置；`run.sh` 用默认 0 → baseline **每 epoch 末重置全部已建 embedding**。需 A/B 决定是文档错还是作者刻意激进。
+2. **F16 / W1.0.3**：`model.py:691` LongerEncoder 取序列尾部，但序列倒序（pos 0=最近），实际取的是**最老**而非最新。当前 transformer 没触发，W1.7 走 longer 必须先修。
+3. **F17 / W1.0.2**：`trainer.py:87` AdamW 没暴露 dense `weight_decay`（用 PyTorch 默认 0.01）。W2.1 扫参前要加 `--dense_weight_decay` CLI。
+
+## 数据关键事实
+
+- 序列**倒序**：pos 0 = 最近（数据分析报告确认）
+- train 集**无 OOV**（vocab 按 train max+1 建），test 集**有 OOV**
+- demo 数据 row group 时间范围全部重叠 → 按 RG 切 ≈ 按行随机切；**线上数据待 W1.9 验证**
+- 4 个被 `emb_skip_threshold=1M` 跳过的高基数 seq 特征（fid 29/34/47/69 vocab 1M-86M），forward 返回零向量。复活方案见 spec 附录 D。
+- 线上 schema 已收到（v0.2），ts_fid 设置正确（39/67/27/26），list dim 比 demo 大 1.4-2.3×
+
+## 工程规范
+
+- **平台上传**：只上传改过的文件（当前 = `src/trainer.py` + `src/train.py` + `src/run.sh`）。**不上传** `taac2026_schema.json` / `__pycache__/` / `output/`
+- **schema 来源**：`train.py:227` 默认从 `data_dir/schema.json` 读，平台用平台自己的 schema；本地 `src/taac2026_schema.json` 仅作参考
+- **W1.10 hash trick 实施位置**：在 `dataset.py` 里覆盖 schema vocab + 应用 modulo，**不要改本地 schema 文件**
+- **A/B 实验隔离**：用 `CUDA_VISIBLE_DEVICES` + 不同 `TRAIN_CKPT_PATH/LOG_PATH/TF_EVENTS_PATH` env var
+
+## 反模式（不要做）
+
+- ❌ **模型 scaling**（d_model / num_layers）：当前 val/test gap 0.051 是过拟合，加大模型只会更糟
+- ❌ **改 baseline 之前的代码默认值**（如 reinit threshold）：先 A/B 验证是 bug 还是刻意，再决定
+- ❌ **白天跑长实验**：被抢卡严重，跑实验尽量挪到半夜
+- ❌ **并行 A/B 跑同一张物理卡**：用 `CUDA_VISIBLE_DEVICES` 隔离到不同 GPU
+- ❌ **改 `taac2026_schema.json` 来做特征工程**：它不上传，改了没用
+
+## 协作约定
+
+- spec 是单一事实源，对话冲突时以 spec 为准
+- spec 改动按 v0.X 版本递增，加 changelog 条目
+- 关键事实新增进事实表 F# 编号，不要散落在正文
+- 实验结果出来后**先更新 spec**再继续做下一个实验
