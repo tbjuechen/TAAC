@@ -2,6 +2,14 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
+# ---- Mode dispatch (controlled by TAAC_MODE env var) -----------------------
+# Default: train. Set TAAC_MODE=profile to run the read-only data profile
+# instead. When dispatching to profile, all "$@" args are forwarded.
+if [ "${TAAC_MODE:-train}" = "profile" ]; then
+    python3 -u "${SCRIPT_DIR}/profile_data.py" "$@"
+    exit $?
+fi
+
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
