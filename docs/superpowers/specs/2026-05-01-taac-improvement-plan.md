@@ -1,6 +1,6 @@
 # TAAC 2026 PCVR Baseline 改进计划（W1-W2）
 
-**Status**: v0.3 — GPT 第二轮 review 暴露 3 个真 bug（reinit 语义、缺 dense_wd、LongerEncoder 取反向）；新增 W1.0 baseline 行为澄清；W1.1 AMP/compile 实测完成（compile 是主加速器 -62%）；W1.10 扩成完整复活方法论
+**Status**: v0.3.1 — W1.0.1 reinit A/B 实验完成：threshold=10000 比默认 0 **掉 0.0015**，确认作者刻意激进 cold restart 是对的；F15 重新表述（文档错，代码故意），W2.5 砍掉 threshold 扫参
 **Author**: brainstorming session 2026-05-01
 **Branch**: this doc lives on `main`; implementation work happens on feature branches
 **Deadline**: 提交截止 2026-05-23 AOE
@@ -8,6 +8,12 @@
 
 ## Changelog
 
+- **v0.3.1（2026-05-01 深夜）**：W1.0.1 实验结果：
+  - ✅ W1.0.1 完成：Run X（默认 threshold=0）vs Run Y（threshold=10000）→ **Run Y val AUC 掉 0.0015**
+  - 🔄 F15 重新表述：不是"doc/code 矛盾的 bug"，而是"**doc 写错，code 是刻意的激进 cold restart 设计**"——作者本意就是每 epoch wipe 全部已建 embedding
+  - 🔄 W2.5 简化：砍掉 `reinit_cardinality_threshold` 0/1000/10000 扫参（已知 0 胜出），只保留 sparse weight_decay 扫
+  - 💡 **新认知**：baseline 已经在"重正则化高原"上——你的 0.051 val/test gap 部分已被这个 trick 压住；W2 推更强正则化（dropout=0.3、wd=1e-2）的边际收益要保守估
+  - 📝 train.py:158 CLI help 文档错，建议本地修但**不影响平台行为**
 - **v0.3（2026-05-01 晚）**：GPT 第二轮 review 反馈 + AMP/compile 实测数据：
   - 🆕 F15：`reinit_cardinality_threshold=0` 文档与代码不一致——CLI help 写 "0=never reset" 但 `model.py:1498` 实际 `vs > 0` 在 threshold=0 时**重置全部已建 embedding** → 新增 **W1.0.1 A/B** 验证 baseline 真实行为
   - 🆕 F16：LongerEncoder top-k 方向反了——`model.py:691` `start_pos = valid_len - actual_k` 取序列**尾部**，但序列倒序（pos 0=最近），即取的是**最老**而非最新 → 新增 **W1.0.3** 修 bug
@@ -44,7 +50,7 @@
 | F12 | **线上 list dim 比 demo 大 1.4-2.3×**（user_int_feats_15 demo dim=13 / 线上 dim=26；user_int_feats_65 demo 49 / 线上 111；user_int_feats_66 demo 66 / 线上 150） | 线上 schema vs demo schema 对比 | 显存压力比 demo 估的更大；W1.7 必须在真实数据上重做估算 |
 | F13 | **`emb_skip_threshold=1e6` 在线上跳过 4 个高基数 seq 特征**：seq_b fid=69 vocab=64.7M、seq_c fid=29 vocab=5.7M、seq_c fid=34 vocab=1.0M（边界）、seq_c fid=47 vocab=86.3M | 线上 schema 实测 | 这 4 个特征 forward 时返回零向量。如果是有意义的 ID（不是 timestamp），用 hash trick 重启它们可能是 +0.005 量级上分点 → 新增 W1.10 |
 | F14 | 线上 schema 顶层多了 `"format": "raw_parquet"` 字段，代码当前未读取 | 线上 schema 实测 | 标记，暂不处理 |
-| F15 | **`reinit_cardinality_threshold` 文档与代码矛盾**：CLI help（`train.py:158`）写 "0 = never reset any Embedding"，但 `model.py:1498` 实际 `if int(vs) > cardinality_threshold` → threshold=0 时对**所有已建 embedding** 触发重置；`run.sh` 没显式传 → 用默认 0 → baseline **每 epoch 末重置全部已建 embedding**（不影响 emb_skip 跳过的表 / time_embedding / dense 参数） | `trainer.py:355` + `model.py:1470-1519` + `train.py:158` 实测 | baseline 真实训练动力学跟 spec 之前的描述不符；W1.0.1 A/B 区分"作者写错"vs"作者刻意激进" |
+| F15 | **`reinit_cardinality_threshold=0` 是刻意的激进 cold restart 设计**（v0.3.1 重新表述）：CLI help（`train.py:158`）写 "0 = never reset" **是错的**，但代码 `model.py:1498` 的 `vs > 0` 即"重置全部已建 embedding" **是作者本意**。W1.0.1 A/B 实验确认：threshold=10000（保留低基数 emb）比默认 0（全员重置）**掉 0.0015 val AUC**。**reinit 范围**：所有已建 seq embedding（不含 emb_skip 跳过的 4 个高基数）+ 所有 user/item NS tokenizer embedding；**reinit 不影响**：time_embedding、dense 参数、emb_skip 跳过的表 | `trainer.py:355` + `model.py:1470-1519` + W1.0.1 实验 | baseline 已在"重正则化高原"，W2 加更强正则化的边际收益要保守估；CLI help 可本地修但不影响平台行为 |
 | F16 | **LongerEncoder top-k 方向反了**：`model.py:691` `start_pos = valid_len - actual_k` 取序列尾部；F5 已确认序列倒序 pos 0=最近，所以代码实际取的是**最老**而非最新 token；当前 baseline 用 transformer 没触发，但 W1.7 走 longer encoder 必须先修 | `model.py:670-719` 实测 | W1.7 / W2 长序列实验前置任务 |
 | F17 | **dense AdamW 没暴露 weight_decay**：`trainer.py:87` `torch.optim.AdamW(dense_params, lr=lr, betas=(0.9, 0.98))` 未传 weight_decay → 用 PyTorch 默认 0.01；CLI 也只有 `--sparse_weight_decay` | `trainer.py:87` 实测 | W2.1 (dropout, wd) 矩阵扫参前置任务 |
 
@@ -74,14 +80,14 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 
 | # | Deliverable | 投入 | 验收标准 | 风险 |
 |---|---|---|---|---|
-| W1.0.1 | **`reinit_cardinality_threshold` A/B**（最高优先级）：用 AMP+compile 跑 2 个 6-epoch 训练对比——Run X（默认 threshold=0，复现 baseline）vs Run Y（`--reinit_cardinality_threshold 10000`，只重置高基数 embedding）；同时观察 per-epoch val AUC 曲线判断重置后是否能恢复 | 4h（2 × 2h，AMP+compile 后） | 输出 val AUC 对比 + 每 epoch 曲线；判断 baseline reinit 行为是否合理 | 实验结果决定 W2.5 扫参起点 |
+| ✅ W1.0.1 | **`reinit_cardinality_threshold` A/B**（v0.3.1 完成）：Run X（默认 threshold=0）val ≈ 0.862，Run Y（threshold=10000）val 掉 **0.0015** → 结论：作者刻意激进 cold restart 是对的，**保留默认 0**。CLI help 文档错（"0=never reset"），代码行为是对的 | 已投入 4h | ✅ 已得结论 + W2.5 简化 | 决定 W2.5 不再扫 threshold |
 | W1.0.2 | **加 `--dense_weight_decay` CLI 参数**：`train.py` argparse 加该参数（default=0.01 维持 PyTorch 默认行为不破坏 baseline 复现）；`trainer.py:87` 把值传给 AdamW；`run.sh` 显式加 `--dense_weight_decay 0.01` 锁定值 | 1h | baseline 复现 AUC 不变（±0.001） | W2.1 扫参直接起步 |
 | W1.0.3 | **修 LongerEncoder top-k 方向**：`model.py:691-714` 从"取尾 top_k"改成"取头 top_k"（pos 0=最近），padding mask 相应调整；写一个 unit test（构造 valid_len=1000、top_k=50 的输入，验证返回的是 pos[0:50] 而非 pos[950:1000]） | 半天 | unit test 通过 + 切到 `--seq_encoder_type longer` 训练 6-epoch 不掉于 transformer baseline | 改错直接掉点；先 unit test 后训练 |
 
 #### W1.0 执行优先级
 
-- **W1.0.1 是 day-1 最高优先级**——它决定了 baseline 真正在做什么。结果会改变 W2.1 / W2.5 的扫参起点。**先做这个再做其他实验**
-- W1.0.2 / W1.0.3 是纯代码改动，1 天内并行做完即可
+- ✅ **W1.0.1 已完成（v0.3.1）**：threshold=10000 比默认 0 掉 0.0015 → 保留默认；W2.5 简化
+- 剩余 W1.0.2 / W1.0.3 是纯代码改动，1 天内并行做完即可
 
 ---
 
@@ -105,7 +111,7 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 - **总投入**：~6 天（v0.3 增加了 W1.0 的 1 天）
 - **执行顺序**：
   1. **D1（5/1）**：✅ W1.4（baseline reproduce）+ ✅ W1.1 实测（AMP/compile 单独，待补叠加 + test 提交）
-  2. **D2（5/2）**：**🔥 W1.0.1 reinit threshold A/B（最高优先级，4h）** + W1.0.2 加 dense_wd（1h）+ W1.0.3 修 LongerEncoder + unit test（半天）+ W1.5 csv 追踪
+  2. **D2（5/2）**：✅ W1.0.1 reinit A/B（保留默认 0）+ W1.0.2 加 dense_wd（1h）+ W1.0.3 修 LongerEncoder + unit test（半天）+ W1.5 csv 追踪
   3. **D3-D4（5/3-5/4）**：W1.10 高基数特征复活（spot-check + 实施 + A/B）+ W1.9 row group 时间分布检查
   4. **D5-D6（5/5-5/6）**：W1.2 多切法 holdout（dump+后处理）+ W1.3 分桶评估 + W1.6 OOV 统计
   5. **D7（5/7）**：W1.7 长序列试点（依赖 W1.0.3 已修）+ buffer + 把 W1 结论写成一页 `diagnosis.md`
@@ -113,13 +119,17 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 ### W1 结束的判定标准
 
 到 5/8 你应该手上有：
-- 一份 `diagnosis.md`，回答 4 个问题：
-  1. AMP 后单次训练时间是多少？
-  2. 在真实数据上 `tail_rg` / `tail_time` / `user_hash` 三个 val AUC 分别是多少？哪个跟 test_AUC 最接近？
-  3. 哪些子群（高/低频 user/item、长/短 seq）val_AUC 最差？
-  4. ts_fid 修复后 baseline AUC 涨了多少（如适用）？
+- 一份 `diagnosis.md`，回答这些问题：
+  1. ✅ AMP+compile 后单次训练时间：~20 min/epoch（v0.3 已知）
+  2. ✅ reinit_cardinality_threshold 默认值是合理的（v0.3.1 已知，threshold=10000 掉 0.0015）
+  3. 在真实数据上 `tail_rg` / `tail_time` / `user_hash` 三个 val AUC 分别是多少？哪个跟 test_AUC 最接近？（W1.2）
+  4. 哪些子群（高/低频 user/item、长/短 seq）val_AUC 最差？（W1.3）
+  5. 哪些 fid OOV 率 ≥ 5%？（W1.6）
+  6. 4 个 emb_skip 高基数 fid 是哪种类型，复活了几个？（W1.10）
+  7. row group 时间分布是连续累积还是混合重叠？（W1.9）
 - 一份能跑通 + 加速 + 可信 val 的 baseline 训练管线
 - 一个能并行 2 个 run 的 GPU 利用环境
+- 修过 LongerEncoder top-k 方向 bug（W1.0.3）+ 暴露 dense_weight_decay 参数（W1.0.2）的代码
 
 ---
 
@@ -131,11 +141,11 @@ W2 是**基于 W1 诊断结果分支执行**的。结构：必做项 + 条件项
 
 | # | Deliverable | 投入 | 验收标准 |
 |---|---|---|---|
-| W2.1 | **正则化超参矩阵**：5 个对角线组合扫——(dropout, wd) ∈ {(0.05, 1e-4), (0.1, 1e-3), (0.2, 1e-3), (0.3, 1e-2), (0.1, 1e-2)} | 5 次 train ≈ 1 天（AMP 后） | 找到比 baseline 涨 ≥ 0.003 的最佳点 |
+| W2.1 | **正则化超参矩阵**：5 个对角线组合扫——(dropout, wd) ∈ {(0.05, 1e-4), (0.1, 1e-3), (0.2, 1e-3), (0.3, 1e-2), (0.1, 1e-2)}。**v0.3.1 备注**：W1.0.1 显示 baseline 已在重正则化高原（aggressive cold restart 已生效），更强 dropout/wd 边际收益要保守估，扫到 0.3/1e-2 大概率掉点 | 5 次 train ≈ 1 天（AMP 后） | 找到比 baseline 涨 ≥ 0.003 的最佳点（保守预期 +0.001~0.003） |
 | W2.2 | **EMA**：trainer 维护一份 EMA model（衰减 0.999），evaluate 用 EMA model | 半天 | EMA model 比 raw model 高 ≥ 0.001（几乎确定的） |
 | W2.3 | **SWA / Checkpoint averaging**：训练结束前最后 N 个 ckpt 做 state_dict 平均 | 半天 | 平均后比单个 ckpt 高 ≥ 0.001 |
 | W2.4 | **Label smoothing 试点**：BCE label 1.0/0.0 → 0.95/0.05；一次 A/B | 1 次 train | 跟 baseline A/B 比，若 ≥ 0.001 就保留 |
-| W2.5 | **Sparse 控制收紧**：(a) Adagrad 加 weight_decay 1e-3；(b) `reinit_cardinality_threshold` 扫 0/1000/10000 | 2 次 train | 找到不掉点的最严收紧设置 |
+| W2.5 | **Sparse 控制收紧（v0.3.1 简化）**：~~`reinit_cardinality_threshold` 扫参~~（W1.0.1 已证 0 胜出，砍掉）；只保留 Adagrad weight_decay 扫 {0, 1e-4, 1e-3, 1e-2} | 2-3 次 train | 找到 sparse_wd 最佳点；预期收益 ≤ 0.002（baseline 已在重正则化高原） |
 
 ### W2 条件项（看 W1 诊断哪个分支命中）
 
@@ -195,13 +205,14 @@ W2 是**基于 W1 诊断结果分支执行**的。结构：必做项 + 条件项
 
 1. ~~拿到线上 schema → 跟 demo schema 对比~~ ✅ 完成（v0.2）
 2. ~~AMP+compile 实验跑出公平对比~~ ✅ 完成（v0.3，compile 主加速器 -62%）
-3. **🔥 W1.0.1 reinit threshold A/B（最高优先级，4h）**：用 AMP+compile 跑 Run X（默认 0）vs Run Y（10000）对比 val AUC，决定 baseline 真实行为是否合理；**这件事不做完后面所有调参都不可信**
+3. ~~W1.0.1 reinit threshold A/B~~ ✅ 完成（v0.3.1，threshold=10000 掉 0.0015 → 保留默认）
 4. **W1.0.2 加 `--dense_weight_decay` 参数**（1h，W2.1 扫参前置）
 5. **W1.0.3 修 LongerEncoder top-k 方向 + unit test**（半天，W1.7 长序列前置）
 6. **W1.10 spot-check 4 个被 skip 高基数 seq 特征**（1h，附录 D.2 脚本）→ 据决策树选复活方案
 7. **W1.9 row group 时间分布检查**（1h）
 8. **AMP+compile 叠加跑 1 次 6-epoch**（2h，确认两个一起开不冲突）+ 用 1 次每日 test 提交确认 test AUC 不掉
-9. 我（assistant）根据 3+6+7+8 的结果继续迭代 spec 到 v0.4，并开始具体实现
+9. （可选）顺手修 `train.py:158` CLI help 文档错误描述（"0=never reset" → "0=most aggressive, reset all built embeddings"）
+10. 我（assistant）根据 6+7+8 的结果继续迭代 spec 到 v0.4，并开始具体实现
 
 ---
 

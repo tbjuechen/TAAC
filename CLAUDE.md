@@ -42,17 +42,18 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 ## 当前活跃工作
 
 **Branch**：`feature/compile-training`（已合并 AMP / compile / tf32）
-**最高优先级**：W1.0.1 reinit_cardinality_threshold A/B（4h）—— 见下文 known issues
+**最高优先级**：W1.0.2（dense_wd）+ W1.0.3（修 LongerEncoder）+ W1.10 spot-check
+**已完成**：W1.0.1 reinit A/B（threshold=10000 掉 0.0015 → 保留默认 0）
 **待跑实验**：
-1. AMP+compile 叠加 baseline（兼 W1.0.1 Run X）
-2. `--reinit_cardinality_threshold 10000`（W1.0.1 Run Y）
-3. 用 1 次每日 test 提交验证 AMP+compile 不掉点
+1. AMP+compile 叠加 baseline（确认两个一起开不冲突）
+2. 用 1 次每日 test 提交验证 AMP+compile 不掉点
+3. W1.10 高基数特征复活 A/B（W1.0.3 修完后并行进行）
 
-## 已知 baseline 问题（v0.3 spec F15-F17）
+## 已知 baseline 问题（v0.3.1 spec F15-F17）
 
 未修，影响后续实验解读：
 
-1. **F15 / W1.0.1**：`train.py:158` CLI help 写 `0 = never reset`，但 `model.py:1498` 实际 `vs > 0` 即全员重置；`run.sh` 用默认 0 → baseline **每 epoch 末重置全部已建 embedding**。需 A/B 决定是文档错还是作者刻意激进。
+1. ✅ **F15 / W1.0.1 已结**：A/B 实验显示 threshold=10000 比默认 0 **掉 0.0015** → 作者 `reinit_cardinality_threshold=0` 是**刻意的激进 cold restart 设计**（每 epoch wipe 全部已建 embedding）。CLI help（`train.py:158`）写的"0=never reset"是错的，但代码行为是对的。**保留默认**。结论：baseline 已在重正则化高原，W2 加更强 dropout/wd 的边际收益要保守估。
 2. **F16 / W1.0.3**：`model.py:691` LongerEncoder 取序列尾部，但序列倒序（pos 0=最近），实际取的是**最老**而非最新。当前 transformer 没触发，W1.7 走 longer 必须先修。
 3. **F17 / W1.0.2**：`trainer.py:87` AdamW 没暴露 dense `weight_decay`（用 PyTorch 默认 0.01）。W2.1 扫参前要加 `--dense_weight_decay` CLI。
 
