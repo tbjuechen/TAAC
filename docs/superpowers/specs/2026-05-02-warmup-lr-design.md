@@ -96,9 +96,22 @@ else:                                   f = r
 
 1. **`len(train_loader)` 于 IterableDataset**：现有 dataset 已正确实现 `__len__`（tqdm 用了），可信。
 2. **`torch.compile` 与 `LambdaLR` 兼容性**：scheduler 不在编译图内（只改 optimizer.param_groups[0]['lr']），不会触发重编译。低风险。
-3. **AMP scaler.step 跳过 optimizer 时 scheduler.step 仍会推进**：PyTorch 官方推荐 unscale → step optimizer → step scheduler 的顺序，scaler 跳过 step 时官方建议同时跳过 scheduler。本设计 follow 官方做法（在 `_train_step` 里检查 `optimizer_was_stepped`）。
+3. **AMP scaler.step 跳过 optimizer 时 scheduler.step 仍会推进**：当前 trainer scaler enabled=False（bf16 不需要 scaling），scaler 永远是 pass-through，不会跳过 optimizer step。所以 scheduler.step 无条件调用安全。
 4. **early stop 在 `T` 之前触发**：cosine 只走完一部分。可接受 —— 这是设计选择（`T=8` 故意略大于典型 stop 点）。
-5. **`reinit_sparse_after_epoch=1` 在 step `len(train_loader)` 处发生**：那时 dense lr 已经走完 warmup（W=500 < 一个 epoch 步数 ~3500），reinit 后高基数 embedding 进入 cosine 衰减期；这是想要的行为。
+5. **🟡 cosine decay × per-epoch sparse reset 交互**（v0.2 补充分析）：
+   - 当前 baseline `reinit_sparse_after_epoch=1` + `reinit_cardinality_threshold=0` 表现：每 epoch 末 95/96 个 sparse embedding 被 wipe，Adagrad 状态清零，sparse_lr=0.05 不变。Schedule 不影响 sparse，只影响 dense。
+   - 实际 lr 轨迹（W=500, T=8 epoch≈28320 步, r=0.1, 3540 steps/epoch）：
+     - epoch 1 末 9.7e-5；epoch 4 末 5.6e-5；epoch 6 末 2.4e-5；epoch 8 末 1e-5
+   - **风险**：late epoch（7-8）reset 之后，sparse 用 Adagrad lr=0.05 一轮内能重新学到 representation，但 dense lr ≤ 1.4e-5 几乎不动，没法 refine 头部去 match 新 sparse → 那一轮 val 大概率持平甚至倒退。
+   - **反向考虑**：低 lr 本身也是 anti-overfit 手段（与 reset 同向），两者也可能互补而非互冲。
+   - **决策**（2026-05-02）：本次 A/B **接受这个交互风险不做缓解**，原因：
+     1. baseline early-stop 多落在 epoch 5-6，那时 lr 还有 2.4-3.9e-5 还能动
+     2. 想以最干净的形式测整套 schedule（warmup+cosine）这一组合的整体效果
+     3. 如果失败再单独剥离 warmup→constant 测，不浪费今晚 GPU 时间
+   - **诊断信号**（看 TB 时重点关注）：
+     - W vs N 的 early-stop epoch（W 早停说明 cosine 拖死了后期）
+     - W 的 best AUC 落在哪个 epoch（如果在 epoch 1-2，就是后期反向走的证据）
+     - W 在 epoch 5-6 之后 val 是否 plateau / 倒退
 
 ## Out-of-scope follow-ups
 
@@ -111,3 +124,4 @@ else:                                   f = r
 ## Spec changelog
 
 - v0.1 (2026-05-02): 初版，与 user brainstorm 确认（schedule shape = warmup→cosine、scope = AdamW only、warmup_steps=500、cosine_total_epochs=8、min_lr_ratio=0.1）
+- v0.2 (2026-05-02): 风险章节补充 cosine decay × per-epoch sparse reset 交互分析。决策保持原计划不缓解（接受风险，便于干净诊断），加诊断信号 checklist。代码与 CLI 默认值不变。
