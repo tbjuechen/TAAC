@@ -58,6 +58,7 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        use_amp: bool = False,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -107,10 +108,16 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.use_amp: bool = use_amp and self.device.startswith('cuda')
+        self.scaler = torch.amp.GradScaler(
+            'cuda', enabled=False
+        )
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        logging.info("AMP enabled=%s, dtype=bf16, grad_scaler=%s",
+                     self.use_amp, self.scaler.is_enabled())
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -409,21 +416,29 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        with torch.amp.autocast(
+            'cuda', enabled=self.use_amp, dtype=torch.bfloat16
+        ):
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-        else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.dense_optimizer)
+        if self.sparse_optimizer is not None:
+            self.scaler.unscale_(self.sparse_optimizer)
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
 
-        self.dense_optimizer.step()
+        self.scaler.step(self.dense_optimizer)
         if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+            self.scaler.step(self.sparse_optimizer)
+        self.scaler.update()
 
         return loss.item()
 
@@ -488,7 +503,10 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
-        logits = logits.squeeze(-1)  # (B,)
+        with torch.amp.autocast(
+            'cuda', enabled=self.use_amp, dtype=torch.bfloat16
+        ):
+            logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+        logits = logits.squeeze(-1).float()  # (B,)
 
         return logits, label
