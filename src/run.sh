@@ -12,6 +12,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
     --use_amp \
+    --use_compile \
+    --compile_mode reduce-overhead \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
@@ -27,4 +29,6 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \
 #     --use_amp \
+#     --use_compile \
+#     --compile_mode reduce-overhead \
 #     "$@"
