@@ -5,6 +5,7 @@ uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 """
 
 import os
+import math
 import glob
 import shutil
 import logging
@@ -59,6 +60,9 @@ class PCVRHyFormerRankingTrainer:
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
         use_amp: bool = False,
+        warmup_steps: int = 0,
+        cosine_total_steps: int = 0,
+        cosine_min_lr_ratio: float = 0.1,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -112,6 +116,42 @@ class PCVRHyFormerRankingTrainer:
         self.scaler = torch.amp.GradScaler(
             'cuda', enabled=False
         )
+
+        # LR scheduler (linear warmup -> cosine decay -> floor at min_lr_ratio).
+        # Active only when warmup_steps > 0; otherwise dense AdamW runs at constant lr.
+        # Applied to dense_optimizer only; sparse Adagrad keeps its constant lr.
+        self.warmup_steps: int = warmup_steps
+        self.cosine_total_steps: int = cosine_total_steps
+        self.cosine_min_lr_ratio: float = cosine_min_lr_ratio
+        self.lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR]
+        if warmup_steps > 0:
+            if cosine_total_steps <= warmup_steps:
+                raise ValueError(
+                    f"cosine_total_steps ({cosine_total_steps}) must be > "
+                    f"warmup_steps ({warmup_steps})"
+                )
+            W = warmup_steps
+            T = cosine_total_steps
+            r = cosine_min_lr_ratio
+
+            def lr_lambda(step: int) -> float:
+                if step < W:
+                    return float(step) / float(max(1, W))
+                if step >= T:
+                    return r
+                progress = (step - W) / float(T - W)
+                return r + (1.0 - r) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+            self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.dense_optimizer, lr_lambda=lr_lambda
+            )
+            logging.info(
+                f"LR scheduler: linear warmup {W} steps -> cosine decay to "
+                f"step {T} (min_lr_ratio={r}); applied to dense AdamW only"
+            )
+        else:
+            self.lr_scheduler = None
+            logging.info("LR scheduler: disabled (warmup_steps=0); dense AdamW uses constant lr")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -314,6 +354,11 @@ class PCVRHyFormerRankingTrainer:
 
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
+                    self.writer.add_scalar(
+                        'LR/dense',
+                        self.dense_optimizer.param_groups[0]['lr'],
+                        total_step,
+                    )
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
@@ -439,6 +484,9 @@ class PCVRHyFormerRankingTrainer:
         if self.sparse_optimizer is not None:
             self.scaler.step(self.sparse_optimizer)
         self.scaler.update()
+
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
 
         return loss.item()
 

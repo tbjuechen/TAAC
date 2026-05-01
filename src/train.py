@@ -167,6 +167,20 @@ def parse_args() -> argparse.Namespace:
                              'Embeddings whose vocab_size exceeds this value are reset '
                              'at each epoch end (0 = never reset any Embedding)')
 
+    # LR scheduler (linear warmup -> cosine decay) for dense AdamW.
+    # Sparse Adagrad is unaffected.
+    parser.add_argument('--warmup_steps', type=int, default=500,
+                        help='Linear warmup steps for dense AdamW (0 = disable scheduler '
+                             'entirely; dense lr stays constant at --lr).')
+    parser.add_argument('--cosine_total_epochs', type=float, default=8.0,
+                        help='Cosine decay reaches its floor after this many epochs '
+                             '(total_steps = epochs * len(train_loader)). '
+                             'Effective only when --warmup_steps > 0.')
+    parser.add_argument('--cosine_min_lr_ratio', type=float, default=0.1,
+                        help='Cosine floor expressed as a fraction of peak --lr '
+                             '(0.1 means floor lr = 0.1 * --lr). '
+                             'Effective only when --warmup_steps > 0.')
+
     # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
                         help='At model construction time, features whose vocab_size '
@@ -347,6 +361,17 @@ def main() -> None:
         "hidden": args.d_model,
     }
 
+    # Cosine schedule terminus, in steps. Computed here because trainer should
+    # not have to peek at len(train_loader) just to convert epochs->steps.
+    cosine_total_steps = int(args.cosine_total_epochs * len(train_loader))
+    if args.warmup_steps > 0:
+        logging.info(
+            f"Warmup-LR config: warmup_steps={args.warmup_steps}, "
+            f"cosine_total_steps={cosine_total_steps} "
+            f"(={args.cosine_total_epochs} epochs * {len(train_loader)} steps/epoch), "
+            f"cosine_min_lr_ratio={args.cosine_min_lr_ratio}"
+        )
+
     trainer = PCVRHyFormerRankingTrainer(
         model=model,
         train_loader=train_loader,
@@ -370,6 +395,9 @@ def main() -> None:
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
         use_amp=args.use_amp,
+        warmup_steps=args.warmup_steps,
+        cosine_total_steps=cosine_total_steps,
+        cosine_min_lr_ratio=args.cosine_min_lr_ratio,
     )
 
     trainer.train()
