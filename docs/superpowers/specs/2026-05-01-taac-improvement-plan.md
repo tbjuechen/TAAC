@@ -1,6 +1,6 @@
 # TAAC 2026 PCVR Baseline 改进计划（W1-W2）
 
-**Status**: v0.3.1 — W1.0.1 reinit A/B 实验完成：threshold=10000 比默认 0 **掉 0.0015**，确认作者刻意激进 cold restart 是对的；F15 重新表述（文档错，代码故意），W2.5 砍掉 threshold 扫参
+**Status**: v0.3.2 — W1.0.1 信号修正：Run Y 不是"略差"，是 epoch 2 后 val 单调降触发 EarlyStopping → reinit threshold=0 是**模型不崩的底线**；W2 策略相应调整（信息层优先于正则化层）；AMP+compile 完整 test AUC = 0.812282（+0.001）
 **Author**: brainstorming session 2026-05-01
 **Branch**: this doc lives on `main`; implementation work happens on feature branches
 **Deadline**: 提交截止 2026-05-23 AOE
@@ -8,6 +8,12 @@
 
 ## Changelog
 
+- **v0.3.2（2026-05-02 凌晨）**：W1.0.1 信号重新解读 + W1.1 完整数据：
+  - 🔥 **F15 大升级**：Run Y（threshold=10000）不是"略差 0.0015"，是 **best val 卡在 epoch 2（0.857339），epoch 3 起反向下降直到 EarlyStopping 触发**——意味着低基数 emb 不重置 → epoch 2 后训练发散。reinit threshold=0 不是"刻意激进的优化"，是**模型不崩的底线**
+  - 🔄 W2 策略大调整：把"正则化层"（W2.1/2.2/2.3/2.4/2.5）和"信息层"（W1.7 长序列 / W1.10 高基数复活）分开看；**baseline 已在重正则化悬崖边走钢丝**，正则化层边际收益打折，**信息层优先级升级**
+  - ✅ W1.1 完全收尾：AMP+compile val=0.862207、**test=0.812282（+0.00079）**、23min/epoch、12-13G
+  - 📝 显存账修正：AMP only 10-11G / AMP+compile 12-13G / compile only 15-16G（W1.7 长序列时按这 3 档选）
+  - 💡 快 A/B 启发法：6 epoch 收敛 ≈ 每 epoch +0.001 量级；**3 epoch 足够诊断 ≥ 0.0015 量级差异**，A/B 可砍 50% 算力
 - **v0.3.1（2026-05-01 深夜）**：W1.0.1 实验结果：
   - ✅ W1.0.1 完成：Run X（默认 threshold=0）vs Run Y（threshold=10000）→ **Run Y val AUC 掉 0.0015**
   - 🔄 F15 重新表述：不是"doc/code 矛盾的 bug"，而是"**doc 写错，code 是刻意的激进 cold restart 设计**"——作者本意就是每 epoch wipe 全部已建 embedding
@@ -50,7 +56,7 @@
 | F12 | **线上 list dim 比 demo 大 1.4-2.3×**（user_int_feats_15 demo dim=13 / 线上 dim=26；user_int_feats_65 demo 49 / 线上 111；user_int_feats_66 demo 66 / 线上 150） | 线上 schema vs demo schema 对比 | 显存压力比 demo 估的更大；W1.7 必须在真实数据上重做估算 |
 | F13 | **`emb_skip_threshold=1e6` 在线上跳过 4 个高基数 seq 特征**：seq_b fid=69 vocab=64.7M、seq_c fid=29 vocab=5.7M、seq_c fid=34 vocab=1.0M（边界）、seq_c fid=47 vocab=86.3M | 线上 schema 实测 | 这 4 个特征 forward 时返回零向量。如果是有意义的 ID（不是 timestamp），用 hash trick 重启它们可能是 +0.005 量级上分点 → 新增 W1.10 |
 | F14 | 线上 schema 顶层多了 `"format": "raw_parquet"` 字段，代码当前未读取 | 线上 schema 实测 | 标记，暂不处理 |
-| F15 | **`reinit_cardinality_threshold=0` 是刻意的激进 cold restart 设计**（v0.3.1 重新表述）：CLI help（`train.py:158`）写 "0 = never reset" **是错的**，但代码 `model.py:1498` 的 `vs > 0` 即"重置全部已建 embedding" **是作者本意**。W1.0.1 A/B 实验确认：threshold=10000（保留低基数 emb）比默认 0（全员重置）**掉 0.0015 val AUC**。**reinit 范围**：所有已建 seq embedding（不含 emb_skip 跳过的 4 个高基数）+ 所有 user/item NS tokenizer embedding；**reinit 不影响**：time_embedding、dense 参数、emb_skip 跳过的表 | `trainer.py:355` + `model.py:1470-1519` + W1.0.1 实验 | baseline 已在"重正则化高原"，W2 加更强正则化的边际收益要保守估；CLI help 可本地修但不影响平台行为 |
+| F15 | **`reinit_cardinality_threshold=0` 是模型不崩的底线**（v0.3.2 升级表述）：W1.0.1 实测——Run X（threshold=0）val 6 epoch 单调涨到 0.862207（test 0.812282）；Run Y（threshold=10000）**best val 卡在 epoch 2（0.857339），epoch 3 起反向下降，patience 耗尽 EarlyStopping**。意味着如果不重置低基数 emb（gender/age/device），它们 2 epoch 内被 dense 参数绑死开始记忆 train 集组合，泛化反向衰减。**reinit 范围**：所有已建 seq embedding（不含 emb_skip 的 4 个高基数）+ 所有 user/item NS tokenizer embedding；**reinit 不影响**：time_embedding、dense 参数、emb_skip 的表。CLI help（`train.py:158`）写 "0 = never reset" 是错的，但**代码行为绝对不能改** | `trainer.py:355` + `model.py:1470-1519` + W1.0.1 实验 | baseline 已在"过拟合悬崖"上走钢丝；W2 不要碰 reinit 这条线；正则化层（dropout/wd/EMA/SWA/label smoothing）的边际收益要打折估，**真正杠杆在信息层**（W1.7 长序列、W1.10 复活高基数特征） |
 | F16 | **LongerEncoder top-k 方向反了**：`model.py:691` `start_pos = valid_len - actual_k` 取序列尾部；F5 已确认序列倒序 pos 0=最近，所以代码实际取的是**最老**而非最新 token；当前 baseline 用 transformer 没触发，但 W1.7 走 longer encoder 必须先修 | `model.py:670-719` 实测 | W1.7 / W2 长序列实验前置任务 |
 | F17 | **dense AdamW 没暴露 weight_decay**：`trainer.py:87` `torch.optim.AdamW(dense_params, lr=lr, betas=(0.9, 0.98))` 未传 weight_decay → 用 PyTorch 默认 0.01；CLI 也只有 `--sparse_weight_decay` | `trainer.py:87` 实测 | W2.1 (dropout, wd) 矩阵扫参前置任务 |
 
@@ -80,7 +86,7 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 
 | # | Deliverable | 投入 | 验收标准 | 风险 |
 |---|---|---|---|---|
-| ✅ W1.0.1 | **`reinit_cardinality_threshold` A/B**（v0.3.1 完成）：Run X（默认 threshold=0）val ≈ 0.862，Run Y（threshold=10000）val 掉 **0.0015** → 结论：作者刻意激进 cold restart 是对的，**保留默认 0**。CLI help 文档错（"0=never reset"），代码行为是对的 | 已投入 4h | ✅ 已得结论 + W2.5 简化 | 决定 W2.5 不再扫 threshold |
+| ✅ W1.0.1 | **`reinit_cardinality_threshold` A/B**（v0.3.2 信号修正）：Run X（threshold=0）val 6 epoch 单调涨到 **0.862207**；Run Y（threshold=10000）**best val 卡在 epoch 2 = 0.857339，epoch 3 起反向下降直到 EarlyStopping 触发**。结论：threshold=0 不是"略好的优化"，是**模型不崩的底线**——保留默认。CLI help 文档错（"0=never reset"），代码行为绝对不能改 | 已投入 4h | ✅ 已得结论，且信号比 v0.3.1 解读强得多 | 决定 W2.5 不再扫 threshold；W2 整体策略调整（信息层 > 正则化层） |
 | W1.0.2 | **加 `--dense_weight_decay` CLI 参数**：`train.py` argparse 加该参数（default=0.01 维持 PyTorch 默认行为不破坏 baseline 复现）；`trainer.py:87` 把值传给 AdamW；`run.sh` 显式加 `--dense_weight_decay 0.01` 锁定值 | 1h | baseline 复现 AUC 不变（±0.001） | W2.1 扫参直接起步 |
 | W1.0.3 | **修 LongerEncoder top-k 方向**：`model.py:691-714` 从"取尾 top_k"改成"取头 top_k"（pos 0=最近），padding mask 相应调整；写一个 unit test（构造 valid_len=1000、top_k=50 的输入，验证返回的是 pos[0:50] 而非 pos[950:1000]） | 半天 | unit test 通过 + 切到 `--seq_encoder_type longer` 训练 6-epoch 不掉于 transformer baseline | 改错直接掉点；先 unit test 后训练 |
 
@@ -95,7 +101,7 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 
 | # | Deliverable | 投入 | 验收标准 | 风险 |
 |---|---|---|---|---|
-| ✅ W1.1 | **AMP/bf16 + compile 接入（v0.3 部分完成）**：实测数据 — Baseline 52min/epoch、AMP only 34min（**-35%**, val AUC +0.00003）、compile only 20min（**-62%**, val AUC -0.000149），二者均通过 ≤0.001 漂移阈值。**结论**：compile 是主加速器，AMP 单独收益受限（embedding op 没拿到 bf16 加速）。**待补**：(a) AMP+compile 叠加跑 1 次 6-epoch 验证不冲突；(b) 用 1 次每日 test 提交确认 test AUC 同步不掉点（不掉超 0.002 即认为 W1.1 完成） | 已半天 + 待补 2-3h | val AUC 漂移 ≤ 0.001 ✅；step 时间 -30%+ ✅；test AUC 验证待补 | AMP+compile 叠加可能冲突 → fallback 到 compile-only |
+| ✅ W1.1 | **AMP/bf16 + compile 接入（v0.3.2 完全收尾）**：实测数据 — Baseline 52min/epoch (val 0.862173 / test 0.811492)、AMP only 34min（-35%）、compile only 20min（-62%）、**AMP+compile 23min/epoch（-56%）val=0.862207 / test=0.812282（+0.00079）/ 显存 12-13G**。test AUC 微涨说明 bf16 + tf32 的小扰动可能意外兼具轻微正则化作用，跟 baseline 重正则化特性吻合。**W1.1 完全 ✅，AMP+compile 锁定为 daily driver** | 已完成 | val/test 漂移 ✅；step 时间 -56% ✅；test AUC 验证 ✅ | 显存 3 档可选：AMP only 10-11G（最省）/ AMP+compile 12-13G（平衡，daily）/ compile only 15-16G（最快） |
 | W1.2 | **多切法 holdout（v0.3 改实施方法）**：trainer 不动，evaluate 时 dump 全 valid 集的 (user_id, timestamp, label, pred) 到 csv；写后处理脚本 `tools/eval_multi_split.py` 算 3 个切法 AUC——`tail_rg`（当前 baseline）、`tail_time`（按 timestamp 取尾 10%）、`user_hash`（`xxhash.xxh64(uid).intdigest() % 10 == 0` 隔离 10%）。**用 xxhash 不用 Python `hash()`**——后者跨进程随机不稳定 | 半天（trainer dump 1h + 脚本 3h） | 跑一次训练后能产出 3 个独立切法的 val AUC，数字稳定可重复 | xxhash 是新依赖（pip install xxhash） |
 | W1.3 | **多分桶评估脚本** `tools/eval_breakdown.py`：valid 集按 (a) 高/低频 user (b) 高/低频 item (c) seq 长度 0/短/中/长 (d) 标签 0/1 比例 分桶，报每桶 AUC | 1 天 | 输出一张诊断表，找出过拟合最严重的子群 | 桶切太碎导致每桶样本少 AUC 不可信——按训练集 user/item 频次切，而非 valid 频次 |
 | W1.4 | **真实数据 reproduce baseline + AMP**：用 AMP 重跑用户的 0.8615 val + 0.811 test 配置，确认实验环境一致 | 3 小时 | val AUC 在 0.8605-0.8625 区间（±0.001），test AUC 在 0.810-0.813 | AMP 后跑出来跟原始有 gap 说明数值精度损失；启动 fp32 fallback |
@@ -137,15 +143,27 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 
 W2 是**基于 W1 诊断结果分支执行**的。结构：必做项 + 条件项。
 
+### v0.3.2 W2 战略调整：信息层优先
+
+W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（reinit threshold=0 是底线）。所以 W2 任务**按以下优先级排序**，不再用原来的扁平列表：
+
+| 层级 | 含义 | 任务 | 预期收益 |
+|---|---|---|---|
+| **信息层（优先）** | 给模型更多/更好的信号 | W1.10 复活 emb_skip 特征、W1.7 长序列、W2.6（v0.3.2 候选新增）"target ∈ user seq" 交互特征 | **+0.003~0.010**（每个 trick 命中） |
+| **正则化层（次要）** | 在已有信号上加防过拟合 | W2.1/2.2/2.3/2.4/2.5 | **+0.0005~0.002**（每个 trick 命中，因已在重正则化高原） |
+
+→ **W2 算力先砸信息层**。正则化层如果都不命中（可能性中等），单模型 +0.005-0.010 已经接近目标。
+
 ### W2 必做项（不论诊断结果）
 
 | # | Deliverable | 投入 | 验收标准 |
 |---|---|---|---|
-| W2.1 | **正则化超参矩阵**：5 个对角线组合扫——(dropout, wd) ∈ {(0.05, 1e-4), (0.1, 1e-3), (0.2, 1e-3), (0.3, 1e-2), (0.1, 1e-2)}。**v0.3.1 备注**：W1.0.1 显示 baseline 已在重正则化高原（aggressive cold restart 已生效），更强 dropout/wd 边际收益要保守估，扫到 0.3/1e-2 大概率掉点 | 5 次 train ≈ 1 天（AMP 后） | 找到比 baseline 涨 ≥ 0.003 的最佳点（保守预期 +0.001~0.003） |
-| W2.2 | **EMA**：trainer 维护一份 EMA model（衰减 0.999），evaluate 用 EMA model | 半天 | EMA model 比 raw model 高 ≥ 0.001（几乎确定的） |
-| W2.3 | **SWA / Checkpoint averaging**：训练结束前最后 N 个 ckpt 做 state_dict 平均 | 半天 | 平均后比单个 ckpt 高 ≥ 0.001 |
-| W2.4 | **Label smoothing 试点**：BCE label 1.0/0.0 → 0.95/0.05；一次 A/B | 1 次 train | 跟 baseline A/B 比，若 ≥ 0.001 就保留 |
-| W2.5 | **Sparse 控制收紧（v0.3.1 简化）**：~~`reinit_cardinality_threshold` 扫参~~（W1.0.1 已证 0 胜出，砍掉）；只保留 Adagrad weight_decay 扫 {0, 1e-4, 1e-3, 1e-2} | 2-3 次 train | 找到 sparse_wd 最佳点；预期收益 ≤ 0.002（baseline 已在重正则化高原） |
+| W2.1 | **正则化超参矩阵（正则化层）**：5 个对角线组合扫——(dropout, wd) ∈ {(0.05, 1e-4), (0.1, 1e-3), (0.2, 1e-3), (0.3, 1e-2), (0.1, 1e-2)}。**v0.3.2 警告**：F15 显示 baseline 在过拟合悬崖上靠 reinit 续命，更强 dropout/wd 大概率推过悬崖；扫到 0.3/1e-2 极可能像 Run Y 一样 epoch 2 后崩 | 5 次 train ≈ 1 天 | 找到比 baseline 涨 ≥ 0.001 的最佳点（**v0.3.2 期望降至 +0.0005~0.002**） |
+| W2.2 | **EMA（正则化层）**：trainer 维护一份 EMA model（衰减 0.999），evaluate 用 EMA model | 半天 | EMA 比 raw 高 ≥ 0.0005（**v0.3.2 期望降，因已在重正则化高原**） |
+| W2.3 | **SWA / Checkpoint averaging（正则化层）**：训练结束前最后 N 个 ckpt state_dict 平均 | 半天 | 平均后比单 ckpt 高 ≥ 0.0005（**v0.3.2 期望降**） |
+| W2.4 | **Label smoothing 试点（正则化层）**：BCE label 1.0/0.0 → 0.95/0.05；一次 A/B | 1 次 train | 跟 baseline A/B 比，若 ≥ 0.0005 就保留（**v0.3.2 期望降，且可能跟 reinit 重叠**） |
+| W2.5 | **Sparse 控制收紧（v0.3.1 简化）**：~~`reinit_cardinality_threshold` 扫参~~（W1.0.1 已证 0 胜出，砍掉）；只保留 Adagrad weight_decay 扫 {0, 1e-4, 1e-3, 1e-2} | 2-3 次 train | 找到 sparse_wd 最佳点；预期收益 ≤ 0.001（baseline 已在重正则化高原） |
+| **W2.6**（v0.3.2 新增）| **target ∈ user seq 交互特征（信息层）**：对每个 (user, target) 样本，计算 4 个二值特征——target item_id 是否在 user 的 seq_a/b/c/d 里出现过；每个 domain 加 1 个 dense feature，concat 进 user 表示。匿名特征场景下最稳的上分招（不依赖语义） | 1 天（dataset 改 + 1 次 train） | val AUC 涨 ≥ 0.002；最理想 +0.005~0.008 | dataset.py 改动量中等；要确保 train/val 各自独立计算（不能跨切污染） |
 
 ### W2 条件项（看 W1 诊断哪个分支命中）
 
@@ -157,12 +175,13 @@ W2 是**基于 W1 诊断结果分支执行**的。结构：必做项 + 条件项
 | W1.7 显存试点显示能开更长序列 + 不严重过拟合 | 把 seq_a/b 开到 384 或 512，重跑 baseline | 3 小时 |
 | W1.3 分桶诊断显示长尾 user/item 子群 AUC 显著低 | 长尾子群 oversample 或 loss reweight | 1 天 |
 
-### W2 执行节奏
+### W2 执行节奏（v0.3.2 调整：信息层先行）
 
-- **D1-D2（5/9-5/10）**：5 个正则化组合排队跑（2 张卡并行 = 2.5 天压成 1.25 天日历）；同时手写 EMA 和 label smoothing 代码
-- **D3（5/11）**：拿正则化最佳组合叠加 EMA 跑一次
-- **D4-D5（5/12-5/13）**：根据 W1 诊断分支，做条件项里命中的 1-2 个
-- **D6-D7（5/14-5/15）**：把 W2 所有胜出项叠到一个 "集大成" 配置，跑一次作为 W3 起点
+- **D1（5/9）**：W2.6 "target ∈ user seq" 交互特征（dataset 改 + 1 次 train） + W1.7 长序列试点（如果 W1.0.3 已修）
+- **D2-D3（5/10-5/11）**：5 个正则化组合排队跑（W2.1） + 手写 EMA / SWA 代码
+- **D4（5/12）**：拿正则化最佳组合叠加 EMA / SWA 跑一次
+- **D5-D6（5/13-5/14）**：根据 W1 诊断分支，做条件项里命中的 1-2 个
+- **D7（5/15）**：把 W2 所有胜出项叠到一个 "集大成" 配置，跑一次作为 W3 起点
 
 ### W2 结束判定
 
