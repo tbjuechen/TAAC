@@ -1,6 +1,6 @@
 # TAAC 2026 PCVR Baseline 改进计划（W1-W2）
 
-**Status**: v0.3.5 — W1.0.3 LongerEncoder bug fix 完成（在 `feature/longer-gather-fix` 分支，**修了 2 个 bug**：gather 方向 + mask layout 反转）；W1.7 第一轮 cap 512 实验 (E2) val 微跌 -0.0006 / **test 暴跌 -0.0181**——诊断为 LongerEncoder 设计的"50-query bottleneck"代价（非 fix bug），cap 512 是 longer 主场劣势；激进 E4（top_k=100，seq 512/512/1024/2048）跑中，是 longer 真正的主场测试
+**Status**: v2.0 — 阶段性整理：v0.3.x 5 次小迭代后稳定到 v2.0；吸纳用户 5/2 笔记的新议题（F24 LongerEncoder bug 2 causal mask 记录但不修 / W2.7 时间特征建模——xhs 提示 +1% 以上信息层金矿候选 / W2.8 LR base value 扫 1.82719e-4）；W1.7 E4 激进版仍跑中是当前唯一关键决策点
 **Author**: brainstorming session 2026-05-01
 **Branch**: this doc lives on `main`; implementation work happens on feature branches
 **Deadline**: 提交截止 2026-05-23 AOE
@@ -8,6 +8,14 @@
 
 ## Changelog
 
+- **v2.0（2026-05-03 早）**：阶段性整理 + 吸纳用户笔记新议题。v0.3.x 5 次小迭代积累的内容稳定化；从用户 5/2 笔记里挑出 spec 缺位的 4 个议题加入：
+  - 🆕 **F24 bug 2 causal mask（记录不修）**：用户 5/2 review 时发现 LongerEncoder 在 `causal=True` 路径下 mask 实现疑似有误。**当前 baseline `--seq_causal` 默认 False 不触发**，所以暂不修；但记录在事实表，避免 W1.7 子方案 c（transformer + 长 cap，可能要开 causal 稳定训练）或未来要试 causal longer 时踩坑
+  - 🆕 **W2.7 时间特征建模（信息层第 4 金矿候选）**：xhs 暗示这条路 +1% 以上。spec 之前缺位，只在 F11 提到 ts_fid 设置正确 + time_bucket 在用，但具体用法可能很浅。需要 brainstorm 设计：(a) label_time vs row timestamp 差值 (b) 各 seq ts vs row timestamp 的 cross-domain 时间对齐 (c) RoPE / 时间分桶 PE 变体
+  - 🆕 **W2.8 LR base value 扫**：xhs 暗示 lr=1.82719e-4 有奇效。F19 闭环的是 schedule（warmup+cosine），不是 base LR。我们 baseline `lr_dense=1e-4 / lr_sparse=0.05` 没扫过 base value。1 次 train 可验证
+  - 📝 **W2.6 标记"待 5/2 晚深化"**：用户计划 5/2 晚干 pair 特征深挖；当前 W2.6 是简单 binary 占位，等用户深化后重写
+  - 📝 **tokenizer 命名澄清（不写进事实表）**：用户笔记说 baseline 用"onetrans"，但 run.sh 已设 `--ns_tokenizer_type rankmixer`。用户确认是命名混淆——代码叫 rankmixer 但实现思路更像 onetrans，group 才更像 rankmixer。结论：**命名问题不影响行为，spec 不需要追这条**
+  - 🔄 **Status 头重构**：从"事件流水"改成"阶段总结 + 当前唯一决策点"
+  - 📝 **接续动作微调**：W2.7 / W2.8 加入候选清单
 - **v0.3.5（2026-05-02 上午）**：W1.0.3 修复完成 + W1.7 第一轮 longer encoder 实验：
   - ✅ **F22 W1.0.3 修复完成**（`feature/longer-gather-fix` 分支，未 push）：实际改了 **2 个 bug**——
     - Bug A（计划修的）：gather 方向，旧 `start_pos = valid_len - actual_k` 取尾=最老，新 `start_pos = 0`（head 模式）取头=最新
@@ -92,6 +100,7 @@
 | F21 | **emb_skip_threshold=6M 失败 + 关键约束发现（v0.3.4）**：用户 5/2 上午实验，threshold 从 1M 拉到 6M 让 fid 29 (vocab=5.7M) + fid 34 (vocab=1.0M) 全量建表（fid 47 / fid 69 仍被 skip）。结果：6 epoch val **0.862852 (+0.0006)** / test **0.810162 (-0.0021)** / GRAM **24G**（vs baseline 12-13G，**+10G**）/ 28 min/epoch（+22%）。val/test gap 0.0499 → 0.0527（同 F19 模式）。**深层失败原因**：F15 reinit threshold=0 每 epoch 清零所有已建 emb；raise threshold 让 fid 29/34 进入 reinit 范围 → 平均 **fid 29: 55 obs/row**（314M obs / 5.7M rows）/ **fid 34: 314 obs/row** + 每 epoch 重置 = 模型实际学不动这些大表，反而引入了未学好的零向量噪声拖累 test。**重要不否定**：EDA 推荐的 hash 100K-171K 桶平均 obs/row 是 1k-3k（跟 baseline 现有 user/item emb 同量级），仍然可走 | 用户实验 / 5 月 2 日 | W1.10 路径裁剪：raise threshold 死、hash trick / freq truncate 仍可试；新增 obs/row sanity check（附录 D.9）作为复活方案前置门槛 |
 | F22 | **W1.0.3 LongerEncoder bug fix 完成（v0.3.5，2 bug）**：`feature/longer-gather-fix` 分支（未 push），改 `model.py:670-720` `LongerEncoder._gather_top_k`：(Bug A) gather 方向 `start_pos = valid_len - actual_k` → `start_pos = 0`（head 模式取最新 K）；(Bug B 隐藏 bug，仅 `valid_len < K` 触发) mask layout 跟 token 内容反了——旧 `pos < pad_count` 说 padding 在前，但 indices 实际取出 valid 在前 → 新 `pos >= n_valid` 跟内容对齐。新增 `--longer_gather_side {head,tail}` CLI（tail 保留旧行为做 A/B）+ run.sh 通过 `GATHER_SIDE` env var 控制。**下游已验证**：`MultiSeqHyFormerBlock` cross_attn 全靠 mask 屏蔽 padding 不依赖 valid 在哪一头；RoPE `q_pos_indices` 跟原始序列位置对齐 ✓ | `feature/longer-gather-fix` 代码 review | W1.7 解锁；longer encoder 路径技术上可走 |
 | F23 | **W1.7 cap 512 longer encoder 实验失败（v0.3.5）**：E2 (longer + head + cap=256/256/512/512) 6 epoch val **0.861586 (-0.0006)** / **test 0.794199 (-0.0181)** / 7 min/epoch（vs baseline 23min，-70%）/ 10G GRAM。E1 (longer + tail + cap=512，no fix) val 0.861060 / test 缺；E2-E1 val +0.0005（噪声级，无法判 fix 单独贡献）。**val/test gap 0.0499 → 0.0670（+0.0171，是 F19/F21 量级的 ~10x）**。**诊断**：不是 W1.0.3 fix bug（代码 review + 下游验证通过），是 LongerEncoder 设计代价——第一个 block cross-attn 后用 50-query 永久压缩 512 tokens，下游再也访问不到原序列；cap 512 是 transformer 的主场尺寸，longer 设计 ceiling 必然更低 | 用户实验 5/2 / `feature/longer-gather-fix` 代码 review | cap 512 longer 路径闭环失败；W1.7 转向"longer + 长 cap"（E4 激进版跑中：top_k=100, seq 512/512/1024/2048）或"transformer + 长 cap"（O(L²) 显存代价，未试） |
+| F24 | **LongerEncoder bug 2 causal mask（记录不修，v2.0）**：用户 5/2 review LongerEncoder 时发现 `causal=True` 路径下 mask 实现疑似反——具体怀疑点见 `model.py:777-799` self-attn 模式的 `attn_mask = nn.Transformer.generate_square_subsequent_mask(L)` 跟 reverse-time 序列（pos 0=最近）的语义可能错位（"causal"按时间应该 mask 掉未来=更新的 token，但 pos 0 在 reverse-time 下就是最新的，不应被 mask）。**当前 baseline `--seq_causal` 默认 False 不触发**，暂不修；但 W1.7 子方案 c（transformer + 长 cap）/ 未来 causal longer 试点前必须先 review 这部分代码并设计 unit test 验证 | 用户代码 review / `model.py:777-799` | 暂不投入；列入"未来开 causal 前必查"清单 |
 
 ---
 
@@ -176,22 +185,23 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 
 W2 是**基于 W1 诊断结果分支执行**的。结构：必做项 + 条件项。
 
-### v0.3.2 W2 战略调整：信息层优先（v0.3.3 用 EDA 数据强化）
+### v0.3.2 W2 战略调整：信息层优先（v2.0 加 W2.7 时间特征 + W2.8 LR base）
 
 W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（reinit threshold=0 是底线）。所以 W2 任务**按以下优先级排序**，不再用原来的扁平列表：
 
-| 层级 | 含义 | 任务 | v0.3.3 后预期 |
+| 层级 | 含义 | 任务 | v2.0 后预期 |
 |---|---|---|---|
-| **信息层（最高优先）** | 给模型更多/更好的信号 | **W1.7 长序列（最大金矿，EDA 量化：seq_d 90.5% 截断，1.79B tokens 浪费）**、W1.10 复活 emb_skip 特征（EDA 已给 4 fid 各自方案）、W2.6 "target ∈ user seq" 交互特征 | **+0.003~0.010**（每个 trick 命中） |
+| **信息层（最高优先）** | 给模型更多/更好的信号 | **W1.7 长序列**（最大金矿，EDA 量化：seq_d 90.5% 截断，1.79B tokens 浪费；E4 跑中）、**W1.10 emb_skip hash trick**（EDA 已给方案 + obs/row 通过门槛）、**W2.6 pair 特征**（5/2 晚深化中）、**W2.7 时间特征建模**（xhs 暗示 +1%，spec 之前缺位） | **+0.003~0.015**（W2.7 单项可能就是 +0.01） |
 | **正则化层（最低优先）** | 在已有信号上加防过拟合 | W2.1/2.2/2.3/2.4/2.5 | **+0.0005~0.002**（每个 trick 命中，因已在重正则化高原 + warmup+cosine F19 实测反向） |
-| ❌ **死路** | 已闭环不再做 | F20 hyformer_blocks 类 depth scaling、F18 OOV→UNK 改造（Direction 1 死） | — |
+| **超参扫（中优先）**| 不需要新建模就能上分 | **W2.8 LR base value 扫**（xhs 暗示 1.82719e-4，3 次 train 即可） | **+0.001~0.003**（如果 xhs 数值能迁移） |
+| ❌ **死路** | 已闭环不再做 | F20 hyformer_blocks 类 depth scaling、F18 OOV→UNK 改造（Direction 1 死）、F21 raise emb_skip_threshold、F23 cap 512 + LongerEncoder | — |
 
-→ **W2 算力先砸信息层**：W1.7 长序列单项可能就是 +0.005~0.010；W1.10 4 fid 复活每个 +0.001~0.003。两者叠加保守估 +0.006~0.013，单模型已经接近 +0.010 的 W2 目标。正则化层退化为"如果还有冗余算力顺手做"。
+→ **W2 算力先砸信息层 4 个金矿候选**：W1.7 长序列单项可能 +0.005~0.010；W1.10 4 fid 复活每个 +0.001~0.003；W2.7 时间特征 xhs 暗示 +0.01；W2.6 pair 5/2 晚深化后估。叠加保守估 **+0.010~0.020**，已超 W2 目标。正则化层退化为"如果还有冗余算力顺手做"。
 
-**v0.3.3 战略闭环**：
-- ✅ 信息层有量化数据支撑（EDA F18）
-- ✅ 反模式有实证（F19 warmup+cosine、F20 depth scaling、F18 OOV）
-- 🔥 唯一卡点：W1.0.3 LongerEncoder bug（W1.7 blocker）半天搞定
+**v2.0 战略闭环**：
+- ✅ 信息层有量化数据支撑（EDA F18）+ 第 4 金矿候选（W2.7 时间特征）
+- ✅ 反模式有实证（F19 / F20 / F21 / F23）
+- 🔥 当前唯一卡点：W1.7 E4 跑结果（决定 longer 路径生死）
 
 ### W2 必做项（不论诊断结果）
 
@@ -202,7 +212,9 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 | W2.3 | **SWA / Checkpoint averaging（正则化层）**：训练结束前最后 N 个 ckpt state_dict 平均 | 半天 | 平均后比单 ckpt 高 ≥ 0.0005（**v0.3.2 期望降**） |
 | W2.4 | **Label smoothing 试点（正则化层）**：BCE label 1.0/0.0 → 0.95/0.05；一次 A/B | 1 次 train | 跟 baseline A/B 比，若 ≥ 0.0005 就保留（**v0.3.2 期望降，且可能跟 reinit 重叠**） |
 | W2.5 | **Sparse 控制收紧（v0.3.1 简化）**：~~`reinit_cardinality_threshold` 扫参~~（W1.0.1 已证 0 胜出，砍掉）；只保留 Adagrad weight_decay 扫 {0, 1e-4, 1e-3, 1e-2} | 2-3 次 train | 找到 sparse_wd 最佳点；预期收益 ≤ 0.001（baseline 已在重正则化高原） |
-| **W2.6**（v0.3.2 新增）| **target ∈ user seq 交互特征（信息层）**：对每个 (user, target) 样本，计算 4 个二值特征——target item_id 是否在 user 的 seq_a/b/c/d 里出现过；每个 domain 加 1 个 dense feature，concat 进 user 表示。匿名特征场景下最稳的上分招（不依赖语义） | 1 天（dataset 改 + 1 次 train） | val AUC 涨 ≥ 0.002；最理想 +0.005~0.008 | dataset.py 改动量中等；要确保 train/val 各自独立计算（不能跨切污染） |
+| **W2.6**（v0.3.2 新增 / v2.0 待深化）| **target ∈ user seq 交互特征（信息层）**：当前是简单 binary 占位——对每个 (user, target) 样本，计算 4 个二值特征：target item_id 是否在 user 的 seq_a/b/c/d 里出现过；每个 domain 加 1 个 dense feature，concat 进 user 表示。匿名特征场景下最稳的上分招（不依赖语义）。**v2.0 状态**：用户 5/2 晚计划深挖 pair 特征更广建模（不止 binary 是否出现，可能含频次 / 时间衰减 / 位置等），等深化后重写本任务 | 1 天（dataset 改 + 1 次 train）→ 待重估 | val AUC 涨 ≥ 0.002；最理想 +0.005~0.008 | dataset.py 改动量中等；要确保 train/val 各自独立计算（不能跨切污染） |
+| **W2.7**（v2.0 新增）| **时间特征建模（信息层第 4 金矿候选）**：spec 之前缺位，仅在 F11 提到 ts_fid 设置正确 + time_bucket 在用，但具体用法可能浅。xhs 暗示这条路 +1% 以上。**Brainstorm 题目**：(a) `label_time` vs `row_timestamp` 差值（用户行为发生到曝光的时间差，可能是 PCVR 的强信号）；(b) 各 seq ts vs row_timestamp 的 cross-domain 时间对齐（每个 domain 的"最近一次行为发生在多久前"）；(c) 现有 time_bucket（65 桶）是否被各 seq 充分使用 vs 只是 padding；(d) 可学习时间编码 vs RoPE vs 时间分桶 PE。需要先 brainstorm 出 ≥ 1 个具体方案再实施 | brainstorm 半天 + 实施 1-2 天 | val + test 同向涨 ≥ 0.003；理想 +0.008~0.015（xhs 暗示 +1%） | spec 缺位说明前面没投入分析；可能跟 W2.6 pair 特征有重叠（target 跟 seq 的时间距离也是 pair 信号） |
+| **W2.8**（v2.0 新增）| **LR base value 扫**：F19 闭环的是 schedule（warmup+cosine 反向），不是 base LR。baseline `lr_dense=1e-4 / lr_sparse=0.05` 没扫过 base value。xhs 暗示 lr=1.82719e-4 有奇效（非常具体的数值，可能反映他们扫过）。**A/B 设计**：dense lr ∈ {1e-4 (baseline), 1.82719e-4 (xhs), 3e-4 (上探)} × sparse lr 不变；只扫 dense 因为 sparse 用 Adagrad 对 lr 不敏感 | 3 次 train ≈ 半天 | val + test 同向涨 ≥ 0.001；F19 教训：必须看 test 不能纯靠 val | 比正则化扫参单点 ROI 高（已知 LR 有具体提示数）；但风险是 1.82719e-4 是别人架构的最优，搬到我们 baseline 不一定迁移 |
 
 ### W2 条件项（看 W1 诊断哪个分支命中）
 
@@ -259,7 +271,7 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 
 ---
 
-## 接续动作（v0.3.5 增量更新——5/2 中午状态）
+## 接续动作（v2.0 增量更新——5/3 早状态）
 
 ### ✅ 已完成（v0.1 → v0.3.2）
 
@@ -283,42 +295,51 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 9. **W1.0.3 LongerEncoder bug fix**（`feature/longer-gather-fix`，未 push）：修了 2 个 bug（gather 方向 + mask layout 反转），加 `--longer_gather_side` CLI；下游 wiring 复核通过（F22）
 10. **W1.7 第一轮 longer encoder cap 512 实验**（5/2 上午）：E1 (no fix, tail) val 0.861060 / test 缺；E2 (fix, head) val 0.861586 / **test 0.794199 (-0.0181)**；诊断为 longer encoder 设计在 cap 512 主场劣势——50-query bottleneck 永久压缩 512 tokens（F23）
 
-### 🔥 立刻做（5/2 下午-5/3，按 ROI 排序）
+### ✅ v2.0 新增已完成
+
+11. **F24 LongerEncoder bug 2 causal mask 记录**（不修）：用户 5/2 review 发现 `causal=True` 路径下 mask 实现疑似反——pos 0=最近 vs `generate_square_subsequent_mask` 默认按时间正序的语义错位。当前 baseline `--seq_causal` 默认 False 不触发，列入"未来开 causal 前必查"清单
+12. **吸纳用户 5/2 笔记差距分析**：W2.7 时间特征建模（信息层第 4 金矿候选） + W2.8 LR base value 扫（xhs 暗示 1.82719e-4）加入 W2 任务表
+
+### 🔥 立刻做（5/3 起，按 ROI 排序）
 
 1. **等 E4 激进版结果**（跑中）：top_k=100, seq 512/512/1024/2048；这是 longer encoder 的真正主场测试，结果出来按 F23 矩阵分级解读：
-   - **≥ 0.815**：W1.7 longer 路径成立，进 W1.10 hash trick + W2.6 交互
+   - **≥ 0.815**：W1.7 longer 路径成立，进 W1.10 hash trick + W2.7 时间特征 + W2.6 pair
    - **0.812-0.815**：持平，长序列收益勉强抵消 longer 压缩代价
    - **0.805-0.812**：longer 设计上限；考虑回退到 transformer + 长 cap（子方案 c）
    - **< 0.80**：longer 路径死；W1.7 走 transformer + cap 1024（O(L²) 显存代价，先验证不爆 19G）
-2. **E4 出后立刻 push `feature/longer-gather-fix`**（保留代码 review 上下文）
-3. **W1.10 emb_skip 复活 hash trick 路径 A/B**（v0.3.4 路径裁剪后，独立于 W1.7 可并行）：
+2. **E4 出后立刻 push `feature/longer-gather-fix`** + 把 E4 数据加进 spec（编号 F25）
+3. **W2.6 pair 特征深化 brainstorm**（用户 5/2 晚原计划）：把当前 binary 占位升级到含频次 / 时间衰减 / 位置等更广的设计
+4. **W1.10 emb_skip 复活 hash trick 路径 A/B**（独立于 W1.7 可并行）：
    - 优先 **fid 69 hash 171K**（obs/row=1046，最高 ROI 候选）
    - 然后 **fid 47 hash 100K**（obs/row=3148）
    - 可选 **fid 29 freq truncate top-100K + UNK**（obs/row=3147，实施稍重）
    - ❌ ~~fid 34~~ / ❌ ~~raise emb_skip_threshold~~
+5. **W2.7 时间特征建模 brainstorm**（v2.0 新增）：(a) `label_time` vs `row_timestamp` 差值；(b) seq ts vs row_timestamp 各 domain 时间对齐；(c) 现有 time_bucket 用法是否浅；先 brainstorm 设计再实施
 
 ### 🔧 中优先（5/4-5/5）
 
-4. **W1.0.2 加 `--dense_weight_decay` CLI 参数**（1h）—— W2.1 扫参前置，但 W2.1 优先级在 v0.3.3 已经降低，不急
-5. **W1.9 row group 时间分布检查**（1h）—— 验证 train tail vs val head 的时间 gap，跟 F19 / F21 / F23 val/test divergence 对照
+6. **W2.8 LR base value 扫**（v2.0 新增）：dense lr ∈ {1e-4 baseline, 1.82719e-4 xhs, 3e-4 上探}；3 次 train 半天搞定
+7. **W1.0.2 加 `--dense_weight_decay` CLI 参数**（1h）—— W2.1 扫参前置，但 W2.1 优先级在 v0.3.3 已经降低，不急
+8. **W1.9 row group 时间分布检查**（1h）—— 验证 train tail vs val head 的时间 gap，跟 F19 / F21 / F23 val/test divergence 对照
 
 ### 📝 低优先 / 工程债
 
-6. 修 `train.py:158` CLI help 文档错误（"0=never reset" → "0=most aggressive"）
-7. profile_data.py 进度日志 bug（modulo 不对齐，第二次没打 log）
+9. 修 `train.py:158` CLI help 文档错误（"0=never reset" → "0=most aggressive"）
+10. profile_data.py 进度日志 bug（modulo 不对齐，第二次没打 log）
+11. **未来开 causal 前必查 F24**（bug 2 causal mask 实现）
 
 ### 🚫 不再做（v0.3.3 + v0.3.4 + v0.3.5 闭环）
 
 - ❌ Direction 1 OOV→UNK 改造（F18 实测无 ROI）
 - ❌ 任何 d_model / num_layers / num_blocks 类 depth scaling（F20 实证）
 - ❌ 单纯靠 val 涨判定 trick 有效（F19 / F21 / F23 三实证 val/test divergence）
-- ❌ warmup+cosine LR schedule（F19）
+- ❌ warmup+cosine LR schedule（F19；注意 W2.8 LR base 扫**只扫 base value 不带 schedule**）
 - ❌ **raise emb_skip_threshold 直接复活全表**（F21 实证；obs/row 必然 < 1000 不通过门槛）
 - ❌ **cap 512 + LongerEncoder**（F23 实证 -0.0181 test，longer 主场劣势）
 
 ### 决策点（W1.7 E4 跑完后）
 
-按 F23 矩阵分级（详见 W1.7 任务行）。E4 是 v0.3.5 这一阶段最关键的单点决策。
+按 F23 矩阵分级（详见 W1.7 任务行）。E4 是 v2.0 这一阶段最关键的单点决策。
 
 
 ---
