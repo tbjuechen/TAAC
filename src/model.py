@@ -636,11 +636,15 @@ class LongerEncoder(nn.Module):
         top_k: int = 50,
         hidden_mult: int = 4,
         dropout: float = 0.0,
-        causal: bool = False
+        causal: bool = False,
+        gather_side: str = 'head',
     ) -> None:
         super().__init__()
+        if gather_side not in ('head', 'tail'):
+            raise ValueError(f"gather_side must be 'head' or 'tail', got {gather_side!r}")
         self.top_k = top_k
         self.causal = causal
+        self.gather_side = gather_side
 
         # Pre-LN for attention
         self.norm_q = nn.LayerNorm(d_model)
@@ -670,7 +674,19 @@ class LongerEncoder(nn.Module):
         x: torch.Tensor,
         key_padding_mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Selects the latest top_k valid tokens from each sample.
+        """Selects top_k tokens from each sample.
+
+        Sequences are stored in reverse-time order (pos 0 = most recent) with
+        right-side padding. Two gather modes:
+
+        - ``head`` (default, correct semantic): take positions ``[0, top_k)``
+          = newest top_k tokens.
+        - ``tail`` (legacy bugged behavior, kept for A/B): take positions
+          ``[valid_len - top_k, valid_len)`` = oldest top_k tokens.
+
+        Output layout is uniform: valid tokens at ``[0, n_valid)``, padding at
+        ``[n_valid, top_k)``, where ``n_valid = min(valid_len, top_k)``. When
+        ``valid_len <= top_k`` the two modes coincide (all valid tokens kept).
 
         Args:
             x: (B, L, D)
@@ -685,36 +701,31 @@ class LongerEncoder(nn.Module):
         B, L, D = x.shape
         device = x.device
 
-        # Valid lengths per sample
+        # Valid lengths per sample (number of non-padding tokens)
         valid_len = (~key_padding_mask).sum(dim=1)  # (B,)
+        n_valid = torch.clamp(valid_len, max=self.top_k)  # (B,) actual valid count in output
 
-        # Start position for each sample: max(valid_len - top_k, 0)
-        actual_k = torch.clamp(valid_len, max=self.top_k)  # (B,)
-        start_pos = valid_len - actual_k  # (B,)
+        if self.gather_side == 'head':
+            start_pos = torch.zeros_like(valid_len)
+        else:  # 'tail'
+            start_pos = torch.clamp(valid_len - self.top_k, min=0)
 
-        # Build gather indices: (B, top_k)
-        offsets = torch.arange(self.top_k, device=device).unsqueeze(0).expand(B, -1)  # (B, top_k)
+        offsets = torch.arange(self.top_k, device=device).unsqueeze(0)  # (1, top_k)
         indices = start_pos.unsqueeze(1) + offsets  # (B, top_k)
-
-        # For samples with valid_len < top_k, early indices may exceed valid range;
-        # clamp to [0, L-1] and handle via mask below
         indices = torch.clamp(indices, min=0, max=L - 1)
 
-        # Gather: (B, top_k, D)
-        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, D)  # (B, top_k, D)
+        # Gather tokens: (B, top_k, D)
+        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, D)
         top_k_tokens = torch.gather(x, dim=1, index=indices_expanded)
 
-        # New padding mask: first (top_k - actual_k) positions are padding
-        new_valid_len = actual_k  # (B,)
-        pad_count = self.top_k - new_valid_len  # (B,)
+        # Padding mask: positions >= n_valid are padding (valid-first layout)
         pos_indices = torch.arange(self.top_k, device=device).unsqueeze(0)  # (1, top_k)
-        new_padding_mask = pos_indices < pad_count.unsqueeze(1)  # (B, top_k)
+        new_padding_mask = pos_indices >= n_valid.unsqueeze(1)  # (B, top_k)
 
         # Zero out tokens at padding positions
         top_k_tokens = top_k_tokens * (~new_padding_mask).unsqueeze(-1).float()
 
-        # position_indices for Q-side RoPE
-        position_indices = indices  # (B, top_k)
+        position_indices = indices  # original positions (for Q-side RoPE)
 
         return top_k_tokens, new_padding_mask, position_indices
 
@@ -815,7 +826,8 @@ def create_sequence_encoder(
     hidden_mult: int = 4,
     dropout: float = 0.0,
     top_k: int = 50,
-    causal: bool = False
+    causal: bool = False,
+    gather_side: str = 'head',
 ) -> nn.Module:
     """Creates a sequence encoder of the specified type.
 
@@ -828,6 +840,8 @@ def create_sequence_encoder(
         top_k: Compression length for LongerEncoder (only used by longer).
         causal: Whether to use causal mask in LongerEncoder (only used by
             longer).
+        gather_side: 'head' (newest top_k, correct) or 'tail' (oldest top_k,
+            legacy bug behavior). Only used by longer.
 
     Returns:
         A sequence encoder module.
@@ -837,7 +851,7 @@ def create_sequence_encoder(
     elif encoder_type == 'transformer':
         return TransformerEncoder(d_model, num_heads, hidden_mult, dropout)
     elif encoder_type == 'longer':
-        return LongerEncoder(d_model, num_heads, top_k, hidden_mult, dropout, causal)
+        return LongerEncoder(d_model, num_heads, top_k, hidden_mult, dropout, causal, gather_side)
     else:
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
@@ -867,6 +881,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         dropout: float = 0.0,
         top_k: int = 50,
         causal: bool = False,
+        longer_gather_side: str = 'head',
         rank_mixer_mode: str = 'full'
     ) -> None:
         super().__init__()
@@ -883,7 +898,8 @@ class MultiSeqHyFormerBlock(nn.Module):
                 hidden_mult=hidden_mult,
                 dropout=dropout,
                 top_k=top_k,
-                causal=causal
+                causal=causal,
+                gather_side=longer_gather_side,
             )
             for _ in range(num_sequences)
         ])
@@ -1218,6 +1234,7 @@ class PCVRHyFormer(nn.Module):
         dropout_rate: float = 0.01,
         seq_top_k: int = 50,
         seq_causal: bool = False,
+        seq_longer_gather_side: str = 'head',
         action_num: int = 1,
         num_time_buckets: int = 65,
         rank_mixer_mode: str = 'full',
@@ -1400,6 +1417,7 @@ class PCVRHyFormer(nn.Module):
                 dropout=dropout_rate,
                 top_k=seq_top_k,
                 causal=seq_causal,
+                longer_gather_side=seq_longer_gather_side,
                 rank_mixer_mode=rank_mixer_mode,
             )
             for _ in range(num_hyformer_blocks)
