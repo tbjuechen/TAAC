@@ -1,6 +1,6 @@
 # TAAC 2026 PCVR Baseline 改进计划（W1-W2）
 
-**Status**: v0.3.2 — W1.0.1 信号修正：Run Y 不是"略差"，是 epoch 2 后 val 单调降触发 EarlyStopping → reinit threshold=0 是**模型不崩的底线**；W2 策略相应调整（信息层优先于正则化层）；AMP+compile 完整 test AUC = 0.812282（+0.001）
+**Status**: v0.3.3 — EDA 完成（profile 报告 `docs/eda/2026-05-01-data-profile.md`）：**Direction 1 (UNK/OOV) 死**、**Direction 3 (长序列) 锁定最大金矿（seq_d 90.5% 截断 / 1.79B tokens 被扔）**、Direction 2 (emb_skip 复活) 4 fid 全有信号。两个反向实验：warmup+cosine **val ↑ 0.0012 / test ↓ 0.0015**（val 已偏离 test）；hyformer_blocks=4 **val ↓ 0.0007 / per-epoch 2x**（depth scaling 反模式实证）。W1.0.3 LongerEncoder bug 修复升级为下一步最高优先级（W1.7 长序列 blocker）
 **Author**: brainstorming session 2026-05-01
 **Branch**: this doc lives on `main`; implementation work happens on feature branches
 **Deadline**: 提交截止 2026-05-23 AOE
@@ -8,6 +8,17 @@
 
 ## Changelog
 
+- **v0.3.3（2026-05-02 早）**：EDA 完成 + 两个反向实验数据：
+  - 🆕 **F18 EDA 完成**：`docs/eda/2026-05-01-data-profile.md`（907K val rows，13 节完整画像）。4 方向决策：
+    - **Direction 1 (UNK/OOV) DEAD**：0 fid val OOV ≥ 1%，UNK token 改造无 ROI；W2 条件项里"OOV → UNK 改造"分支可砍
+    - **Direction 2 (emb_skip 复活) 信号充足**：fid 69 推荐 hash 171K（99% 覆盖率）/ fid 47 hash 100K / fid 29 freq truncate / fid 34 分布平摊（信号弱）
+    - **Direction 3 (长序列) 锁定最大金矿**：seq_d **90.5% 截断率** / **1.79B tokens 被扔**（cap=512 vs p99=3962）；seq_a 65% / seq_b 73% 截断；当前 baseline 只看到用户 10-30% 历史
+    - **Direction 4 (per-fid emb_dim) 后置**：低 ROI 工程量，先做信息层
+  - 🔴 **F19 warmup+cosine 失败**：val 0.862207 → **0.863439 (+0.0012)** 但 test 0.812282 → **0.810773 (-0.0015)**；val/test gap 0.0499 → **0.0527（恶化 +0.0028）**；含义：~~val ↑ 即有效~~ 不再可用作判据，val 已偏离 test 分布；W2.1 扫参必须靠 1 次 test 提交确认，不能纯 val 选优
+  - 🔴 **F20 hyformer_blocks=4 失败**：5 epoch val **0.861496 (-0.0007)** / per-epoch 47min（**2x baseline**）/ GRAM 17G；CLAUDE.md "❌ 模型 scaling" 反模式实证；W2 后续不再做 d_model / num_layers 类实验
+  - 🔄 **W1.7 升级为最高优先级**：EDA 已量化潜力（seq_d cap 256→2048 能从 9.5% → ~99% token 覆盖）；前置仍是 W1.0.3 LongerEncoder bug fix
+  - 🔄 **W2.1 警告增强**：除了"baseline 在过拟合悬崖"，再加"val 已偏离 test"——扫参时必须周期性消耗 test 提交校准，否则扫到的"最佳"可能是过拟合 val
+  - 📝 **接续动作重写**：旧 TODO 大部分已完成，按当前实际状态重排
 - **v0.3.2（2026-05-02 凌晨）**：W1.0.1 信号重新解读 + W1.1 完整数据：
   - 🔥 **F15 大升级**：Run Y（threshold=10000）不是"略差 0.0015"，是 **best val 卡在 epoch 2（0.857339），epoch 3 起反向下降直到 EarlyStopping 触发**——意味着低基数 emb 不重置 → epoch 2 后训练发散。reinit threshold=0 不是"刻意激进的优化"，是**模型不崩的底线**
   - 🔄 W2 策略大调整：把"正则化层"（W2.1/2.2/2.3/2.4/2.5）和"信息层"（W1.7 长序列 / W1.10 高基数复活）分开看；**baseline 已在重正则化悬崖边走钢丝**，正则化层边际收益打折，**信息层优先级升级**
@@ -59,6 +70,9 @@
 | F15 | **`reinit_cardinality_threshold=0` 是模型不崩的底线**（v0.3.2 升级表述）：W1.0.1 实测——Run X（threshold=0）val 6 epoch 单调涨到 0.862207（test 0.812282）；Run Y（threshold=10000）**best val 卡在 epoch 2（0.857339），epoch 3 起反向下降，patience 耗尽 EarlyStopping**。意味着如果不重置低基数 emb（gender/age/device），它们 2 epoch 内被 dense 参数绑死开始记忆 train 集组合，泛化反向衰减。**reinit 范围**：所有已建 seq embedding（不含 emb_skip 的 4 个高基数）+ 所有 user/item NS tokenizer embedding；**reinit 不影响**：time_embedding、dense 参数、emb_skip 的表。CLI help（`train.py:158`）写 "0 = never reset" 是错的，但**代码行为绝对不能改** | `trainer.py:355` + `model.py:1470-1519` + W1.0.1 实验 | baseline 已在"过拟合悬崖"上走钢丝；W2 不要碰 reinit 这条线；正则化层（dropout/wd/EMA/SWA/label smoothing）的边际收益要打折估，**真正杠杆在信息层**（W1.7 长序列、W1.10 复活高基数特征） |
 | F16 | **LongerEncoder top-k 方向反了**：`model.py:691` `start_pos = valid_len - actual_k` 取序列尾部；F5 已确认序列倒序 pos 0=最近，所以代码实际取的是**最老**而非最新 token；当前 baseline 用 transformer 没触发，但 W1.7 走 longer encoder 必须先修 | `model.py:670-719` 实测 | W1.7 / W2 长序列实验前置任务 |
 | F17 | **dense AdamW 没暴露 weight_decay**：`trainer.py:87` `torch.optim.AdamW(dense_params, lr=lr, betas=(0.9, 0.98))` 未传 weight_decay → 用 PyTorch 默认 0.01；CLI 也只有 `--sparse_weight_decay` | `trainer.py:87` 实测 | W2.1 (dropout, wd) 矩阵扫参前置任务 |
+| F18 | **EDA 完成（v0.3.3）**：profile 脚本 `src/profile_data.py` 跑出 907K val rows 全数据画像 → `docs/eda/2026-05-01-data-profile.md`。**4 方向决策**：(1) **Direction 1 UNK/OOV 死**：0 个 fid val OOV ≥ 1%，最高 OOV fid 也只 0.4%——UNK 改造无 ROI；(2) **Direction 2 emb_skip 复活**：fid 69 推荐 hash 171K / fid 47 hash 100K / fid 29 freq truncate（top-100K 覆盖 95%）/ fid 34 分布平摊（信号弱可保 skip）；(3) **Direction 3 长序列锁定最大金矿**：seq_d 当前 cap=512 vs p99=3962 → **90.5% 截断率 / 1.79B tokens 被扔**；seq_a/b/c 截断率 65-73%；当前 baseline 只看到用户 10-30% 历史；(4) **Direction 4 per-fid emb_dim 后置**：低 ROI 工程量；schema health check 全部通过（schema vocab vs 实测 max+1 一致） | `docs/eda/2026-05-01-data-profile.md` + `docs/eda/2026-05-01-data-profile.json` | W1.10 / W1.7 决策依据齐全；W2 条件项里 OOV 分支可砍；W1.7 升级为最高优先级 |
+| F19 | **warmup+cosine LR schedule 失败（v0.3.3）**：用户 5/2 凌晨实验，10 epoch，**val 0.862207 → 0.863439 (+0.0012)** 但 **test 0.812282 → 0.810773 (-0.0015)**。val/test gap 0.0499 → **0.0527（恶化 +0.0028）**。诊断：cosine 后段低 LR + 多跑 4 epoch 让模型在 val 分布上过精修，test (OOD) 没受益反而被坑。**含义**：(1) val ↑ **不再**可用作单独判据；(2) val 已偏离 test 分布（EDA 已报 train tail vs val head 时间不重叠）；(3) W2.1 扫参必须周期性消耗 test 提交校准，不能纯 val 选优 | 用户实验 / 5 月 2 日 | W2.1 警告增强；不要再单独靠 val 涨判定 trick 有效 |
+| F20 | **hyformer_blocks=4 (depth scaling) 失败（v0.3.3）**：用户 5/2 凌晨实验，5 epoch val **0.861496 (-0.0007)** / per-epoch **47min（2x baseline）** / GRAM 17G（接近 19G 上限）。CLAUDE.md "❌ 模型 scaling" 反模式实证 | 用户实验 / 5 月 2 日 | W2 后续不再做 d_model / num_layers 类实验；这条路闭环 |
 
 ---
 
@@ -107,7 +121,7 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 | W1.4 | **真实数据 reproduce baseline + AMP**：用 AMP 重跑用户的 0.8615 val + 0.811 test 配置，确认实验环境一致 | 3 小时 | val AUC 在 0.8605-0.8625 区间（±0.001），test AUC 在 0.810-0.813 | AMP 后跑出来跟原始有 gap 说明数值精度损失；启动 fp32 fallback |
 | W1.5 | **实验追踪 csv**：`runs/experiments.csv` 每行记录 (run_id, branch, config_diff, val_AUC_taill_rg, val_AUC_tail_time, val_AUC_user_hash, test_AUC_if_have, time, notes) | 1 小时 | 后续每次 train 自动追加一行 | 容易忘记填——建议 train.py 退出时强制 dump 一次 |
 | W1.6 | **OOV 频次统计（v0.3 加分母）**：dataset 当前 `_oob_stats` 只记 OOV 计数无总曝光分母 → 加每特征曝光 counter；valid 当前 num_workers=0 单进程没汇总问题，但要在文档里标注"valid 改 num_workers > 0 时必须 manual reduce 各 worker stats"；输出 `oov_rate = oob_count / total_count` 按率排序 | 半天 | 输出按 OOV 率排序的特征列表，含分母 | train 集理论 OOV=0（vocab 按 train max+1 建），重点测**线上完整数据集**含 test 隐式 OOV |
-| W1.7 | **长序列显存试点（v0.3 改 encoder + 前置 bug 修复）**：原计划用 transformer 拉序列，但 attention O(L²) 在 L=2000+ 撞墙——改成走 `--seq_encoder_type longer`（**前提：W1.0.3 已修 top-k 方向 bug**）。在线上数据上二分查找 (seq_a, seq_b, seq_c, seq_d) 各自 OOM 边界；**优先 AMP-only 配置**（不带 compile，省 33% 显存，W1.1 实测）；如果 longer 修完后 AUC 不掉于 transformer baseline 则升级 seq_max_lens | 半天 | 给出 4 个 domain 各自 OOM 边界 + longer encoder 在拉长序列后的 val AUC 对比 | 线上 list dim 比 demo 大 2.3×（user_int_feats_66：66→150），显存压力远大于 demo |
+| W1.7 | **长序列显存试点（v0.3.3 升级为最高优先级，EDA 已量化潜力）**：EDA F18 数据——seq_d 当前 cap=512 vs p99=3962 / **90.5% 截断率 / 1.79B tokens 被扔**；seq_a 65% trunc / seq_b 73% trunc / seq_c 68% trunc。当前 baseline 只看到用户 10-30% 历史。计划：走 `--seq_encoder_type longer`（**前提：W1.0.3 已修 top-k 方向 bug**）；优先把 seq_d cap 从 512 拉到 2048（覆盖率 9.5% → 99%）；在线上数据上二分查找 OOM 边界；**优先 AMP-only 配置**（不带 compile，省 33% 显存，W1.1 实测）；如果 longer 修完后 AUC 不掉于 transformer baseline 则升级 seq_max_lens | 半天 | seq_d cap 提到 ≥ 1024 + val AUC 不掉于 transformer baseline；理想 +0.005~0.010（信息层金矿） | 线上 list dim 比 demo 大 2.3×（user_int_feats_66：66→150），显存压力远大于 demo |
 | ~~W1.8~~ | ~~修复 schema.json 的 ts_fid~~ | ~~半天~~ | ~~**取消**：线上 schema 已正确设置 ts_fid（F11），time_bucket embedding 在线上正常工作~~ | — |
 | **W1.10**（v0.3 扩） | **排查并复活 emb_skip 跳过的高基数 seq 特征**：详细方案见**附录 D**。三步走——(1) 跑 spot-check 脚本看 4 个 fid 取值分布（1h）；(2) 按附录 D 决策树选复活方案（A: hash trick / B: bucket / C: dense / D: 保持 skip）；(3) 改 schema + dataset 实施 + 跑 1 次 6-epoch A/B 验证 | 1.5 天（spot-check + 实施 + A/B） | 至少 1 个被复活的特征带 ≥ 0.001 val AUC 提升；其他特征做出明确保留/丢弃判断 | 4 个 fid 可能本来就是噪声，复活反而掉点；A/B 必做，掉点立即回退 |
 | **W1.9** | **真实数据上验证 row group 时间分布（待验证）**：在线上数据上跑 `pf.metadata.row_group(i)` 拿每个 RG 的 timestamp min/max，判断是按时间累积（连续）还是混合抽样（重叠） | 1 小时 | 给出明确判断：当前 val 是时间 holdout 还是随机 holdout | 看真实数据 |
@@ -143,22 +157,28 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 
 W2 是**基于 W1 诊断结果分支执行**的。结构：必做项 + 条件项。
 
-### v0.3.2 W2 战略调整：信息层优先
+### v0.3.2 W2 战略调整：信息层优先（v0.3.3 用 EDA 数据强化）
 
 W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（reinit threshold=0 是底线）。所以 W2 任务**按以下优先级排序**，不再用原来的扁平列表：
 
-| 层级 | 含义 | 任务 | 预期收益 |
+| 层级 | 含义 | 任务 | v0.3.3 后预期 |
 |---|---|---|---|
-| **信息层（优先）** | 给模型更多/更好的信号 | W1.10 复活 emb_skip 特征、W1.7 长序列、W2.6（v0.3.2 候选新增）"target ∈ user seq" 交互特征 | **+0.003~0.010**（每个 trick 命中） |
-| **正则化层（次要）** | 在已有信号上加防过拟合 | W2.1/2.2/2.3/2.4/2.5 | **+0.0005~0.002**（每个 trick 命中，因已在重正则化高原） |
+| **信息层（最高优先）** | 给模型更多/更好的信号 | **W1.7 长序列（最大金矿，EDA 量化：seq_d 90.5% 截断，1.79B tokens 浪费）**、W1.10 复活 emb_skip 特征（EDA 已给 4 fid 各自方案）、W2.6 "target ∈ user seq" 交互特征 | **+0.003~0.010**（每个 trick 命中） |
+| **正则化层（最低优先）** | 在已有信号上加防过拟合 | W2.1/2.2/2.3/2.4/2.5 | **+0.0005~0.002**（每个 trick 命中，因已在重正则化高原 + warmup+cosine F19 实测反向） |
+| ❌ **死路** | 已闭环不再做 | F20 hyformer_blocks 类 depth scaling、F18 OOV→UNK 改造（Direction 1 死） | — |
 
-→ **W2 算力先砸信息层**。正则化层如果都不命中（可能性中等），单模型 +0.005-0.010 已经接近目标。
+→ **W2 算力先砸信息层**：W1.7 长序列单项可能就是 +0.005~0.010；W1.10 4 fid 复活每个 +0.001~0.003。两者叠加保守估 +0.006~0.013，单模型已经接近 +0.010 的 W2 目标。正则化层退化为"如果还有冗余算力顺手做"。
+
+**v0.3.3 战略闭环**：
+- ✅ 信息层有量化数据支撑（EDA F18）
+- ✅ 反模式有实证（F19 warmup+cosine、F20 depth scaling、F18 OOV）
+- 🔥 唯一卡点：W1.0.3 LongerEncoder bug（W1.7 blocker）半天搞定
 
 ### W2 必做项（不论诊断结果）
 
 | # | Deliverable | 投入 | 验收标准 |
 |---|---|---|---|
-| W2.1 | **正则化超参矩阵（正则化层）**：5 个对角线组合扫——(dropout, wd) ∈ {(0.05, 1e-4), (0.1, 1e-3), (0.2, 1e-3), (0.3, 1e-2), (0.1, 1e-2)}。**v0.3.2 警告**：F15 显示 baseline 在过拟合悬崖上靠 reinit 续命，更强 dropout/wd 大概率推过悬崖；扫到 0.3/1e-2 极可能像 Run Y 一样 epoch 2 后崩 | 5 次 train ≈ 1 天 | 找到比 baseline 涨 ≥ 0.001 的最佳点（**v0.3.2 期望降至 +0.0005~0.002**） |
+| W2.1 | **正则化超参矩阵（正则化层）**：5 个对角线组合扫——(dropout, wd) ∈ {(0.05, 1e-4), (0.1, 1e-3), (0.2, 1e-3), (0.3, 1e-2), (0.1, 1e-2)}。**v0.3.2 警告**：F15 显示 baseline 在过拟合悬崖上靠 reinit 续命，更强 dropout/wd 大概率推过悬崖；扫到 0.3/1e-2 极可能像 Run Y 一样 epoch 2 后崩。**v0.3.3 警告增强**：F19 显示 val 已偏离 test（warmup+cosine 实测 val ↑ 0.0012 / test ↓ 0.0015）→ **扫参不能纯靠 val 选优，必须每 2-3 个组合消耗 1 次 test 提交校准最佳配置**，否则可能扫到"过拟合 val 不是 test"的伪最佳点 | 5 次 train ≈ 1 天 + 2-3 次 test 提交 | 找到比 baseline 涨 ≥ 0.001 的最佳点（**v0.3.2 期望降至 +0.0005~0.002**） |
 | W2.2 | **EMA（正则化层）**：trainer 维护一份 EMA model（衰减 0.999），evaluate 用 EMA model | 半天 | EMA 比 raw 高 ≥ 0.0005（**v0.3.2 期望降，因已在重正则化高原**） |
 | W2.3 | **SWA / Checkpoint averaging（正则化层）**：训练结束前最后 N 个 ckpt state_dict 平均 | 半天 | 平均后比单 ckpt 高 ≥ 0.0005（**v0.3.2 期望降**） |
 | W2.4 | **Label smoothing 试点（正则化层）**：BCE label 1.0/0.0 → 0.95/0.05；一次 A/B | 1 次 train | 跟 baseline A/B 比，若 ≥ 0.0005 就保留（**v0.3.2 期望降，且可能跟 reinit 重叠**） |
@@ -220,18 +240,51 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 
 ---
 
-## 接续动作（用户明天的 TODO）
+## 接续动作（v0.3.3 重写——5/2 早起后状态）
 
-1. ~~拿到线上 schema → 跟 demo schema 对比~~ ✅ 完成（v0.2）
-2. ~~AMP+compile 实验跑出公平对比~~ ✅ 完成（v0.3，compile 主加速器 -62%）
-3. ~~W1.0.1 reinit threshold A/B~~ ✅ 完成（v0.3.1，threshold=10000 掉 0.0015 → 保留默认）
-4. **W1.0.2 加 `--dense_weight_decay` 参数**（1h，W2.1 扫参前置）
-5. **W1.0.3 修 LongerEncoder top-k 方向 + unit test**（半天，W1.7 长序列前置）
-6. **W1.10 spot-check 4 个被 skip 高基数 seq 特征**（1h，附录 D.2 脚本）→ 据决策树选复活方案
-7. **W1.9 row group 时间分布检查**（1h）
-8. **AMP+compile 叠加跑 1 次 6-epoch**（2h，确认两个一起开不冲突）+ 用 1 次每日 test 提交确认 test AUC 不掉
-9. （可选）顺手修 `train.py:158` CLI help 文档错误描述（"0=never reset" → "0=most aggressive, reset all built embeddings"）
-10. 我（assistant）根据 6+7+8 的结果继续迭代 spec 到 v0.4，并开始具体实现
+### ✅ 已完成（v0.1 → v0.3.2）
+
+1. 线上 schema 接入（v0.2）
+2. AMP+compile 实验（v0.3，daily driver 23 min/epoch）
+3. W1.0.1 reinit threshold A/B（v0.3.1 → v0.3.2，threshold=0 是底线）
+4. AMP+compile 叠加 + test 提交（v0.3.2，test=0.812282 +0.00079）
+
+### ✅ v0.3.3 新增已完成
+
+5. **EDA 完成**（5/1 晚-5/2）：`src/profile_data.py` 跑出 907K val rows 全画像 → `docs/eda/2026-05-01-data-profile.md`；4 方向决策依据齐全（F18）
+6. **warmup+cosine 实验**（5/1 夜）：失败，val ↑ test ↓，gap 拉大 → 闭环（F19）
+7. **hyformer_blocks=4 实验**（5/1 夜）：失败，depth scaling 反模式实证 → 闭环（F20）
+
+### 🔥 立刻做（5/2-5/3，按 ROI 排序）
+
+1. **W1.0.3 修 LongerEncoder top-k 方向 + unit test**（半天）—— **W1.7 长序列实验的硬 blocker**，纯 bug fix，零参数调整
+2. **W1.7 长序列实验**（1 天）—— EDA 已锁定为最大金矿（seq_d 90.5% 截断 / 1.79B tokens 浪费）；前置 W1.0.3 修完，把 seq_d cap 从 512 拉到 2048（覆盖率 9.5% → 99%），用 AMP-only 配置（省 33% 显存）
+3. **W1.10 emb_skip 复活 spot-check 已完成**（EDA F18）→ **直接进 A/B 阶段**：fid 69 hash 171K + fid 47 hash 100K + fid 29 freq truncate 各跑 1 次 6-epoch；fid 34 信号弱可保 skip
+
+### 🔧 中优先（5/4-5/5）
+
+4. **W1.0.2 加 `--dense_weight_decay` CLI 参数**（1h）—— W2.1 扫参前置，但 W2.1 优先级在 v0.3.3 已经降低，不急
+5. **W1.9 row group 时间分布检查**（1h）—— 验证 train tail vs val head 的时间 gap，跟 F19 val/test divergence 对照
+
+### 📝 低优先 / 工程债
+
+6. 修 `train.py:158` CLI help 文档错误（"0=never reset" → "0=most aggressive"）
+7. profile_data.py 进度日志 bug（modulo 不对齐，第二次没打 log）
+
+### 🚫 不再做（v0.3.3 闭环）
+
+- ❌ Direction 1 OOV→UNK 改造（F18 实测无 ROI）
+- ❌ 任何 d_model / num_layers / num_blocks 类 depth scaling（F20 实证）
+- ❌ 单纯靠 val 涨判定 trick 有效（F19 实证 val/test divergence）
+- ❌ warmup+cosine LR schedule（F19）
+
+### 决策点（W1.7 跑完后）
+
+W1.7 长序列实验结果出来后，根据 val + test 数据决定：
+- 涨 ≥ 0.005：W2 主线挪到信息层组合（W1.7 + W1.10 + W2.6），正则化层降级为"如果有冗余算力"
+- 涨 0.001~0.005：保留 W1.7，继续做 W1.10 / W2.6
+- 涨 < 0.001 或反向：检查 LongerEncoder 实现，必要时回到 transformer + 长序列（O(L²) 显存代价）
+
 
 ---
 
@@ -338,6 +391,8 @@ emb_skip 跳过的表**根本没建出来**——forward 返回零向量（`mode
 
 ### D.2 4 个被 skip 特征 spot-check 脚本
 
+**v0.3.3 状态**：spot-check 脚本已被更全面的 `src/profile_data.py` 替代——profile 跑了全 train+val 数据，给出 4 个 fid 的精确 top-K 覆盖率曲线（不是 1 个 row group 的样本）。spot-check 脚本作为遗留参考，实际决策直接看 D.2.5 EDA 实测数据。
+
 ```python
 # tools/spotcheck_emb_skip.py
 import pyarrow.parquet as pq
@@ -372,6 +427,40 @@ for col, fid, vocab in TARGETS:
     print(f"  top-100 freq pct: {sum(top100_share) / len(flat):.2%}")
     print()
 ```
+
+### D.2.5 v0.3.3 EDA 实测数据（替代 spot-check）
+
+来源：`docs/eda/2026-05-01-data-profile.md` Section 6.2 + Section 10。
+
+**4 个 fid 的 top-K 覆盖率曲线**（全 train+val 实测，905K rows / fid，每个 fid ~3 亿次观测）：
+
+| fid | domain | vocab | total_obs | top1k | top10k | top100k | top1M | top10M |
+|---|---|---|---|---|---|---|---|---|
+| 69 | seq_b | 64,710,562 | 178,843,744 | 14.08% | 22.87% | 33.27% | 45.81% | 45.87% |
+| 29 | seq_c | 5,764,358 | 314,691,684 | 5.02% | 10.99% | 27.71% | 58.92% | 58.92% |
+| 34 | seq_c | 1,031,305 | 314,799,897 | **82.74%** | **89.25%** | **95.02%** | **98.74%** | 98.77% |
+| 47 | seq_c | 86,335,515 | 314,781,147 | 1.00% | 3.69% | 10.59% | 21.19% | 21.19% |
+
+**EDA Section 10 推荐方案**：
+
+| fid | k@99% | 推荐方案 | 桶大小 / 阈值 | 信号判断 |
+|---|---|---|---|---|
+| 69 | 171,052 | **A：hash trick** | bucket=171,052 | 0.26% vocab → 99% obs，强 Zipfian |
+| 47 | 100,000 | **A：hash trick** | bucket=100,000 | 0.12% vocab → 99% obs，最强 Zipfian |
+| 29 | 100,000 | **freq truncate + UNK pooling** | top-100K + 1 个 UNK | 1.7% vocab → 99% obs |
+| 34 | 139,000 | **raise emb_skip threshold** | 提到 1,031,306（即覆盖全 vocab）or 保 skip | 13.5% vocab 才到 99% — 分布平摊，Zipfian 弱，hash 收益小；信号弱可保 skip |
+
+**优先级**：
+1. **fid 69**（seq_b，最高 ROI）：vocab 64.7M，99% obs 只占 0.26% vocab，hash 到 171K 桶几乎无冲撞
+2. **fid 47**（seq_c，第二）：vocab 86.3M，最强 Zipfian，hash 100K 桶
+3. **fid 29**（seq_c）：freq truncate 比 hash 更直观（100K 个独立桶 + 1 UNK），实施稍重
+4. **fid 34**（seq_c，可选）：信号弱，先观察前 3 个的 A/B 结果再决定
+
+**显存账（v0.3.3 更新）**：
+- fid 69 复活：171K × 64 × 4B = 44 MB
+- fid 47 复活：100K × 64 × 4B = 26 MB
+- fid 29 复活：100K × 64 × 4B = 26 MB（+1 UNK row 忽略）
+- 全部 3 个复活：~96 MB（vs baseline 0 MB / vs 不 skip 40+ GB）
 
 ### D.3 复活方案决策树
 
