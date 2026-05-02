@@ -1,6 +1,6 @@
 # TAAC 2026 PCVR Baseline 改进计划（W1-W2）
 
-**Status**: v0.3.4 — F21 emb_skip_threshold=6M 实验失败：val ↑ 0.0006 / **test ↓ 0.0021** / GRAM 24G。诊断到关键约束——**reinit threshold=0 强制要求 emb_skip 复活方案的 obs/row >> 1**：raise threshold 让 fid 29 (5.7M) / fid 34 (1M) 全量建表 → 平均 55-314 obs/row + 每 epoch 重置 = 模型学不动。**EDA 推荐的 hash trick 路径（fid 69 hash 171K / fid 47 hash 100K，1k-3k obs/row）仍未试，未被本次否定**。"raise emb_skip_threshold" 路径死，"hash trick" 路径仍待验证
+**Status**: v0.3.5 — W1.0.3 LongerEncoder bug fix 完成（在 `feature/longer-gather-fix` 分支，**修了 2 个 bug**：gather 方向 + mask layout 反转）；W1.7 第一轮 cap 512 实验 (E2) val 微跌 -0.0006 / **test 暴跌 -0.0181**——诊断为 LongerEncoder 设计的"50-query bottleneck"代价（非 fix bug），cap 512 是 longer 主场劣势；激进 E4（top_k=100，seq 512/512/1024/2048）跑中，是 longer 真正的主场测试
 **Author**: brainstorming session 2026-05-01
 **Branch**: this doc lives on `main`; implementation work happens on feature branches
 **Deadline**: 提交截止 2026-05-23 AOE
@@ -8,6 +8,16 @@
 
 ## Changelog
 
+- **v0.3.5（2026-05-02 上午）**：W1.0.3 修复完成 + W1.7 第一轮 longer encoder 实验：
+  - ✅ **F22 W1.0.3 修复完成**（`feature/longer-gather-fix` 分支，未 push）：实际改了 **2 个 bug**——
+    - Bug A（计划修的）：gather 方向，旧 `start_pos = valid_len - actual_k` 取尾=最老，新 `start_pos = 0`（head 模式）取头=最新
+    - Bug B（顺手修的隐藏 bug）：mask layout 跟 token 内容反了，仅在 `valid_len < K` 时触发——旧 `pos < pad_count` 说 padding 在前，但 indices 实际取出 valid 在前的 token；新 `pos >= n_valid` 跟内容对齐
+    - 新增 `--longer_gather_side {head,tail}` CLI 参数 + run.sh 通过 `GATHER_SIDE` env var 控制；`tail` 保留旧行为做 A/B
+    - 下游 wiring 已复核（MultiSeqHyFormerBlock cross_attn 全靠 mask 屏蔽 padding，不依赖 valid 在哪一头）；RoPE 位置对齐正确
+  - 🔴 **F23 W1.7 cap 512 longer encoder 实验失败**：E2 (longer + head + cap 512) val 0.861586 (-0.0006) / **test 0.794199 (-0.0181)** / 7 min/epoch（vs baseline 23min）/ 10G GRAM。val/test gap 0.0499 → 0.0670（+0.0171，是 F19/F21 的 ~10x）。**诊断不是 fix bug**，是 LongerEncoder 设计代价：第一个 block 后用 50-query 永久压缩 512 tokens，cap 512 下设计 ceiling 必然低于 transformer
+  - 🔄 **W1.7 子方案分裂**：cap 512 longer 路径已闭环（F23 实证劣势）；剩下两条候选：(a) longer + 长 cap（E4 激进版跑中：top_k=100, seq 512/512/1024/2048）；(b) transformer + 长 cap（attention O(L²)，未试）
+  - 📝 **E1 vs E2 对比**：E1 (no fix, tail+反转 mask) val 0.861060 / test 缺；E2 (fix, head, mask 对齐) val 0.861586。差 +0.0005 噪声级，无法只凭 val 数据判断 fix 单独贡献，但代码 review + 下游验证支持 fix 正确
+  - 📝 **接续动作更新**：W1.0.3 闭合，W1.7 子任务展开，F23 加进死路警告
 - **v0.3.4（2026-05-02 上午）**：emb_skip 复活第一次实验 + 关键约束发现：
   - 🔴 **F21 emb_skip_threshold=6M 失败**：val 0.862207 → **0.862852 (+0.0006)** / test 0.812282 → **0.810162 (-0.0021)** / GRAM **24G**（vs baseline 12-13G）/ 28 min/epoch（+22%）。val/test gap 0.0499 → 0.0527（同 F19 模式）
   - 🆕 **关键约束发现：reinit × emb_skip 的隐藏交互**：F15 reinit threshold=0 每 epoch 重置所有已建 emb；raise threshold 把 fid 29 (5.7M) / fid 34 (1M) 拉进 reinit 范围 → 平均 **55 / 314 obs/row** vs 每 epoch 清零 = 模型根本学不动这些超大表。EDA 推荐 hash 桶 100K-171K（**1k-3k obs/row**，跟 baseline 现有 emb 同量级）正是为了规避这个问题
@@ -80,6 +90,8 @@
 | F19 | **warmup+cosine LR schedule 失败（v0.3.3）**：用户 5/2 凌晨实验，10 epoch，**val 0.862207 → 0.863439 (+0.0012)** 但 **test 0.812282 → 0.810773 (-0.0015)**。val/test gap 0.0499 → **0.0527（恶化 +0.0028）**。诊断：cosine 后段低 LR + 多跑 4 epoch 让模型在 val 分布上过精修，test (OOD) 没受益反而被坑。**含义**：(1) val ↑ **不再**可用作单独判据；(2) val 已偏离 test 分布（EDA 已报 train tail vs val head 时间不重叠）；(3) W2.1 扫参必须周期性消耗 test 提交校准，不能纯 val 选优 | 用户实验 / 5 月 2 日 | W2.1 警告增强；不要再单独靠 val 涨判定 trick 有效 |
 | F20 | **hyformer_blocks=4 (depth scaling) 失败（v0.3.3）**：用户 5/2 凌晨实验，5 epoch val **0.861496 (-0.0007)** / per-epoch **47min（2x baseline）** / GRAM 17G（接近 19G 上限）。CLAUDE.md "❌ 模型 scaling" 反模式实证 | 用户实验 / 5 月 2 日 | W2 后续不再做 d_model / num_layers 类实验；这条路闭环 |
 | F21 | **emb_skip_threshold=6M 失败 + 关键约束发现（v0.3.4）**：用户 5/2 上午实验，threshold 从 1M 拉到 6M 让 fid 29 (vocab=5.7M) + fid 34 (vocab=1.0M) 全量建表（fid 47 / fid 69 仍被 skip）。结果：6 epoch val **0.862852 (+0.0006)** / test **0.810162 (-0.0021)** / GRAM **24G**（vs baseline 12-13G，**+10G**）/ 28 min/epoch（+22%）。val/test gap 0.0499 → 0.0527（同 F19 模式）。**深层失败原因**：F15 reinit threshold=0 每 epoch 清零所有已建 emb；raise threshold 让 fid 29/34 进入 reinit 范围 → 平均 **fid 29: 55 obs/row**（314M obs / 5.7M rows）/ **fid 34: 314 obs/row** + 每 epoch 重置 = 模型实际学不动这些大表，反而引入了未学好的零向量噪声拖累 test。**重要不否定**：EDA 推荐的 hash 100K-171K 桶平均 obs/row 是 1k-3k（跟 baseline 现有 user/item emb 同量级），仍然可走 | 用户实验 / 5 月 2 日 | W1.10 路径裁剪：raise threshold 死、hash trick / freq truncate 仍可试；新增 obs/row sanity check（附录 D.9）作为复活方案前置门槛 |
+| F22 | **W1.0.3 LongerEncoder bug fix 完成（v0.3.5，2 bug）**：`feature/longer-gather-fix` 分支（未 push），改 `model.py:670-720` `LongerEncoder._gather_top_k`：(Bug A) gather 方向 `start_pos = valid_len - actual_k` → `start_pos = 0`（head 模式取最新 K）；(Bug B 隐藏 bug，仅 `valid_len < K` 触发) mask layout 跟 token 内容反了——旧 `pos < pad_count` 说 padding 在前，但 indices 实际取出 valid 在前 → 新 `pos >= n_valid` 跟内容对齐。新增 `--longer_gather_side {head,tail}` CLI（tail 保留旧行为做 A/B）+ run.sh 通过 `GATHER_SIDE` env var 控制。**下游已验证**：`MultiSeqHyFormerBlock` cross_attn 全靠 mask 屏蔽 padding 不依赖 valid 在哪一头；RoPE `q_pos_indices` 跟原始序列位置对齐 ✓ | `feature/longer-gather-fix` 代码 review | W1.7 解锁；longer encoder 路径技术上可走 |
+| F23 | **W1.7 cap 512 longer encoder 实验失败（v0.3.5）**：E2 (longer + head + cap=256/256/512/512) 6 epoch val **0.861586 (-0.0006)** / **test 0.794199 (-0.0181)** / 7 min/epoch（vs baseline 23min，-70%）/ 10G GRAM。E1 (longer + tail + cap=512，no fix) val 0.861060 / test 缺；E2-E1 val +0.0005（噪声级，无法判 fix 单独贡献）。**val/test gap 0.0499 → 0.0670（+0.0171，是 F19/F21 量级的 ~10x）**。**诊断**：不是 W1.0.3 fix bug（代码 review + 下游验证通过），是 LongerEncoder 设计代价——第一个 block cross-attn 后用 50-query 永久压缩 512 tokens，下游再也访问不到原序列；cap 512 是 transformer 的主场尺寸，longer 设计 ceiling 必然更低 | 用户实验 5/2 / `feature/longer-gather-fix` 代码 review | cap 512 longer 路径闭环失败；W1.7 转向"longer + 长 cap"（E4 激进版跑中：top_k=100, seq 512/512/1024/2048）或"transformer + 长 cap"（O(L²) 显存代价，未试） |
 
 ---
 
@@ -109,7 +121,7 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 |---|---|---|---|---|
 | ✅ W1.0.1 | **`reinit_cardinality_threshold` A/B**（v0.3.2 信号修正）：Run X（threshold=0）val 6 epoch 单调涨到 **0.862207**；Run Y（threshold=10000）**best val 卡在 epoch 2 = 0.857339，epoch 3 起反向下降直到 EarlyStopping 触发**。结论：threshold=0 不是"略好的优化"，是**模型不崩的底线**——保留默认。CLI help 文档错（"0=never reset"），代码行为绝对不能改 | 已投入 4h | ✅ 已得结论，且信号比 v0.3.1 解读强得多 | 决定 W2.5 不再扫 threshold；W2 整体策略调整（信息层 > 正则化层） |
 | W1.0.2 | **加 `--dense_weight_decay` CLI 参数**：`train.py` argparse 加该参数（default=0.01 维持 PyTorch 默认行为不破坏 baseline 复现）；`trainer.py:87` 把值传给 AdamW；`run.sh` 显式加 `--dense_weight_decay 0.01` 锁定值 | 1h | baseline 复现 AUC 不变（±0.001） | W2.1 扫参直接起步 |
-| W1.0.3 | **修 LongerEncoder top-k 方向**：`model.py:691-714` 从"取尾 top_k"改成"取头 top_k"（pos 0=最近），padding mask 相应调整；写一个 unit test（构造 valid_len=1000、top_k=50 的输入，验证返回的是 pos[0:50] 而非 pos[950:1000]） | 半天 | unit test 通过 + 切到 `--seq_encoder_type longer` 训练 6-epoch 不掉于 transformer baseline | 改错直接掉点；先 unit test 后训练 |
+| ✅ W1.0.3 (v0.3.5) | **修 LongerEncoder top-k 方向 + mask layout**：`feature/longer-gather-fix` 已实施。代码改动（详见 F22）：(Bug A) `start_pos = valid_len - actual_k` → `start_pos = 0`（head 模式）；(Bug B) mask 改 `pos >= n_valid` 跟内容对齐；新增 `--longer_gather_side {head,tail}` CLI。**未写 unit test**（直接 6-epoch 实测验证，E1/E2 数据见 F23）。下游 wiring 复核通过 | 已投入 半天 | ✅ E1/E2 数据出来；longer encoder 路径技术上 work，但 cap 512 下设计劣势导致 -0.018 test 跌（F23 诊断为非 fix bug） | F23 暴露的"cap 512 longer 设计劣势"是 W1.7 的关键变量；E4 激进版跑中验证长 cap 是否摊薄 |
 
 #### W1.0 执行优先级
 
@@ -128,7 +140,7 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 | W1.4 | **真实数据 reproduce baseline + AMP**：用 AMP 重跑用户的 0.8615 val + 0.811 test 配置，确认实验环境一致 | 3 小时 | val AUC 在 0.8605-0.8625 区间（±0.001），test AUC 在 0.810-0.813 | AMP 后跑出来跟原始有 gap 说明数值精度损失；启动 fp32 fallback |
 | W1.5 | **实验追踪 csv**：`runs/experiments.csv` 每行记录 (run_id, branch, config_diff, val_AUC_taill_rg, val_AUC_tail_time, val_AUC_user_hash, test_AUC_if_have, time, notes) | 1 小时 | 后续每次 train 自动追加一行 | 容易忘记填——建议 train.py 退出时强制 dump 一次 |
 | W1.6 | **OOV 频次统计（v0.3 加分母）**：dataset 当前 `_oob_stats` 只记 OOV 计数无总曝光分母 → 加每特征曝光 counter；valid 当前 num_workers=0 单进程没汇总问题，但要在文档里标注"valid 改 num_workers > 0 时必须 manual reduce 各 worker stats"；输出 `oov_rate = oob_count / total_count` 按率排序 | 半天 | 输出按 OOV 率排序的特征列表，含分母 | train 集理论 OOV=0（vocab 按 train max+1 建），重点测**线上完整数据集**含 test 隐式 OOV |
-| W1.7 | **长序列显存试点（v0.3.3 升级为最高优先级，EDA 已量化潜力）**：EDA F18 数据——seq_d 当前 cap=512 vs p99=3962 / **90.5% 截断率 / 1.79B tokens 被扔**；seq_a 65% trunc / seq_b 73% trunc / seq_c 68% trunc。当前 baseline 只看到用户 10-30% 历史。计划：走 `--seq_encoder_type longer`（**前提：W1.0.3 已修 top-k 方向 bug**）；优先把 seq_d cap 从 512 拉到 2048（覆盖率 9.5% → 99%）；在线上数据上二分查找 OOM 边界；**优先 AMP-only 配置**（不带 compile，省 33% 显存，W1.1 实测）；如果 longer 修完后 AUC 不掉于 transformer baseline 则升级 seq_max_lens | 半天 | seq_d cap 提到 ≥ 1024 + val AUC 不掉于 transformer baseline；理想 +0.005~0.010（信息层金矿） | 线上 list dim 比 demo 大 2.3×（user_int_feats_66：66→150），显存压力远大于 demo |
+| W1.7 | **长序列显存试点（v0.3.5 子方案分裂，cap 512 longer 已闭环失败）**：EDA F18 数据——seq_d 当前 cap=512 vs p99=3962 / **90.5% 截断率 / 1.79B tokens 被扔**；seq_a 65% trunc / seq_b 73% trunc / seq_c 68% trunc。**v0.3.5 状态**：(子方案 a) **cap 512 + longer**（E2）已 F23 失败 (-0.0181 test)，闭环；(子方案 b) **长 cap + longer**（E4 跑中：top_k=100, seq 512/512/1024/2048）；(子方案 c) **长 cap + transformer**（attention O(L²)，cap 1024 可能爆 19G，未试）。E4 决定 longer 路径生死 | 1-2 天 | E4 出结果分级：≥0.815 longer 路径成立 / 0.812-0.815 持平 / 0.805-0.812 longer 设计上限 / <0.80 路径死 → 转 transformer | 线上 list dim 比 demo 大 2.3×；longer encoder 第一个 block 后压缩到 top_k，后续 block 再不见原序列；top_k=50 cap 512 的 ~10% 比例已知不行 |
 | ~~W1.8~~ | ~~修复 schema.json 的 ts_fid~~ | ~~半天~~ | ~~**取消**：线上 schema 已正确设置 ts_fid（F11），time_bucket embedding 在线上正常工作~~ | — |
 | **W1.10**（v0.3.4 路径裁剪）| **复活 emb_skip 跳过的高基数 seq 特征**：详细方案见**附录 D**。**v0.3.4 警告**：F21 实验证明 raise emb_skip_threshold（直接全量建表）路径死——fid 29/34 平均 55-314 obs/row 配合 reinit threshold=0 模型学不动 + test ↓ 0.0021。仍可走的路径：(a) **hash trick**（附录 D.4）：fid 69 hash 171K（1042 obs/row）/ fid 47 hash 100K（3140 obs/row）；(b) **freq truncate**（附录 D.6 改造）：fid 29 top-100K + UNK pooling（3140 obs/row）。**前置门槛（附录 D.9）**：任何复活方案必须满足 obs/row ≥ 1000 才值得跑 A/B；fid 34 EDA 信号弱 + 平均 314 obs/row（边缘），保 skip | 1 天（fid 69 + fid 47 hash A/B 各 1 次） | 至少 1 个被复活的特征带 ≥ 0.001 val + ≥ 0 test 提升；其他特征做明确保留/丢弃判断 | reinit × obs/row 约束已在 F21 实证；hash trick 仍可能掉点（dataset 改动 bug、hash 冲撞、特征本身就是噪声等）；A/B 必跑，掉点立即回退 |
 | **W1.9** | **真实数据上验证 row group 时间分布（待验证）**：在线上数据上跑 `pf.metadata.row_group(i)` 拿每个 RG 的 timestamp min/max，判断是按时间累积（连续）还是混合抽样（重叠） | 1 小时 | 给出明确判断：当前 val 是时间 holdout 还是随机 holdout | 看真实数据 |
@@ -247,7 +259,7 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 
 ---
 
-## 接续动作（v0.3.4 增量更新——5/2 上午状态）
+## 接续动作（v0.3.5 增量更新——5/2 中午状态）
 
 ### ✅ 已完成（v0.1 → v0.3.2）
 
@@ -266,41 +278,47 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 
 8. **emb_skip_threshold=6M 实验**（5/2 上午）：失败，val ↑ 0.0006 / test ↓ 0.0021 / GRAM 24G → raise threshold 路径死，但发现 reinit × obs/row 关键约束（F21 + 附录 D.9）
 
-### 🔥 立刻做（5/2-5/3，按 ROI 排序）
+### ✅ v0.3.5 新增已完成
 
-1. **W1.0.3 修 LongerEncoder top-k 方向 + unit test**（半天）—— **W1.7 长序列实验的硬 blocker**，纯 bug fix，零参数调整
-2. **W1.7 长序列实验**（1 天）—— EDA 已锁定为最大金矿（seq_d 90.5% 截断 / 1.79B tokens 浪费）；前置 W1.0.3 修完，把 seq_d cap 从 512 拉到 2048（覆盖率 9.5% → 99%），用 AMP-only 配置（省 33% 显存）
-3. **W1.10 emb_skip 复活 hash trick 路径 A/B**（v0.3.4 路径裁剪后）：
+9. **W1.0.3 LongerEncoder bug fix**（`feature/longer-gather-fix`，未 push）：修了 2 个 bug（gather 方向 + mask layout 反转），加 `--longer_gather_side` CLI；下游 wiring 复核通过（F22）
+10. **W1.7 第一轮 longer encoder cap 512 实验**（5/2 上午）：E1 (no fix, tail) val 0.861060 / test 缺；E2 (fix, head) val 0.861586 / **test 0.794199 (-0.0181)**；诊断为 longer encoder 设计在 cap 512 主场劣势——50-query bottleneck 永久压缩 512 tokens（F23）
+
+### 🔥 立刻做（5/2 下午-5/3，按 ROI 排序）
+
+1. **等 E4 激进版结果**（跑中）：top_k=100, seq 512/512/1024/2048；这是 longer encoder 的真正主场测试，结果出来按 F23 矩阵分级解读：
+   - **≥ 0.815**：W1.7 longer 路径成立，进 W1.10 hash trick + W2.6 交互
+   - **0.812-0.815**：持平，长序列收益勉强抵消 longer 压缩代价
+   - **0.805-0.812**：longer 设计上限；考虑回退到 transformer + 长 cap（子方案 c）
+   - **< 0.80**：longer 路径死；W1.7 走 transformer + cap 1024（O(L²) 显存代价，先验证不爆 19G）
+2. **E4 出后立刻 push `feature/longer-gather-fix`**（保留代码 review 上下文）
+3. **W1.10 emb_skip 复活 hash trick 路径 A/B**（v0.3.4 路径裁剪后，独立于 W1.7 可并行）：
    - 优先 **fid 69 hash 171K**（obs/row=1046，最高 ROI 候选）
    - 然后 **fid 47 hash 100K**（obs/row=3148）
-   - 可选 **fid 29 freq truncate top-100K + UNK**（obs/row=3147，实施稍重，需要 train pass 预统计 top-K）
-   - ❌ ~~fid 34~~ 跳过（EDA 信号弱 + obs/row 边缘）
-   - ❌ ~~raise emb_skip_threshold~~ 路径已 F21 闭环
+   - 可选 **fid 29 freq truncate top-100K + UNK**（obs/row=3147，实施稍重）
+   - ❌ ~~fid 34~~ / ❌ ~~raise emb_skip_threshold~~
 
 ### 🔧 中优先（5/4-5/5）
 
 4. **W1.0.2 加 `--dense_weight_decay` CLI 参数**（1h）—— W2.1 扫参前置，但 W2.1 优先级在 v0.3.3 已经降低，不急
-5. **W1.9 row group 时间分布检查**（1h）—— 验证 train tail vs val head 的时间 gap，跟 F19 / F21 val/test divergence 对照
+5. **W1.9 row group 时间分布检查**（1h）—— 验证 train tail vs val head 的时间 gap，跟 F19 / F21 / F23 val/test divergence 对照
 
 ### 📝 低优先 / 工程债
 
 6. 修 `train.py:158` CLI help 文档错误（"0=never reset" → "0=most aggressive"）
 7. profile_data.py 进度日志 bug（modulo 不对齐，第二次没打 log）
 
-### 🚫 不再做（v0.3.3 + v0.3.4 闭环）
+### 🚫 不再做（v0.3.3 + v0.3.4 + v0.3.5 闭环）
 
 - ❌ Direction 1 OOV→UNK 改造（F18 实测无 ROI）
 - ❌ 任何 d_model / num_layers / num_blocks 类 depth scaling（F20 实证）
-- ❌ 单纯靠 val 涨判定 trick 有效（F19 / F21 双实证 val/test divergence）
+- ❌ 单纯靠 val 涨判定 trick 有效（F19 / F21 / F23 三实证 val/test divergence）
 - ❌ warmup+cosine LR schedule（F19）
 - ❌ **raise emb_skip_threshold 直接复活全表**（F21 实证；obs/row 必然 < 1000 不通过门槛）
+- ❌ **cap 512 + LongerEncoder**（F23 实证 -0.0181 test，longer 主场劣势）
 
-### 决策点（W1.7 跑完后）
+### 决策点（W1.7 E4 跑完后）
 
-W1.7 长序列实验结果出来后，根据 val + test 数据决定：
-- 涨 ≥ 0.005：W2 主线挪到信息层组合（W1.7 + W1.10 hash trick + W2.6），正则化层降级为"如果有冗余算力"
-- 涨 0.001~0.005：保留 W1.7，继续做 W1.10 hash trick / W2.6
-- 涨 < 0.001 或反向：检查 LongerEncoder 实现，必要时回到 transformer + 长序列（O(L²) 显存代价）
+按 F23 矩阵分级（详见 W1.7 任务行）。E4 是 v0.3.5 这一阶段最关键的单点决策。
 
 
 ---

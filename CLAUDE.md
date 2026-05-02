@@ -8,7 +8,7 @@
 
 ## 主要 spec（先读这个）
 
-`docs/superpowers/specs/2026-05-01-taac-improvement-plan.md` —— 当前 **v0.3.4**，包含 W1-W3 完整作战图、关键事实表（**F1-F21**）、附录 A-D。**任何后续工作都从这份 spec 起步**，不要重新规划。
+`docs/superpowers/specs/2026-05-01-taac-improvement-plan.md` —— 当前 **v0.3.5**，包含 W1-W3 完整作战图、关键事实表（**F1-F23**）、附录 A-D。**任何后续工作都从这份 spec 起步**，不要重新规划。
 
 **EDA 报告**：`docs/eda/2026-05-01-data-profile.md` + `.json`（907K val rows 全数据画像，4 方向决策依据齐全）
 
@@ -42,44 +42,49 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 - **A/B 启发法**：6 epoch 收敛 ≈ 每 epoch +0.001；**3 epoch 足够诊断 ≥ 0.0015 量级差异**，可砍 50% 算力
 - **实验预算**：理论 30-50 次完整训练；考虑虚拟化高峰损耗按 **15-25 次** 算
 
-## 当前活跃工作（v0.3.4 / 5/2 上午）
+## 当前活跃工作（v0.3.5 / 5/2 中午-下午状态）
 
-**Branch**：`main`（feature/longer-gather-fix 已开但未实施 W1.0.3 / 其他 feature/* 已合或废）
-**最高优先级**：**W1.0.3 修 LongerEncoder bug**（半天，纯 bug fix）→ 解锁 **W1.7 长序列实验**（EDA 锁定为最大金矿）
+**Branch**：`main`（`feature/longer-gather-fix` 已实现 W1.0.3 修复，**未 push**，等 E4 出结果一并 push）
+**最高优先级**：**等 E4 激进版（top_k=100, seq 512/512/1024/2048）跑完** → 决定 W1.7 longer 路径生死
 **已完成**：
 - W1.0.1 reinit A/B（threshold=10000 掉 0.0015 → 保留默认 0）
 - AMP+compile 验证通过（test=0.812282 +0.00079）
 - EDA 全量画像（907K rows，13 节报告，4 方向决策齐全）
 - ❌ warmup+cosine 实验：val ↑ 0.0012 / test ↓ 0.0015（F19，反向）
-- ❌ hyformer_blocks=4 实验：val -0.0007 / per-epoch 2x（F20，反向，CLAUDE.md ❌ "模型 scaling" 反模式实证）
-- ❌ emb_skip_threshold=6M 实验：val ↑ 0.0006 / **test ↓ 0.0021** / GRAM 24G（F21，反向，但发现 reinit × obs/row 关键约束）
+- ❌ hyformer_blocks=4 实验：val -0.0007 / per-epoch 2x（F20，反向）
+- ❌ emb_skip_threshold=6M 实验：val ↑ 0.0006 / **test ↓ 0.0021** / GRAM 24G（F21，反向，发现 reinit × obs/row 关键约束）
+- ✅ **W1.0.3 LongerEncoder bug fix**（feature/longer-gather-fix，未 push）：修了 2 个 bug（gather 方向 + mask layout 反转，F22）
+- ❌ **W1.7 cap 512 longer 实验**：E2 (longer + head + cap 512) val 0.861586 (-0.0006) / **test 0.794199 (-0.0181)** / 7 min/epoch（F23，反向，longer 主场劣势）
 
 **待跑实验**（按 ROI 排序）：
-1. **W1.0.3 修 LongerEncoder + unit test**（半天，前置）
-2. **W1.7 seq_d cap 512→2048 + AMP-only**（1 天，最大金矿，EDA 实测 90.5% 截断 / 1.79B tokens 浪费）
-3. **W1.10 emb_skip 复活 hash trick**（v0.3.4 路径裁剪后）：fid 69 hash 171K → fid 47 hash 100K → fid 29 freq truncate top-100K（obs/row 都过 ≥1000 门槛，详见 spec 附录 D.9）；❌ raise threshold 路径已 F21 闭环
+1. **等 E4 激进版结果**（跑中）：top_k=100, seq 512/512/1024/2048；longer encoder 真正主场测试，按 F23 矩阵分级解读
+2. **E4 出后立刻 push `feature/longer-gather-fix`** + 把 E4 数据加进 spec
+3. **W1.10 emb_skip 复活 hash trick**（独立于 W1.7 可并行）：fid 69 hash 171K → fid 47 hash 100K → fid 29 freq truncate top-100K
 4. （中优先）W1.0.2 加 `--dense_weight_decay` CLI（W2.1 前置，但 W2.1 已降级）
-5. （低优先）W1.9 row group 时间分布检查（验证 train tail vs val head）
+5. （低优先）W1.9 row group 时间分布检查
 
-## 已知 baseline 问题（v0.3.4 spec F15-F21）
+## 已知 baseline 问题（v0.3.5 spec F15-F23）
 
 1. ✅🔥 **F15 / W1.0.1 已结**：reinit threshold=0 是模型不崩的底线（Run Y threshold=10000 best val 卡在 epoch 2，patience 耗尽 EarlyStopping）。**绝对不要碰这条线**。CLI help（`train.py:158`）写的"0=never reset"是错的，但代码行为对，留着别动。
-2. **F16 / W1.0.3 未修（W1.7 blocker）**：`model.py:691` LongerEncoder 取序列尾部，但序列倒序（pos 0=最近），实际取的是**最老**而非最新。当前 transformer 没触发，W1.7 走 longer 必须先修。
+2. ✅ **F16 / W1.0.3 已修**（v0.3.5）：`feature/longer-gather-fix` 修了 LongerEncoder gather 方向（取头=最新）+ mask layout 反转（`pos >= n_valid`）；新增 `--longer_gather_side` CLI（tail 保留旧行为做 A/B）；下游 wiring 复核通过；详见 F22
 3. **F17 / W1.0.2 未修**：`trainer.py:87` AdamW 没暴露 dense `weight_decay`（用 PyTorch 默认 0.01）。W2.1 扫参前要加 `--dense_weight_decay` CLI（但 v0.3.3 W2.1 已降级，不急）。
 4. ✅ **F18 EDA 完成**：Direction 1 (UNK/OOV) 死、Direction 3 (长序列) 锁定为最大金矿、Direction 2 (emb_skip) 4 fid 全有信号
 5. ✅🔴 **F19 warmup+cosine 失败**：val/test 已 divergence，**纯靠 val 涨不能再判定 trick 有效**
 6. ✅🔴 **F20 hyformer_blocks=4 失败**：depth scaling 反模式实证，这条路闭环
-7. ✅🔴 **F21 emb_skip_threshold=6M 失败**：raise threshold 路径死，但发现 **reinit × obs/row 关键约束**——复活方案必须满足 obs/row ≥ 1000（spec 附录 D.9），baseline 现有 emb 都满足，hash 100K-171K 桶也满足，但 raise threshold 全表必然 < 100 → 模型学不动
+7. ✅🔴 **F21 emb_skip_threshold=6M 失败**：raise threshold 路径死，但发现 **reinit × obs/row 关键约束**——复活方案必须满足 obs/row ≥ 1000（spec 附录 D.9）
+8. ✅ **F22 W1.0.3 修复完成**（v0.3.5）：见上 F16；同时修了 mask layout 反转隐藏 bug（仅 valid_len < K 触发，baseline 不走 longer 路径所以从未被触发）
+9. ✅🔴 **F23 W1.7 cap 512 longer 失败**：E2 val 0.861586 (-0.0006) / **test 0.794199 (-0.0181)**；val/test gap 拉大 +0.0171（F19/F21 量级 ~10x）；诊断为 longer encoder 设计代价（50-query bottleneck），不是 fix bug；E4 激进版（top_k=100, 长 cap）跑中验证长 cap 是否摊薄
 
-## v0.3.4 战略提示
+## v0.3.5 战略提示
 
 - **baseline 已在过拟合悬崖上**——靠 reinit threshold=0 续命（v0.3.2 已证）
-- **val 已偏离 test 分布**（v0.3.3 F19 + v0.3.4 F21 双证据）：W2 扫参不能纯靠 val，必须周期性消耗 test 提交校准
-- **复活高基数特征前先算 obs/row（v0.3.4 新约束）**：reinit threshold=0 强制要求复活后表的 obs/row ≥ 1000，否则 1 epoch 内学不动；hash trick 100K-200K 桶刚好满足，raise threshold 必然违反
-- W2 优先级（v0.3.4 强化）：
-  - 🔥 **信息层（最高）**：W1.7 长序列（EDA 量化最大金矿）→ W1.10 emb_skip hash trick → W2.6 target∈seq 交互
-  - **正则化层（最低）**：W2.1-2.5 期望收益 +0.0005~0.002（warmup+cosine 实测反向后进一步打折）
-  - ❌ **死路**：depth scaling、OOV→UNK 改造、warmup+cosine LR schedule、raise emb_skip_threshold 直接复活全表
+- **val 已偏离 test 分布**（F19 + F21 + F23 三证据）：W2 扫参不能纯靠 val，必须周期性消耗 test 提交校准
+- **复活高基数特征前先算 obs/row**（v0.3.4 新约束）：reinit threshold=0 强制要求复活后表的 obs/row ≥ 1000；hash trick 100K-200K 桶刚好满足
+- **LongerEncoder cap 512 是劣势主场**（v0.3.5 新事实）：第一个 block 后 50-query 永久压缩 512 tokens，下游再不见原序列；cap 必须拉到 ≥ 1024 才有机会反超 transformer
+- W2 优先级（v0.3.5 强化）：
+  - 🔥 **信息层（最高）**：W1.7 长序列（E4 验证中）→ W1.10 emb_skip hash trick → W2.6 target∈seq 交互
+  - **正则化层（最低）**：W2.1-2.5 期望收益 +0.0005~0.002（多次反向实测后进一步打折）
+  - ❌ **死路**：depth scaling、OOV→UNK 改造、warmup+cosine LR schedule、raise emb_skip_threshold 直接复活全表、cap 512 + LongerEncoder
 - 不要往 baseline 身上再压重正则化（dropout 0.3 / wd 1e-2 大概率推过悬崖）
 
 ## 数据关键事实
@@ -107,6 +112,7 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 - ❌ **纯靠 val 涨判定 trick 有效**：v0.3.3 F19 实证 val/test 已 divergence，必须周期性消耗 test 提交校准
 - ❌ **OOV → UNK 改造**：v0.3.3 F18 EDA 实测所有 fid val OOV < 1%，无 ROI
 - ❌ **raise emb_skip_threshold 直接复活全表**：v0.3.4 F21 实证 val ↑ test ↓ / GRAM 24G；reinit × obs/row 约束（spec 附录 D.9）证明全表复活的 obs/row 必然 < 100，模型学不动 → 必须走 hash trick / freq truncate 中转
+- ❌ **cap 512 + LongerEncoder**：v0.3.5 F23 实证 test -0.0181；longer encoder 第一个 block 后 50-query 永久压缩到固定长度，cap 512 是 transformer 主场尺寸，longer 设计 ceiling 必然更低 → longer 路径必须搭配长 cap (≥1024)
 - ❌ **白天跑长实验**：被抢卡严重，跑实验尽量挪到半夜
 - ❌ **并行 A/B 跑同一张物理卡**：用 `CUDA_VISIBLE_DEVICES` 隔离到不同 GPU
 - ❌ **改 `taac2026_schema.json` 来做特征工程**：它不上传，改了没用
