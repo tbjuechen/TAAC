@@ -19,6 +19,48 @@ class ModelInput(NamedTuple):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# W2.6 重写 — Pair-weighted pool (int, dense) parallel pairs
+# See docs/superpowers/specs/2026-05-03-pair-feature-design.md
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# fid 列表（vocab fid number, NOT schema index）— 触发 weighted pool 的 user_int 多值特征
+# fid 89-91 不在此列表（log1p 不适合双边 bounded 分布；本期保持 uniform）
+PAIR_WEIGHTED_FIDS = [62, 63, 64, 65, 66]
+
+
+def _pool_multivalue(
+    emb_all: torch.Tensor,                    # (B, length, emb_dim)
+    vals: torch.Tensor,                       # (B, length) int values used for padding mask
+    paired_value: Optional[torch.Tensor],     # (B, length) dense values, or None
+    weight_mode: str,                         # 'uniform' or 'log1p'
+) -> torch.Tensor:
+    """Pool multi-value embeddings, optionally weighted by paired dense values.
+
+    Returns: (B, emb_dim).
+
+    - weight_mode='uniform' or paired_value is None: mean-pool ignoring padding (=0).
+    - weight_mode='log1p': w_i = log1p(clamp_min(paired_value_i, 0)) * mask_i.
+      If sum(w) ~ 0 (dense all zero but ids valid), fall back to uniform mean-pool.
+      If mask sum ~ 0 (ids all padding), output 0 (matches baseline behavior).
+    """
+    mask = (vals != 0).float().unsqueeze(-1)              # (B, length, 1)
+    mask_count = mask.sum(dim=1).clamp(min=1)             # (B, 1)
+    uniform_pool = (emb_all * mask).sum(dim=1) / mask_count  # (B, emb_dim)
+
+    if weight_mode == 'uniform' or paired_value is None:
+        return uniform_pool
+
+    # log1p weighted pool
+    eps = 1e-8
+    w = torch.log1p(paired_value.clamp(min=0)) * mask.squeeze(-1)  # (B, length)
+    W = w.sum(dim=1, keepdim=True)                                  # (B, 1)
+    weighted_pool = (emb_all * w.unsqueeze(-1)).sum(dim=1) / W.clamp(min=eps)
+    # Fallback: where W <= eps (dense all zero), use uniform_pool
+    use_weighted = (W > eps).float()                                # (B, 1)
+    return weighted_pool * use_weighted + uniform_pool * (1 - use_weighted)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Rotary Position Embedding (RoPE)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1062,12 +1104,11 @@ class GroupNSTokenizer(nn.Module):
                         # Single-value feature: direct lookup
                         fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
                     else:
-                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
+                        # Multi-value feature: optional value-weighted pool
                         vals = int_feats[:, offset:offset + length].long()  # (B, length)
-                        emb_all = emb_layer(vals)  # (B, length, emb_dim)
-                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
-                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                        emb_all = emb_layer(vals)                            # (B, length, emb_dim)
+                        paired_value = (paired_dense or {}).get(fid_idx, None)
+                        fid_emb = _pool_multivalue(emb_all, vals, paired_value, weight_mode)
                 fid_embs.append(fid_emb)
             cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
