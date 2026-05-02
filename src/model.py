@@ -1281,6 +1281,10 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Pair-weighted pool (W2.6 重写) — see PAIR_WEIGHTED_FIDS
+        user_paired_dense_specs: Optional[dict] = None,  # {fid: (doff, dlen)}
+        user_int_fids: Optional[List[int]] = None,       # fid order matching user_int_feature_specs
+        pair_weight_mode: str = 'uniform',
     ) -> None:
         super().__init__()
 
@@ -1295,6 +1299,15 @@ class PCVRHyFormer(nn.Module):
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
+
+        # Pair-weighted pool: build {fid_idx: (doff, dlen)} so the user NS tokenizer
+        # can grab the paired dense slice for each multi-value fid in PAIR_WEIGHTED_FIDS.
+        self.pair_weight_mode = pair_weight_mode
+        self._paired_fid_idx_to_slice: dict = {}
+        if user_paired_dense_specs and user_int_fids:
+            for fid_idx, fid in enumerate(user_int_fids):
+                if fid in user_paired_dense_specs:
+                    self._paired_fid_idx_to_slice[fid_idx] = user_paired_dense_specs[fid]
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1683,10 +1696,29 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
+    def _build_paired_dense(self, inputs: ModelInput) -> Optional[dict]:
+        """Slice user_dense_feats into per-fid_idx (B, length) tensors for weighted pool.
+
+        Returns None if pair-weighted pool is disabled (uniform mode or empty specs),
+        which makes downstream tokenizer take the original mean-pool path.
+        """
+        if self.pair_weight_mode == 'uniform' or not self._paired_fid_idx_to_slice:
+            return None
+        ud = inputs.user_dense_feats
+        return {
+            fid_idx: ud[:, doff:doff + dlen]
+            for fid_idx, (doff, dlen) in self._paired_fid_idx_to_slice.items()
+        }
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
+        paired_dense = self._build_paired_dense(inputs)
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats,
+            paired_dense=paired_dense,
+            weight_mode=self.pair_weight_mode,
+        )   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
         ns_parts = [user_ns]
@@ -1729,7 +1761,12 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        paired_dense = self._build_paired_dense(inputs)
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats,
+            paired_dense=paired_dense,
+            weight_mode=self.pair_weight_mode,
+        )
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]
