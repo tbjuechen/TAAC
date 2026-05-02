@@ -2,6 +2,11 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
+# ---- W2.6 pair-weighted pool A/B (default = baseline) ----
+#   PAIR_WEIGHTED_POOL=none  bash run.sh   # baseline mean-pool
+#   PAIR_WEIGHTED_POOL=log1p bash run.sh   # treatment: log1p-weighted pool on fid 62-66
+PAIR_WEIGHTED_POOL="${PAIR_WEIGHTED_POOL:-none}"
+
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
@@ -14,6 +19,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --use_amp \
     --use_compile \
     --compile_mode reduce-overhead \
+    --pair_weighted_pool "$PAIR_WEIGHTED_POOL" \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
@@ -31,4 +37,5 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --use_amp \
 #     --use_compile \
 #     --compile_mode reduce-overhead \
+#     --pair_weighted_pool "$PAIR_WEIGHTED_POOL" \
 #     "$@"
