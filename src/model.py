@@ -1031,11 +1031,18 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(self, int_feats: torch.Tensor,
+                paired_dense: "dict | None" = None,
+                weight_mode: str = 'uniform') -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
             int_feats: (B, total_int_dim), concatenated integer features.
+            paired_dense: Optional dict {fid_idx: (B, length) dense tensor} for
+                value-weighted pooling. Only fid_idx in this dict gets weighted
+                treatment; others use uniform mean-pool. Default None = all uniform.
+            weight_mode: 'uniform' (default, bit-equivalent to baseline) or
+                'log1p' (use log1p(clamp_min(value, 0)) as pool weights).
 
         Returns:
             Tokens of shape (B, num_groups, D).
@@ -1145,11 +1152,16 @@ class RankMixerNSTokenizer(nn.Module):
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(self, int_feats: torch.Tensor,
+                paired_dense: "dict | None" = None,
+                weight_mode: str = 'uniform') -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
+            paired_dense: Optional dict {fid_idx: (B, length) dense tensor} for
+                value-weighted pooling. See GroupNSTokenizer.forward.
+            weight_mode: 'uniform' (default, bit-equivalent to baseline) or 'log1p'.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
