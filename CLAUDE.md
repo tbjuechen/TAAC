@@ -8,7 +8,9 @@
 
 ## 主要 spec（先读这个）
 
-`docs/superpowers/specs/2026-05-01-taac-improvement-plan.md` —— 当前 v0.3，包含 W1-W3 完整作战图、关键事实表（F1-F17）、附录 A-D。**任何后续工作都从这份 spec 起步**，不要重新规划。
+`docs/superpowers/specs/2026-05-01-taac-improvement-plan.md` —— 当前 **v0.3.3**，包含 W1-W3 完整作战图、关键事实表（**F1-F20**）、附录 A-D。**任何后续工作都从这份 spec 起步**，不要重新规划。
+
+**EDA 报告**：`docs/eda/2026-05-01-data-profile.md` + `.json`（907K val rows 全数据画像，4 方向决策依据齐全）
 
 ## 仓库布局
 
@@ -40,37 +42,50 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 - **A/B 启发法**：6 epoch 收敛 ≈ 每 epoch +0.001；**3 epoch 足够诊断 ≥ 0.0015 量级差异**，可砍 50% 算力
 - **实验预算**：理论 30-50 次完整训练；考虑虚拟化高峰损耗按 **15-25 次** 算
 
-## 当前活跃工作
+## 当前活跃工作（v0.3.3 / 5/2 早）
 
-**Branch**：`feature/compile-training`（已合并 AMP / compile / tf32）
-**最高优先级**：W1.0.2（dense_wd）+ W1.0.3（修 LongerEncoder）+ W1.10 spot-check
-**已完成**：W1.0.1 reinit A/B（threshold=10000 掉 0.0015 → 保留默认 0）
-**待跑实验**：
-1. AMP+compile 叠加 baseline（确认两个一起开不冲突）
-2. 用 1 次每日 test 提交验证 AMP+compile 不掉点
-3. W1.10 高基数特征复活 A/B（W1.0.3 修完后并行进行）
+**Branch**：`main`（feature/compile-training / feature/data-profiling / feature/warmup-lr 都已合或废）
+**最高优先级**：**W1.0.3 修 LongerEncoder bug**（半天，纯 bug fix）→ 解锁 **W1.7 长序列实验**（EDA 锁定为最大金矿）
+**已完成**：
+- W1.0.1 reinit A/B（threshold=10000 掉 0.0015 → 保留默认 0）
+- AMP+compile 验证通过（test=0.812282 +0.00079）
+- EDA 全量画像（907K rows，13 节报告，4 方向决策齐全）
+- ❌ warmup+cosine 实验：val ↑ 0.0012 / test ↓ 0.0015（F19，反向）
+- ❌ hyformer_blocks=4 实验：val -0.0007 / per-epoch 2x（F20，反向，CLAUDE.md ❌ "模型 scaling" 反模式实证）
 
-## 已知 baseline 问题（v0.3.2 spec F15-F17）
+**待跑实验**（按 ROI 排序）：
+1. **W1.0.3 修 LongerEncoder + unit test**（半天，前置）
+2. **W1.7 seq_d cap 512→2048 + AMP-only**（1 天，最大金矿，EDA 实测 90.5% 截断 / 1.79B tokens 浪费）
+3. **W1.10 emb_skip 复活 A/B**：fid 69 hash 171K → fid 47 hash 100K → fid 29 freq truncate（EDA 已给方案，不再需要 spot-check）
+4. （中优先）W1.0.2 加 `--dense_weight_decay` CLI（W2.1 前置，但 W2.1 已降级）
+5. （低优先）W1.9 row group 时间分布检查（验证 train tail vs val head）
 
-未修，影响后续实验解读：
+## 已知 baseline 问题（v0.3.3 spec F15-F20）
 
-1. ✅🔥 **F15 / W1.0.1 已结，结论比预期重**：A/B 实验显示 threshold=10000 不只是"略差 0.0015"——Run Y **best val 卡在 epoch 2（0.857339），epoch 3 起反向下降直到 EarlyStopping**。Run X（默认 0）val 6 epoch 单调涨到 0.862207。**reinit threshold=0 不是"刻意激进的优化"，是模型不崩的底线**。**绝对不要碰这条线**。CLI help（`train.py:158`）写的"0=never reset"是错的，但代码行为对，留着别动。
-2. **F16 / W1.0.3**：`model.py:691` LongerEncoder 取序列尾部，但序列倒序（pos 0=最近），实际取的是**最老**而非最新。当前 transformer 没触发，W1.7 走 longer 必须先修。
-3. **F17 / W1.0.2**：`trainer.py:87` AdamW 没暴露 dense `weight_decay`（用 PyTorch 默认 0.01）。W2.1 扫参前要加 `--dense_weight_decay` CLI。
+1. ✅🔥 **F15 / W1.0.1 已结**：reinit threshold=0 是模型不崩的底线（Run Y threshold=10000 best val 卡在 epoch 2，patience 耗尽 EarlyStopping）。**绝对不要碰这条线**。CLI help（`train.py:158`）写的"0=never reset"是错的，但代码行为对，留着别动。
+2. **F16 / W1.0.3 未修（W1.7 blocker）**：`model.py:691` LongerEncoder 取序列尾部，但序列倒序（pos 0=最近），实际取的是**最老**而非最新。当前 transformer 没触发，W1.7 走 longer 必须先修。
+3. **F17 / W1.0.2 未修**：`trainer.py:87` AdamW 没暴露 dense `weight_decay`（用 PyTorch 默认 0.01）。W2.1 扫参前要加 `--dense_weight_decay` CLI（但 v0.3.3 W2.1 已降级，不急）。
+4. ✅ **F18 EDA 完成**：Direction 1 (UNK/OOV) 死、Direction 3 (长序列) 锁定为最大金矿、Direction 2 (emb_skip) 4 fid 全有信号
+5. ✅🔴 **F19 warmup+cosine 失败**：val/test 已 divergence，**纯靠 val 涨不能再判定 trick 有效**
+6. ✅🔴 **F20 hyformer_blocks=4 失败**：depth scaling 反模式实证，这条路闭环
 
-## v0.3.2 战略提示
+## v0.3.3 战略提示
 
-- **baseline 已在过拟合悬崖上**——靠 reinit threshold=0 续命
-- W2 策略：**信息层（W1.7 长序列、W1.10 复活高基数、W2.6 target∈seq 交互特征）优先于正则化层（W2.1-2.5）**
-- 正则化层每个 trick 期望收益降到 +0.0005~0.002（不是原来的 0.001~0.003）
+- **baseline 已在过拟合悬崖上**——靠 reinit threshold=0 续命（v0.3.2 已证）
+- **val 已偏离 test 分布**（v0.3.3 F19 新证据）：W2 扫参不能纯靠 val，必须周期性消耗 test 提交校准
+- W2 优先级（v0.3.3 强化）：
+  - 🔥 **信息层（最高）**：W1.7 长序列（EDA 量化最大金矿）→ W1.10 emb_skip 复活 → W2.6 target∈seq 交互
+  - **正则化层（最低）**：W2.1-2.5 期望收益 +0.0005~0.002（warmup+cosine 实测反向后进一步打折）
+  - ❌ **死路**：depth scaling、OOV→UNK 改造、warmup+cosine LR schedule
 - 不要往 baseline 身上再压重正则化（dropout 0.3 / wd 1e-2 大概率推过悬崖）
 
 ## 数据关键事实
 
-- 序列**倒序**：pos 0 = 最近（数据分析报告确认）
-- train 集**无 OOV**（vocab 按 train max+1 建），test 集**有 OOV**
+- 序列**倒序**：pos 0 = 最近（数据分析报告 + EDA pos[0] median diff 验证 ✓）
+- train 集**无 OOV**（vocab 按 train max+1 建），test 集**有 OOV**；**v0.3.3 EDA 实测 val 集所有 fid OOV < 1%**（Direction 1 死）
 - demo 数据 row group 时间范围全部重叠 → 按 RG 切 ≈ 按行随机切；**线上数据待 W1.9 验证**
-- 4 个被 `emb_skip_threshold=1M` 跳过的高基数 seq 特征（fid 29/34/47/69 vocab 1M-86M），forward 返回零向量。复活方案见 spec 附录 D。
+- 4 个被 `emb_skip_threshold=1M` 跳过的高基数 seq 特征（fid 29/34/47/69 vocab 1M-86M），forward 返回零向量。**v0.3.3 EDA 决策**：fid 69 hash 171K / fid 47 hash 100K / fid 29 freq truncate 100K / fid 34 信号弱可保 skip。详见 spec 附录 D.2.5。
+- **序列截断浪费严重（v0.3.3 EDA 实测）**：seq_d cap=512 vs p99=3962 → **90.5% 截断率 / 1.79B tokens 被扔**；seq_a 73% / seq_b 65% / seq_c 34% 截断；当前 baseline 只看到用户 10-30% 历史
 - 线上 schema 已收到（v0.2），ts_fid 设置正确（39/67/27/26），list dim 比 demo 大 1.4-2.3×
 
 ## 工程规范
@@ -82,9 +97,12 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 
 ## 反模式（不要做）
 
-- ❌ **模型 scaling**（d_model / num_layers）：当前 val/test gap 0.051 是过拟合，加大模型只会更糟
-- ❌ **碰 reinit_cardinality_threshold**：v0.3.2 已证它是模型不崩的底线，往任何方向改（10000、100、1000000）都会让训练 epoch 2 后崩
+- ❌ **模型 scaling**（d_model / num_layers / num_blocks）：v0.3.3 F20 实证 hyformer_blocks=4 val ↓ 0.0007 / per-epoch 2x；当前 val/test gap 0.051 是过拟合，加大模型只会更糟
+- ❌ **碰 reinit_cardinality_threshold**：v0.3.2 F15 已证它是模型不崩的底线，往任何方向改（10000、100、1000000）都会让训练 epoch 2 后崩
 - ❌ **再往 baseline 身上压重正则化**（dropout=0.3、wd=1e-2 等极端值）：已在过拟合悬崖上，更强正则会推过悬崖
+- ❌ **warmup+cosine LR schedule**：v0.3.3 F19 实证 val ↑ 0.0012 但 test ↓ 0.0015，gap 拉大 +0.0028
+- ❌ **纯靠 val 涨判定 trick 有效**：v0.3.3 F19 实证 val/test 已 divergence，必须周期性消耗 test 提交校准
+- ❌ **OOV → UNK 改造**：v0.3.3 F18 EDA 实测所有 fid val OOV < 1%，无 ROI
 - ❌ **白天跑长实验**：被抢卡严重，跑实验尽量挪到半夜
 - ❌ **并行 A/B 跑同一张物理卡**：用 `CUDA_VISIBLE_DEVICES` 隔离到不同 GPU
 - ❌ **改 `taac2026_schema.json` 来做特征工程**：它不上传，改了没用
