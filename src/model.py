@@ -1222,9 +1222,8 @@ class RankMixerNSTokenizer(nn.Module):
                     else:
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
-                        mask = (vals != 0).float().unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        paired_value = (paired_dense or {}).get(fid_idx, None)
+                        fid_emb = _pool_multivalue(emb_all, vals, paired_value, weight_mode)
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)

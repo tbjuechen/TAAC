@@ -3,6 +3,7 @@
 See docs/superpowers/specs/2026-05-03-pair-feature-design.md for design.
 """
 import torch
+import torch.nn.functional as F
 
 from model import GroupNSTokenizer, RankMixerNSTokenizer
 
@@ -159,3 +160,60 @@ def test_numerical_stability_huge_values():
     out = tok(int_feats, paired_dense={0: vals}, weight_mode='log1p')
 
     assert torch.isfinite(out).all(), f"Output must be finite (no inf/nan); got {out}"
+
+
+def test_rankmixer_log1p_changes_output():
+    """RankMixer log1p weighted pool must differ from uniform when vals are non-uniform."""
+    torch.manual_seed(0)
+    feature_specs, groups = _make_simple_specs()
+    tok = RankMixerNSTokenizer(
+        feature_specs=feature_specs, groups=groups,
+        emb_dim=8, d_model=16, num_ns_tokens=1, emb_skip_threshold=0,
+    )
+    tok.eval()
+
+    int_feats = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
+    vals = torch.tensor([[10.0, 20.0, 0.5, 0.0]])
+
+    out_uniform = tok(int_feats, paired_dense=None, weight_mode='uniform')
+    out_log1p = tok(int_feats, paired_dense={0: vals}, weight_mode='log1p')
+
+    assert torch.isfinite(out_uniform).all() and torch.isfinite(out_log1p).all()
+    assert not torch.allclose(out_uniform, out_log1p, atol=1e-5), \
+        "log1p with non-uniform vals must differ from uniform mode in RankMixer"
+
+
+def test_rankmixer_log1p_correctness_vs_groupns():
+    """When configured with shared embedding weights, RankMixer's pre-projection
+    embedding (i.e., the multi-value pool) must equal GroupNS's pool."""
+    torch.manual_seed(0)
+    feature_specs, groups = _make_simple_specs()
+    tok_g = GroupNSTokenizer(
+        feature_specs=feature_specs, groups=groups,
+        emb_dim=8, d_model=16, emb_skip_threshold=0,
+    )
+    tok_r = RankMixerNSTokenizer(
+        feature_specs=feature_specs, groups=groups,
+        emb_dim=8, d_model=16, num_ns_tokens=1, emb_skip_threshold=0,
+    )
+    # Force shared embedding weights so the multi-value pool inputs are identical
+    tok_r.embs[0].weight.data.copy_(tok_g.embs[0].weight.data)
+    tok_g.eval(); tok_r.eval()
+
+    int_feats = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
+    vals = torch.tensor([[10.0, 20.0, 0.5, 0.0]])
+
+    # Hand-compute the pool (same for both tokenizers because logic is shared)
+    emb = tok_g.embs[0]
+    e1, e2, e3 = emb(torch.tensor([1, 2, 3]))
+    w = torch.log1p(torch.tensor([10.0, 20.0, 0.5]))
+    expected_pool = ((w[0] * e1 + w[1] * e2 + w[2] * e3) / w.sum()).detach()
+
+    # Verify by hooking into RankMixer's internal cat (it cats per-group then projects).
+    # Since num_ns_tokens=1 and we have a single 8-dim emb, the chunk_dim should be 8
+    # and the projection is on the full 8-dim pool. Its pre-silu input should be
+    # tok_r.token_projs[0]'s linear applied to expected_pool.
+    out_r = tok_r(int_feats, paired_dense={0: vals}, weight_mode='log1p')
+    expected_token_r = F.silu(tok_r.token_projs[0](expected_pool.unsqueeze(0))).unsqueeze(1)
+    assert torch.allclose(out_r, expected_token_r, atol=1e-5), \
+        f"RankMixer log1p mismatch: got {out_r}, expected {expected_token_r}"
