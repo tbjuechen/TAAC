@@ -1,6 +1,6 @@
 # TAAC 2026 PCVR Baseline 改进计划（W1-W2）
 
-**Status**: v0.3.3 — EDA 完成（profile 报告 `docs/eda/2026-05-01-data-profile.md`）：**Direction 1 (UNK/OOV) 死**、**Direction 3 (长序列) 锁定最大金矿（seq_d 90.5% 截断 / 1.79B tokens 被扔）**、Direction 2 (emb_skip 复活) 4 fid 全有信号。两个反向实验：warmup+cosine **val ↑ 0.0012 / test ↓ 0.0015**（val 已偏离 test）；hyformer_blocks=4 **val ↓ 0.0007 / per-epoch 2x**（depth scaling 反模式实证）。W1.0.3 LongerEncoder bug 修复升级为下一步最高优先级（W1.7 长序列 blocker）
+**Status**: v0.3.4 — F21 emb_skip_threshold=6M 实验失败：val ↑ 0.0006 / **test ↓ 0.0021** / GRAM 24G。诊断到关键约束——**reinit threshold=0 强制要求 emb_skip 复活方案的 obs/row >> 1**：raise threshold 让 fid 29 (5.7M) / fid 34 (1M) 全量建表 → 平均 55-314 obs/row + 每 epoch 重置 = 模型学不动。**EDA 推荐的 hash trick 路径（fid 69 hash 171K / fid 47 hash 100K，1k-3k obs/row）仍未试，未被本次否定**。"raise emb_skip_threshold" 路径死，"hash trick" 路径仍待验证
 **Author**: brainstorming session 2026-05-01
 **Branch**: this doc lives on `main`; implementation work happens on feature branches
 **Deadline**: 提交截止 2026-05-23 AOE
@@ -8,6 +8,12 @@
 
 ## Changelog
 
+- **v0.3.4（2026-05-02 上午）**：emb_skip 复活第一次实验 + 关键约束发现：
+  - 🔴 **F21 emb_skip_threshold=6M 失败**：val 0.862207 → **0.862852 (+0.0006)** / test 0.812282 → **0.810162 (-0.0021)** / GRAM **24G**（vs baseline 12-13G）/ 28 min/epoch（+22%）。val/test gap 0.0499 → 0.0527（同 F19 模式）
+  - 🆕 **关键约束发现：reinit × emb_skip 的隐藏交互**：F15 reinit threshold=0 每 epoch 重置所有已建 emb；raise threshold 把 fid 29 (5.7M) / fid 34 (1M) 拉进 reinit 范围 → 平均 **55 / 314 obs/row** vs 每 epoch 清零 = 模型根本学不动这些超大表。EDA 推荐 hash 桶 100K-171K（**1k-3k obs/row**，跟 baseline 现有 emb 同量级）正是为了规避这个问题
+  - 🔄 **W1.10 路径裁剪**：~~raise emb_skip_threshold~~（路径错，F21 实证）；仍可走的两条 → (a) **hash trick**（fid 69 hash 171K / fid 47 hash 100K，附录 D.4）；(b) **freq truncate + UNK pooling**（fid 29，附录 D.6 改造）。fid 34 EDA 已判信号弱建议保 skip
+  - 📝 **附录 D.9 新增**：reinit × obs/row 约束量化分析；新增"复活方案 obs/row sanity check"作为前置门槛
+  - 📝 **反模式新增**：❌ raise emb_skip_threshold 直接复活全表（不走 hash / truncate 中转）
 - **v0.3.3（2026-05-02 早）**：EDA 完成 + 两个反向实验数据：
   - 🆕 **F18 EDA 完成**：`docs/eda/2026-05-01-data-profile.md`（907K val rows，13 节完整画像）。4 方向决策：
     - **Direction 1 (UNK/OOV) DEAD**：0 fid val OOV ≥ 1%，UNK token 改造无 ROI；W2 条件项里"OOV → UNK 改造"分支可砍
@@ -73,6 +79,7 @@
 | F18 | **EDA 完成（v0.3.3）**：profile 脚本 `src/profile_data.py` 跑出 907K val rows 全数据画像 → `docs/eda/2026-05-01-data-profile.md`。**4 方向决策**：(1) **Direction 1 UNK/OOV 死**：0 个 fid val OOV ≥ 1%，最高 OOV fid 也只 0.4%——UNK 改造无 ROI；(2) **Direction 2 emb_skip 复活**：fid 69 推荐 hash 171K / fid 47 hash 100K / fid 29 freq truncate（top-100K 覆盖 95%）/ fid 34 分布平摊（信号弱可保 skip）；(3) **Direction 3 长序列锁定最大金矿**：seq_d 当前 cap=512 vs p99=3962 → **90.5% 截断率 / 1.79B tokens 被扔**；seq_a/b/c 截断率 65-73%；当前 baseline 只看到用户 10-30% 历史；(4) **Direction 4 per-fid emb_dim 后置**：低 ROI 工程量；schema health check 全部通过（schema vocab vs 实测 max+1 一致） | `docs/eda/2026-05-01-data-profile.md` + `docs/eda/2026-05-01-data-profile.json` | W1.10 / W1.7 决策依据齐全；W2 条件项里 OOV 分支可砍；W1.7 升级为最高优先级 |
 | F19 | **warmup+cosine LR schedule 失败（v0.3.3）**：用户 5/2 凌晨实验，10 epoch，**val 0.862207 → 0.863439 (+0.0012)** 但 **test 0.812282 → 0.810773 (-0.0015)**。val/test gap 0.0499 → **0.0527（恶化 +0.0028）**。诊断：cosine 后段低 LR + 多跑 4 epoch 让模型在 val 分布上过精修，test (OOD) 没受益反而被坑。**含义**：(1) val ↑ **不再**可用作单独判据；(2) val 已偏离 test 分布（EDA 已报 train tail vs val head 时间不重叠）；(3) W2.1 扫参必须周期性消耗 test 提交校准，不能纯 val 选优 | 用户实验 / 5 月 2 日 | W2.1 警告增强；不要再单独靠 val 涨判定 trick 有效 |
 | F20 | **hyformer_blocks=4 (depth scaling) 失败（v0.3.3）**：用户 5/2 凌晨实验，5 epoch val **0.861496 (-0.0007)** / per-epoch **47min（2x baseline）** / GRAM 17G（接近 19G 上限）。CLAUDE.md "❌ 模型 scaling" 反模式实证 | 用户实验 / 5 月 2 日 | W2 后续不再做 d_model / num_layers 类实验；这条路闭环 |
+| F21 | **emb_skip_threshold=6M 失败 + 关键约束发现（v0.3.4）**：用户 5/2 上午实验，threshold 从 1M 拉到 6M 让 fid 29 (vocab=5.7M) + fid 34 (vocab=1.0M) 全量建表（fid 47 / fid 69 仍被 skip）。结果：6 epoch val **0.862852 (+0.0006)** / test **0.810162 (-0.0021)** / GRAM **24G**（vs baseline 12-13G，**+10G**）/ 28 min/epoch（+22%）。val/test gap 0.0499 → 0.0527（同 F19 模式）。**深层失败原因**：F15 reinit threshold=0 每 epoch 清零所有已建 emb；raise threshold 让 fid 29/34 进入 reinit 范围 → 平均 **fid 29: 55 obs/row**（314M obs / 5.7M rows）/ **fid 34: 314 obs/row** + 每 epoch 重置 = 模型实际学不动这些大表，反而引入了未学好的零向量噪声拖累 test。**重要不否定**：EDA 推荐的 hash 100K-171K 桶平均 obs/row 是 1k-3k（跟 baseline 现有 user/item emb 同量级），仍然可走 | 用户实验 / 5 月 2 日 | W1.10 路径裁剪：raise threshold 死、hash trick / freq truncate 仍可试；新增 obs/row sanity check（附录 D.9）作为复活方案前置门槛 |
 
 ---
 
@@ -123,7 +130,7 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 | W1.6 | **OOV 频次统计（v0.3 加分母）**：dataset 当前 `_oob_stats` 只记 OOV 计数无总曝光分母 → 加每特征曝光 counter；valid 当前 num_workers=0 单进程没汇总问题，但要在文档里标注"valid 改 num_workers > 0 时必须 manual reduce 各 worker stats"；输出 `oov_rate = oob_count / total_count` 按率排序 | 半天 | 输出按 OOV 率排序的特征列表，含分母 | train 集理论 OOV=0（vocab 按 train max+1 建），重点测**线上完整数据集**含 test 隐式 OOV |
 | W1.7 | **长序列显存试点（v0.3.3 升级为最高优先级，EDA 已量化潜力）**：EDA F18 数据——seq_d 当前 cap=512 vs p99=3962 / **90.5% 截断率 / 1.79B tokens 被扔**；seq_a 65% trunc / seq_b 73% trunc / seq_c 68% trunc。当前 baseline 只看到用户 10-30% 历史。计划：走 `--seq_encoder_type longer`（**前提：W1.0.3 已修 top-k 方向 bug**）；优先把 seq_d cap 从 512 拉到 2048（覆盖率 9.5% → 99%）；在线上数据上二分查找 OOM 边界；**优先 AMP-only 配置**（不带 compile，省 33% 显存，W1.1 实测）；如果 longer 修完后 AUC 不掉于 transformer baseline 则升级 seq_max_lens | 半天 | seq_d cap 提到 ≥ 1024 + val AUC 不掉于 transformer baseline；理想 +0.005~0.010（信息层金矿） | 线上 list dim 比 demo 大 2.3×（user_int_feats_66：66→150），显存压力远大于 demo |
 | ~~W1.8~~ | ~~修复 schema.json 的 ts_fid~~ | ~~半天~~ | ~~**取消**：线上 schema 已正确设置 ts_fid（F11），time_bucket embedding 在线上正常工作~~ | — |
-| **W1.10**（v0.3 扩） | **排查并复活 emb_skip 跳过的高基数 seq 特征**：详细方案见**附录 D**。三步走——(1) 跑 spot-check 脚本看 4 个 fid 取值分布（1h）；(2) 按附录 D 决策树选复活方案（A: hash trick / B: bucket / C: dense / D: 保持 skip）；(3) 改 schema + dataset 实施 + 跑 1 次 6-epoch A/B 验证 | 1.5 天（spot-check + 实施 + A/B） | 至少 1 个被复活的特征带 ≥ 0.001 val AUC 提升；其他特征做出明确保留/丢弃判断 | 4 个 fid 可能本来就是噪声，复活反而掉点；A/B 必做，掉点立即回退 |
+| **W1.10**（v0.3.4 路径裁剪）| **复活 emb_skip 跳过的高基数 seq 特征**：详细方案见**附录 D**。**v0.3.4 警告**：F21 实验证明 raise emb_skip_threshold（直接全量建表）路径死——fid 29/34 平均 55-314 obs/row 配合 reinit threshold=0 模型学不动 + test ↓ 0.0021。仍可走的路径：(a) **hash trick**（附录 D.4）：fid 69 hash 171K（1042 obs/row）/ fid 47 hash 100K（3140 obs/row）；(b) **freq truncate**（附录 D.6 改造）：fid 29 top-100K + UNK pooling（3140 obs/row）。**前置门槛（附录 D.9）**：任何复活方案必须满足 obs/row ≥ 1000 才值得跑 A/B；fid 34 EDA 信号弱 + 平均 314 obs/row（边缘），保 skip | 1 天（fid 69 + fid 47 hash A/B 各 1 次） | 至少 1 个被复活的特征带 ≥ 0.001 val + ≥ 0 test 提升；其他特征做明确保留/丢弃判断 | reinit × obs/row 约束已在 F21 实证；hash trick 仍可能掉点（dataset 改动 bug、hash 冲撞、特征本身就是噪声等）；A/B 必跑，掉点立即回退 |
 | **W1.9** | **真实数据上验证 row group 时间分布（待验证）**：在线上数据上跑 `pf.metadata.row_group(i)` 拿每个 RG 的 timestamp min/max，判断是按时间累积（连续）还是混合抽样（重叠） | 1 小时 | 给出明确判断：当前 val 是时间 holdout 还是随机 holdout | 看真实数据 |
 
 ### W1 总投入与执行顺序
@@ -240,7 +247,7 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 
 ---
 
-## 接续动作（v0.3.3 重写——5/2 早起后状态）
+## 接续动作（v0.3.4 增量更新——5/2 上午状态）
 
 ### ✅ 已完成（v0.1 → v0.3.2）
 
@@ -255,34 +262,44 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 6. **warmup+cosine 实验**（5/1 夜）：失败，val ↑ test ↓，gap 拉大 → 闭环（F19）
 7. **hyformer_blocks=4 实验**（5/1 夜）：失败，depth scaling 反模式实证 → 闭环（F20）
 
+### ✅ v0.3.4 新增已完成
+
+8. **emb_skip_threshold=6M 实验**（5/2 上午）：失败，val ↑ 0.0006 / test ↓ 0.0021 / GRAM 24G → raise threshold 路径死，但发现 reinit × obs/row 关键约束（F21 + 附录 D.9）
+
 ### 🔥 立刻做（5/2-5/3，按 ROI 排序）
 
 1. **W1.0.3 修 LongerEncoder top-k 方向 + unit test**（半天）—— **W1.7 长序列实验的硬 blocker**，纯 bug fix，零参数调整
 2. **W1.7 长序列实验**（1 天）—— EDA 已锁定为最大金矿（seq_d 90.5% 截断 / 1.79B tokens 浪费）；前置 W1.0.3 修完，把 seq_d cap 从 512 拉到 2048（覆盖率 9.5% → 99%），用 AMP-only 配置（省 33% 显存）
-3. **W1.10 emb_skip 复活 spot-check 已完成**（EDA F18）→ **直接进 A/B 阶段**：fid 69 hash 171K + fid 47 hash 100K + fid 29 freq truncate 各跑 1 次 6-epoch；fid 34 信号弱可保 skip
+3. **W1.10 emb_skip 复活 hash trick 路径 A/B**（v0.3.4 路径裁剪后）：
+   - 优先 **fid 69 hash 171K**（obs/row=1046，最高 ROI 候选）
+   - 然后 **fid 47 hash 100K**（obs/row=3148）
+   - 可选 **fid 29 freq truncate top-100K + UNK**（obs/row=3147，实施稍重，需要 train pass 预统计 top-K）
+   - ❌ ~~fid 34~~ 跳过（EDA 信号弱 + obs/row 边缘）
+   - ❌ ~~raise emb_skip_threshold~~ 路径已 F21 闭环
 
 ### 🔧 中优先（5/4-5/5）
 
 4. **W1.0.2 加 `--dense_weight_decay` CLI 参数**（1h）—— W2.1 扫参前置，但 W2.1 优先级在 v0.3.3 已经降低，不急
-5. **W1.9 row group 时间分布检查**（1h）—— 验证 train tail vs val head 的时间 gap，跟 F19 val/test divergence 对照
+5. **W1.9 row group 时间分布检查**（1h）—— 验证 train tail vs val head 的时间 gap，跟 F19 / F21 val/test divergence 对照
 
 ### 📝 低优先 / 工程债
 
 6. 修 `train.py:158` CLI help 文档错误（"0=never reset" → "0=most aggressive"）
 7. profile_data.py 进度日志 bug（modulo 不对齐，第二次没打 log）
 
-### 🚫 不再做（v0.3.3 闭环）
+### 🚫 不再做（v0.3.3 + v0.3.4 闭环）
 
 - ❌ Direction 1 OOV→UNK 改造（F18 实测无 ROI）
 - ❌ 任何 d_model / num_layers / num_blocks 类 depth scaling（F20 实证）
-- ❌ 单纯靠 val 涨判定 trick 有效（F19 实证 val/test divergence）
+- ❌ 单纯靠 val 涨判定 trick 有效（F19 / F21 双实证 val/test divergence）
 - ❌ warmup+cosine LR schedule（F19）
+- ❌ **raise emb_skip_threshold 直接复活全表**（F21 实证；obs/row 必然 < 1000 不通过门槛）
 
 ### 决策点（W1.7 跑完后）
 
 W1.7 长序列实验结果出来后，根据 val + test 数据决定：
-- 涨 ≥ 0.005：W2 主线挪到信息层组合（W1.7 + W1.10 + W2.6），正则化层降级为"如果有冗余算力"
-- 涨 0.001~0.005：保留 W1.7，继续做 W1.10 / W2.6
+- 涨 ≥ 0.005：W2 主线挪到信息层组合（W1.7 + W1.10 hash trick + W2.6），正则化层降级为"如果有冗余算力"
+- 涨 0.001~0.005：保留 W1.7，继续做 W1.10 hash trick / W2.6
 - 涨 < 0.001 或反向：检查 LongerEncoder 实现，必要时回到 transformer + 长序列（O(L²) 显存代价）
 
 
@@ -378,7 +395,7 @@ W1.10 要做的事：spot-check 真实数据上每个 fid 的取值分布。判�
 
 ## 附录 D：emb_skip 特征复活决策树（W1.10 详细方案）
 
-### D.1 emb_skip 与 reinit 是两个独立机制（v0.3 新增）
+### D.1 emb_skip 与 reinit 在 baseline 下独立，复活时强相互作用（v0.3.4 升级）
 
 容易看混的两个 threshold：
 
@@ -387,7 +404,9 @@ W1.10 要做的事：spot-check 真实数据上每个 fid 的取值分布。判�
 | `--emb_skip_threshold` | 是否**建** embedding 表 | 模型构建时（一次性） | **1,000,000**（显式设） | 准确 |
 | `--reinit_cardinality_threshold` | 是否**重置**已建 embedding | 每 epoch 末尾 | **0**（默认值） | **错**（见 F15） |
 
-emb_skip 跳过的表**根本没建出来**——forward 返回零向量（`model.py` 中 `if real_idx == -1`），等价于"特征被删除"。reinit 也碰不到它们。两个机制完全独立。
+**baseline 状态**（threshold=1M）：emb_skip 跳过的 4 个表**根本没建出来**——forward 返回零向量（`model.py` 中 `if real_idx == -1`），等价于"特征被删除"。reinit 也碰不到它们。两个机制独立。
+
+**复活后状态**（如 F21 raise threshold to 6M）：被复活的 fid 进入 reinit 范围 → **每 epoch 清零**。如果该 fid 的 obs/row 不够大，模型 1 epoch 内拿不到足够梯度信号学好这些 row → 复活引入的不是有效信号，是未学好的零向量噪声。**这就是 F21 test ↓ 0.0021 的根本原因**。详见 D.9。
 
 ### D.2 4 个被 skip 特征 spot-check 脚本
 
@@ -528,10 +547,40 @@ schema 里这个 fid 的 vocab 改成 100；其余流程同方案 A。
 
 | A/B 结果 | 动作 |
 |---|---|
-| val AUC 涨 ≥ 0.001 | 保留复活 |
-| val AUC 持平（±0.001） | 选省显存的（保留 D：继续 skip） |
+| val AUC 涨 ≥ 0.001 **且 test 不掉** | 保留复活 |
+| val AUC 持平（±0.001）或 val ↑ test ↓（F19 / F21 模式）| 回退（保留 D：继续 skip）；**v0.3.4 提醒**：纯 val 涨不能判定有效，必须 test 提交校准 |
 | val AUC 掉 ≥ 0.001 | 回退；如果是 modulo，先升级 xxhash 再试一次；仍掉就 fallback 到 D |
 
 每个 fid **独立 A/B**——可能 fid=69 复活有效但 fid=47 复活掉点，最终保留前者跳过后者。
+
+### D.9 obs/row sanity check（v0.3.4 新增，复活方案前置门槛）
+
+**核心约束**（F21 实证 + F15 推导）：reinit threshold=0 每 epoch 清零所有已建 emb，所以复活后的表必须满足"每行平均收到足够梯度信号"才能在 1 epoch 内学到东西。**经验门槛：obs/row ≥ 1000**（跟 baseline 现有 user/item emb 同量级）。
+
+**计算方式**（来自 EDA 数据）：
+
+```
+obs/row = total_observations(fid) / 复活后表的 row 数
+```
+
+**4 个 fid 在不同复活方案下的 obs/row**：
+
+| fid | total_obs | 方案 | 表大小 | obs/row | 评估 |
+|---|---|---|---|---|---|
+| 69 | 178,843,744 | hash 171K | 171,052 | **1,046** | ✅ 通过门槛 |
+| 69 | 178,843,744 | raise threshold（全表） | 64,710,562 | **2.8** | ❌ 远远不够 |
+| 47 | 314,781,147 | hash 100K | 100,000 | **3,148** | ✅ 通过门槛 |
+| 47 | 314,781,147 | raise threshold（全表） | 86,335,515 | **3.6** | ❌ 远远不够 |
+| 29 | 314,691,684 | freq truncate top-100K + UNK | 100,001 | **3,147** | ✅ 通过门槛 |
+| 29 | 314,691,684 | raise threshold（全表） | 5,764,358 | **55** | ❌ F21 实证失败 |
+| 34 | 314,799,897 | freq truncate top-100K + UNK | 100,001 | **3,148** | ✅ 通过门槛 |
+| 34 | 314,799,897 | raise threshold（全表） | 1,031,305 | **305** | ⚠️ 边缘（F21 同时复活，无法单独归因；EDA 已判信号弱） |
+
+**含义**：
+1. **直接 raise emb_skip_threshold 的路径全死**：4 个 fid 的全表 obs/row 都远低于 1000 门槛
+2. **EDA 推荐的 hash trick / freq truncate 全部通过门槛**：obs/row 都在 1k-3k 量级，跟 baseline 同
+3. **fid 34 是边缘 case**：305 obs/row 在门槛附近，加上 EDA 判信号弱，建议保 skip 不再投入 A/B
+
+**新规则**：写复活方案前先算 obs/row，< 1000 直接砍掉这条路径，不要浪费 A/B 配额。
 
 
