@@ -1,6 +1,6 @@
 # TAAC 2026 PCVR Baseline 改进计划（W1-W2）
 
-**Status**: v2.1 — W1.7 longer encoder 路径**整体闭环失败**：E4 激进版（top_k=100, seq 2048）val **0.861047 (-0.0012)**，比 E2 cap 512 还差 → 拉 cap 不能救 longer，4 重不利机制（信息瓶颈、head gather 自指退化、top_k/cap 比例下降、val/test divergence 即"近因偏置毒药"）见 F25 诊断；W1.7 唯一剩下的子方案 c = transformer + 长 cap（O(L²) 显存待验证）；F26 tokenizer 手工划分（group + query 3 + d_model 96）val 微跌但多变量混淆，待 test 决策
+**Status**: v2.2 — W2.6 v1 weighted pool 失败（F27）：feature/pair-weighted-pool 两组实验（log1p only vs log1p+sigmoid full）val 全部持平、**test 反向 -0.0022 / -0.0054**；val/test divergence 第 5 次触发；hard-coded log1p / sigmoid weighted pool 范式整体死；W2.6 整体保留，下版换 paradigm（learnable / attention / 显式 pair embedding 三选一）。W1.7 longer encoder 路径**整体闭环失败**（F25），唯一剩 (c) transformer + 长 cap 未试；F26 tokenizer 手工划分待 test 决策
 **Author**: brainstorming session 2026-05-01
 **Branch**: this doc lives on `main`; implementation work happens on feature branches
 **Deadline**: 提交截止 2026-05-23 AOE
@@ -8,6 +8,11 @@
 
 ## Changelog
 
+- **v2.2（2026-05-03 下午）**：W2.6 v1 weighted pool 实验记录 + 反模式新增：
+  - 🔴 **F27 W2.6 v1 weighted pool 失败**：feature/pair-weighted-pool 两组 6 epoch：(a) `log1p` mode（仅 fid 62-66）val +0.000185 / **test -0.00224**；(b) `full` mode（62-66 log1p + 89-91 sigmoid）val +0.000201 / **test -0.00535**。边际加 sigmoid on fid 89-91：val 零 / **test -0.0031**（比 log1p 反向更狠）。3 重失败机制：sigmoid 在 [-1,+1] 上对比度太低（2.5× vs log1p 21×）/ fid 91 全 0 率 48% 触发非系统性噪声 / val/test divergence **第 5 次触发**
+  - 🔄 **W2.6 状态调整**：v1 weighted pool 范式（hard-coded log1p / sigmoid 加权 pool on (int, dense) pair）闭环失败；W2.6 整体保留为"待 v2 重新设计"，下次必须换 paradigm：(α) learnable transform（小 MLP / FiLM 替代 hard-coded log1p / sigmoid）；(β) attention-based pooling（query 来自 ns_token，key/value 来自 (id_emb, dense_value)）；(γ) 显式 pair embedding（每 (int, dense) 对一个独立 emb 表，绕开 pool 机制）
+  - 📝 **反模式新增**：❌ hard-coded log1p / sigmoid weighted pool on (int, dense) pair（v1 实证 5 次 val/test divergence 模式之一）
+  - 📝 **val/test divergence 警告强化**：F19/F21/F23/F25/F27 共 5 次实证 → 升级为铁律级反模式："纯靠 val 涨判定 trick 有效" 不仅"不再可用"，是**必触发反向**信号
 - **v2.1（2026-05-03 上午）**：W1.7 longer 路径整体闭环 + tokenizer 实验记录：
   - 🔴 **F25 W1.7 E4 longer + cap 2048 失败**：8 epoch val **0.861047 (-0.0012)** / test 未提交（决策已清晰，省配额）/ 19 min/epoch / 12-13G。**比 E2 cap 512 还差**！4 重失败机制深度诊断：(a) 信息瓶颈无法绕开（block 1 cross-attn 一次摘要后下游永远 K 维）；(b) head gather 自指退化（query=最新 K 跟 key 前 K 重合，cross-attn 退化成准 self-attn）；(c) E4 top_k/cap 比例 4.9% < E2 的 9.7%，信息密度反而更低；(d) val/test divergence 加剧——longer 是"近因偏置放大器"，PCVR test 时间漂移让这个偏置变成毒药
   - 🔄 **W1.7 子方案最终裁剪**：(a) cap 512 longer = 死（F23）；(b) 长 cap longer = 死（F25）；(c) **transformer + 长 cap = 唯一剩下，未试**；longer 路径**整体闭环**
@@ -110,6 +115,7 @@
 | F24 | **LongerEncoder bug 2 causal mask（记录不修，v2.0）**：用户 5/2 review LongerEncoder 时发现 `causal=True` 路径下 mask 实现疑似反——具体怀疑点见 `model.py:777-799` self-attn 模式的 `attn_mask = nn.Transformer.generate_square_subsequent_mask(L)` 跟 reverse-time 序列（pos 0=最近）的语义可能错位（"causal"按时间应该 mask 掉未来=更新的 token，但 pos 0 在 reverse-time 下就是最新的，不应被 mask）。**当前 baseline `--seq_causal` 默认 False 不触发**，暂不修；但 W1.7 子方案 c（transformer + 长 cap）/ 未来 causal longer 试点前必须先 review 这部分代码并设计 unit test 验证 | 用户代码 review / `model.py:777-799` | 暂不投入；列入"未来开 causal 前必查"清单 |
 | F25 | **W1.7 E4 longer + cap 2048 失败 → longer 路径整体闭环（v2.1）**：8 epoch val **0.861047 (-0.0012)** / test 未提交（省配额）/ 19 min/epoch / 12-13G。**比 E2 cap 512（val 0.861586）还差 -0.0005**！4 重失败机制：**(a) 信息瓶颈**：block 1 cross-attn 一次性把全 cap 压缩到 top_k，下游 N-1 个 block 永远在 K 维上 self-attn，单点失败无救（vs transformer 每个 block 都 refresh 全序列）；**(b) head gather 自指退化**：query=最新 K 个 token 跟 key 前 K 重合，cross-attn 倾向 attend 自己，退化成 self-attn + 一点尾巴，后 L-K 个老 token 被低权重看待；**(c) top_k/cap 比例反而下降**：E2 50/512=9.7%，E4 100/2048=**4.9%**——拉 cap 信息密度反而更低；**(d) val/test divergence 即"近因偏置毒药"**：longer 在 train+val（同时间窗）能学"近期 50 token 模式"，test 时间漂移使该模式失效；transformer 因 self-attn 全连接对最新依赖弱，分布偏移容忍度高 | 用户实验 5/2-5/3 + 架构机制深度诊断 | longer 路径整体死；W1.7 子方案 (a) cap 512 longer ❌（F23）+ (b) 长 cap longer ❌（F25）= 全部闭环；唯一剩下 **(c) transformer + 长 cap**（O(L²) 显存待验证 cap 1024 是否爆 19G） |
 | F26 | **Tokenizer 手工划分实验（val 持平，待 test 决策，v2.1）**：group NS tokenizer + num_queries=3 + d_model=96（**3 变量同改** vs baseline 的 rankmixer + 2 query + d_model=64），5 epoch val **0.861597 (-0.0006)** / test 待提交 / 14-15G / 26 min/epoch。val 持平无法独立判决——可能"d_model 加大涨了 + group tokenizer 拖累 = 抵消"，也可能真持平。spec 之前完全没覆盖这条路径（v2.0 把 tokenizer 命名问题略过未扫架构），test 数据有独立信息价值 → **值得花 test 配额校准** | 用户实验 5/2-5/3 | 待 test：≥0.812 → 开新路径继续挖；<0.808 → 闭环组合死路；中间 → 单独扫 d_model=96（rankmixer 不变）排除组合效应 |
+| F27 | **W2.6 v1 weighted pool 失败（v2.2）**：feature/pair-weighted-pool 实施 hard-coded transform weighted pool（fid 62-66 用 log1p 加权 / fid 89-91 用 sigmoid 加权），两组 6 epoch 实验：(a) `log1p` mode（仅 fid 62-66）val **0.862392 (+0.0002)** / test **0.81004 (-0.0022)** / 25 min/epoch / 12-13G；(b) `full` mode（62-66 log1p + 89-91 sigmoid）val **0.862408 (+0.0002)** / test **0.80693 (-0.0054)** / 23 min/epoch / 12-13G。**边际诊断**（full − log1p = 多加 sigmoid on fid 89-91）：val +0.000016（零）/ test **-0.0031**——sigmoid on 89-91 比 log1p on 62-66 反向幅度还大 1.4×。**机制**：(i) sigmoid 把 [-1,+1] 压到 (0.27, 0.73)，权重最大对比 ~2.5× vs log1p 在 fid 62-66 ~21× 对比，区分度低但仍微扰，等于注入噪声；(ii) fid 91 全 0 率 48% → 一半 fallback mean-pool + 一半微扰权重 = 非系统性噪声；(iii) val/test divergence **第 5 次触发**（前 4 次：F19/F21/F23/F25），dense 数值的 train→test 分布漂移让"基于 dense weight 的 pool 选择"在 test 上失效。**这一版 weighted pool 范式整体死**（hard-coded log1p / sigmoid weighted pool on (int, dense) pair） | 用户实验 5/3 + 边际诊断 | W2.6 v1 闭环；W2.6 整体保留，下次必须换 paradigm（learnable transform / attention pooling / 显式 pair embedding 三选一） |
 
 ---
 
@@ -221,7 +227,7 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 | W2.3 | **SWA / Checkpoint averaging（正则化层）**：训练结束前最后 N 个 ckpt state_dict 平均 | 半天 | 平均后比单 ckpt 高 ≥ 0.0005（**v0.3.2 期望降**） |
 | W2.4 | **Label smoothing 试点（正则化层）**：BCE label 1.0/0.0 → 0.95/0.05；一次 A/B | 1 次 train | 跟 baseline A/B 比，若 ≥ 0.0005 就保留（**v0.3.2 期望降，且可能跟 reinit 重叠**） |
 | W2.5 | **Sparse 控制收紧（v0.3.1 简化）**：~~`reinit_cardinality_threshold` 扫参~~（W1.0.1 已证 0 胜出，砍掉）；只保留 Adagrad weight_decay 扫 {0, 1e-4, 1e-3, 1e-2} | 2-3 次 train | 找到 sparse_wd 最佳点；预期收益 ≤ 0.001（baseline 已在重正则化高原） |
-| **W2.6**（v0.3.2 新增 / v2.0 待深化）| **target ∈ user seq 交互特征（信息层）**：当前是简单 binary 占位——对每个 (user, target) 样本，计算 4 个二值特征：target item_id 是否在 user 的 seq_a/b/c/d 里出现过；每个 domain 加 1 个 dense feature，concat 进 user 表示。匿名特征场景下最稳的上分招（不依赖语义）。**v2.0 状态**：用户 5/2 晚计划深挖 pair 特征更广建模（不止 binary 是否出现，可能含频次 / 时间衰减 / 位置等），等深化后重写本任务 | 1 天（dataset 改 + 1 次 train）→ 待重估 | val AUC 涨 ≥ 0.002；最理想 +0.005~0.008 | dataset.py 改动量中等；要确保 train/val 各自独立计算（不能跨切污染） |
+| **W2.6**（v0.3.2 新增 / v2.0 待深化 / v2.2 v1 失败）| **(int, dense) pair 特征建模（信息层）**：原始构想——target ∈ user seq 交互特征（4 个 binary 占位）；后续重定义为 `user_int_feats × user_dense_feats` 配对的加权 pool（fid 62-66 + 89-91，详见 `docs/superpowers/specs/2026-05-03-pair-feature-design.md`）。**v2.2 状态：v1 weighted pool 范式失败**（F27，hard-coded log1p / sigmoid 加权 pool 两组实验 val 持平 / test -0.0022 ~ -0.0054）。整体保留任务，下版必须换 paradigm，候选三选一：**(α) learnable transform**（小 MLP / FiLM 替代 hard-coded log1p / sigmoid，让模型自己学权重函数）；**(β) attention-based pooling**（query 来自 ns_token，key/value 来自 (id_emb, dense_value)，pool weight 由 attention score 决定而非 dense 值直接驱动）；**(γ) 显式 pair embedding**（每个 (int, dense) 对一个独立 emb 表，绕开 pool 机制，dense value 作为 emb 索引或 FiLM modulation） | 重新 brainstorm 半天 + 1 天实施 | val + **test 同向**涨 ≥ 0.002（v2.2 教训：纯靠 val 必反向） | dataset.py 不动（v1 已用 forward pass weighted pool 路径）；下版焦点在 model.py 的 transform / pooling 设计；avoid v1 范式（hard-coded log1p / sigmoid weighted pool） |
 | **W2.7**（v2.0 新增）| **时间特征建模（信息层第 4 金矿候选）**：spec 之前缺位，仅在 F11 提到 ts_fid 设置正确 + time_bucket 在用，但具体用法可能浅。xhs 暗示这条路 +1% 以上。**Brainstorm 题目**：(a) `label_time` vs `row_timestamp` 差值（用户行为发生到曝光的时间差，可能是 PCVR 的强信号）；(b) 各 seq ts vs row_timestamp 的 cross-domain 时间对齐（每个 domain 的"最近一次行为发生在多久前"）；(c) 现有 time_bucket（65 桶）是否被各 seq 充分使用 vs 只是 padding；(d) 可学习时间编码 vs RoPE vs 时间分桶 PE。需要先 brainstorm 出 ≥ 1 个具体方案再实施 | brainstorm 半天 + 实施 1-2 天 | val + test 同向涨 ≥ 0.003；理想 +0.008~0.015（xhs 暗示 +1%） | spec 缺位说明前面没投入分析；可能跟 W2.6 pair 特征有重叠（target 跟 seq 的时间距离也是 pair 信号） |
 | **W2.8**（v2.0 新增）| **LR base value 扫**：F19 闭环的是 schedule（warmup+cosine 反向），不是 base LR。baseline `lr_dense=1e-4 / lr_sparse=0.05` 没扫过 base value。xhs 暗示 lr=1.82719e-4 有奇效（非常具体的数值，可能反映他们扫过）。**A/B 设计**：dense lr ∈ {1e-4 (baseline), 1.82719e-4 (xhs), 3e-4 (上探)} × sparse lr 不变；只扫 dense 因为 sparse 用 Adagrad 对 lr 不敏感 | 3 次 train ≈ 半天 | val + test 同向涨 ≥ 0.001；F19 教训：必须看 test 不能纯靠 val | 比正则化扫参单点 ROI 高（已知 LR 有具体提示数）；但风险是 1.82719e-4 是别人架构的最优，搬到我们 baseline 不一定迁移 |
 
@@ -314,12 +320,13 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 13. **W1.7 E4 longer + cap 2048 失败**（5/2-5/3 夜）：8 epoch val 0.861047 (-0.0012) **比 E2 cap 512 还差**；4 重机制深度诊断（信息瓶颈 / head gather 自指 / top_k/cap 比例下降 / 近因偏置毒药）→ longer 路径整体闭环（F25）
 14. **F26 Tokenizer 手工划分实验**（5/2-5/3 夜）：group + query 3 + d_model 96，val 0.861597 (-0.0006)；3 变量同改 val 持平无法判决，待 test 校准（值得花配额）
 15. **feature/longer-gather-fix merge 进 main**（独立 commit）：分支 run.sh 默认 = baseline transformer，可安全 merge；提供 env var 切换 W1.7 实验
+16. **W2.6 v1 weighted pool 失败**（5/3 上午）：feature/pair-weighted-pool 两组 6 epoch：log1p (62-66) val +0.0002 / test -0.0022；full (62-66+89-91 sigmoid) val +0.0002 / test -0.0054；val/test divergence 第 5 次触发 → v1 范式死，W2.6 整体保留待换 paradigm（F27）
 
 ### 🔥 立刻做（5/3，按 ROI 排序）
 
 1. **Tokenizer F26 上 test 校准**（0 算力，1 次 test 提交）：只是提交一个 ckpt，立刻知道 group + query 3 + d_model 96 这个组合到底是真持平还是假持平
 2. **W1.7 子方案 c 试点：transformer + cap 1024（仅 seq_d）**（首要算力候选）：先 nvidia-smi 看显存，cap 1024 全 4 domain 大概率爆 19G；建议只拉 seq_d 一家；如果不爆，6 epoch 跑一次看 val + test
-3. **W2.6 pair 特征深化 brainstorm + 实施**（feature/pair-weighted-pool 已开新分支）：从 binary 占位升级到含频次 / 时间衰减 / 位置等
+3. **W2.6 v2 重新 brainstorm（v1 已死，F27）**（feature/pair-weighted-pool 仍可复用）：v1 hard-coded log1p / sigmoid weighted pool 范式闭环；v2 必须换 paradigm，候选 (α) learnable transform / (β) attention pool / (γ) 显式 pair embedding 三选一
 4. **W1.10 emb_skip 复活 hash trick 路径 A/B**（独立可并行）：
    - 优先 **fid 69 hash 171K**（obs/row=1046）
    - 然后 **fid 47 hash 100K**（obs/row=3148）
@@ -342,10 +349,11 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 
 - ❌ Direction 1 OOV→UNK 改造（F18 实测无 ROI）
 - ❌ 任何 d_model / num_layers / num_blocks 类 depth scaling（F20 实证；注意 F26 d_model=96 待 test 决定，不直接套这条）
-- ❌ 单纯靠 val 涨判定 trick 有效（F19 / F21 / F23 / F25 四实证 val/test divergence）
+- ❌ 单纯靠 val 涨判定 trick 有效（F19 / F21 / F23 / F25 / F27 **5 次实证** val/test divergence，已升级铁律级）
 - ❌ warmup+cosine LR schedule（F19；注意 W2.8 LR base 扫**只扫 base value 不带 schedule**）
 - ❌ **raise emb_skip_threshold 直接复活全表**（F21 实证；obs/row 必然 < 1000 不通过门槛）
 - ❌ **LongerEncoder 整条路径**（F23 cap 512 死 + F25 长 cap 也死，4 重机制诊断完整）
+- ❌ **hard-coded log1p / sigmoid weighted pool on (int, dense) pair**（F27 v1 范式实证；下版 W2.6 必须换 paradigm：learnable transform / attention pool / 显式 pair emb）
 
 ### 决策点（W1.7 子方案 c 跑完后）
 

@@ -8,7 +8,7 @@
 
 ## 主要 spec（先读这个）
 
-`docs/superpowers/specs/2026-05-01-taac-improvement-plan.md` —— 当前 **v2.1**，包含 W1-W3 完整作战图、关键事实表（**F1-F26**）、附录 A-D。**任何后续工作都从这份 spec 起步**，不要重新规划。
+`docs/superpowers/specs/2026-05-01-taac-improvement-plan.md` —— 当前 **v2.2**，包含 W1-W3 完整作战图、关键事实表（**F1-F27**），附录 A-D。**任何后续工作都从这份 spec 起步**，不要重新规划。
 
 **EDA 报告**：`docs/eda/2026-05-01-data-profile.md` + `.json`（907K val rows 全数据画像，4 方向决策依据齐全）
 
@@ -42,10 +42,10 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 - **A/B 启发法**：6 epoch 收敛 ≈ 每 epoch +0.001；**3 epoch 足够诊断 ≥ 0.0015 量级差异**，可砍 50% 算力
 - **实验预算**：理论 30-50 次完整训练；考虑虚拟化高峰损耗按 **15-25 次** 算
 
-## 当前活跃工作（v2.1 / 5/3 上午状态）
+## 当前活跃工作（v2.2 / 5/3 下午状态）
 
-**Branch**：`main`（`feature/longer-gather-fix` 已 merge 进 main，包含 W1.0.3 修复 + run.sh env var 切换；`feature/pair-weighted-pool` 用户已开新分支做 W2.6 pair 特征深化）
-**最高优先级**：**Tokenizer F26 上 test 校准**（0 算力，1 次 test 提交立刻知道是不是真持平）；同步**评估 W1.7 子方案 c**（transformer + cap 1024 仅 seq_d 显存）
+**Branch**：`main`（`feature/longer-gather-fix` 已 merge；`feature/pair-weighted-pool` 用户已开新分支做 W2.6，**v1 weighted pool 失败 F27**，准备 v2 换 paradigm）
+**最高优先级**：**Tokenizer F26 上 test 校准**（0 算力，1 次 test 提交立刻知道是不是真持平）；同步**评估 W1.7 子方案 c**（transformer + cap 1024 仅 seq_d 显存）；W2.6 v2 brainstorm（learnable / attention / 显式 pair emb 三选一）
 **已完成**（按时间）：
 - W1.0.1 reinit A/B（threshold=10000 掉 0.0015 → 保留默认 0）
 - AMP+compile 验证通过（test=0.812282 +0.00079）
@@ -58,16 +58,17 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 - 📝 **F24 LongerEncoder bug 2 causal mask 记录**（不修；baseline `--seq_causal` 默认 False 不触发；未来开 causal 前必查）
 - ❌ **W1.7 E4 longer + cap 2048**（5/2-5/3 夜）：val 0.861047 (-0.0012) **比 E2 还差**；4 重机制诊断完成 → **longer 路径整体闭环**（F25）
 - 🟡 **F26 Tokenizer 手工划分**（5/2-5/3 夜）：group + query 3 + d_model 96，val 0.861597 (-0.0006)；3 变量同改 val 持平无法判决，**待 test 校准**
+- ❌ **W2.6 v1 weighted pool 失败**（5/3 上午）：log1p mode val +0.0002 / test -0.0022；full mode val +0.0002 / **test -0.0054**；val/test divergence 第 5 次触发 → **v1 范式（hard-coded log1p / sigmoid weighted pool on (int, dense) pair）整体死**（F27）；W2.6 整体保留待 v2 重新 brainstorm
 
 **待跑实验**（按 ROI 排序）：
 1. **Tokenizer F26 上 test**（0 算力，1 次 test 提交）
 2. **W1.7 子方案 c：transformer + cap 1024（仅 seq_d）**：先 nvidia-smi 看显存，cap 1024 全 4 domain 大概率爆 19G，建议只拉 seq_d；longer 整条路已闭环，这是 W1.7 信息层最后一根稻草
-3. **W2.6 pair 特征深化**（feature/pair-weighted-pool 进行中）
+3. **W2.6 v2 重新 brainstorm**（feature/pair-weighted-pool 复用）：v1 已死，v2 必须换 paradigm，候选 (α) learnable transform / (β) attention pool / (γ) 显式 pair embedding 三选一
 4. **W1.10 emb_skip 复活 hash trick**（独立可并行）：fid 69 hash 171K → fid 47 hash 100K → fid 29 freq truncate top-100K
 5. **W2.7 时间特征建模 brainstorm**（v2.0 新增）：xhs 暗示 +1%
 6. **W2.8 LR base 扫**（v2.0 新增）：dense lr {1e-4, 1.82719e-4 xhs, 3e-4}；3 次 train 半天
 
-## 已知 baseline 问题（v2.1 spec F15-F26）
+## 已知 baseline 问题（v2.2 spec F15-F27）
 
 1. ✅🔥 **F15 / W1.0.1 已结**：reinit threshold=0 是模型不崩的底线（Run Y threshold=10000 best val 卡在 epoch 2，patience 耗尽 EarlyStopping）。**绝对不要碰这条线**。CLI help（`train.py:158`）写的"0=never reset"是错的，但代码行为对，留着别动。
 2. ✅ **F16 / W1.0.3 已修**（v0.3.5 / v2.1 merge 进 main）：LongerEncoder gather 方向 + mask layout 反转双修；新增 `--longer_gather_side` CLI；下游 wiring 复核通过；详见 F22
@@ -81,18 +82,20 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 10. **F24 LongerEncoder bug 2 causal mask 记录**（v2.0 新增，不修）：未来开 causal 前必查 `model.py:777-799`
 11. ✅🔴 **F25 W1.7 E4 longer + cap 2048 失败**（v2.1）：val -0.0012 比 cap 512 还差；4 重机制：信息瓶颈 / head gather 自指 / top_k/cap 比例下降 / 近因偏置毒药 → **longer 路径整体闭环**
 12. 🟡 **F26 Tokenizer 手工划分实验**（v2.1 待 test 校准）：group + query 3 + d_model 96，val 0.861597 (-0.0006)；3 变量同改 val 持平无法判决
+13. ✅🔴 **F27 W2.6 v1 weighted pool 失败**（v2.2）：log1p (62-66) val +0.0002 / test -0.0022；full (62-66+89-91 sigmoid) val +0.0002 / **test -0.0054**；3 重机制：sigmoid [-1,+1] 对比度太低 / fid 91 全 0 率 48% 噪声 / **val/test divergence 第 5 次触发**；hard-coded log1p / sigmoid weighted pool 范式整体死
 
-## v2.1 战略提示
+## v2.2 战略提示
 
 - **baseline 已在过拟合悬崖上**——靠 reinit threshold=0 续命（v0.3.2 已证）
-- **val 已偏离 test 分布**（F19 + F21 + F23 + F25 四证据）：W2 扫参不能纯靠 val，必须周期性消耗 test 提交校准
+- **val 已偏离 test 分布**（F19 + F21 + F23 + F25 + F27 **5 证据**）：W2 扫参不能纯靠 val，必须周期性消耗 test 提交校准；"val 涨即有效" 已升级为铁律级反模式（5 次实证全部反向）
 - **复活高基数特征前先算 obs/row**（v0.3.4 新约束）：reinit threshold=0 强制要求复活后表的 obs/row ≥ 1000；hash trick 100K-200K 桶刚好满足
 - **LongerEncoder 整条路径已死**（v2.1 新事实）：cap 512 / 长 cap 都试了都死；W1.7 信息层最后一根稻草是 transformer + 长 cap（O(L²) 显存）
-- W2 优先级（v2.1 调整，longer 闭环后金矿候选 4→3，但 W1.7 子方案 c 仍可能补回）：
-  - 🔥 **信息层（最高）**：W1.7 子方案 c (transformer + cap 1024 仅 seq_d) → W1.10 emb_skip hash trick → W2.6 pair 深化（进行中）→ W2.7 时间特征
+- **W2.6 v1 weighted pool 范式死**（v2.2 新事实）：hard-coded log1p / sigmoid weighted pool on (int, dense) pair 已闭环；W2.6 v2 必须换 paradigm（learnable / attention / 显式 pair emb 三选一）
+- W2 优先级（v2.2 调整）：
+  - 🔥 **信息层（最高）**：W1.7 子方案 c (transformer + cap 1024 仅 seq_d) → W1.10 emb_skip hash trick → W2.6 v2 重新 brainstorm → W2.7 时间特征
   - **超参扫（中）**：W2.8 LR base 扫
   - **正则化层（最低）**：W2.1-2.5 期望收益 +0.0005~0.002
-  - ❌ **死路**：depth scaling、OOV→UNK、warmup+cosine、raise emb_skip_threshold 全表、**LongerEncoder 整条路径**
+  - ❌ **死路**：depth scaling、OOV→UNK、warmup+cosine、raise emb_skip_threshold 全表、**LongerEncoder 整条路径**、**hard-coded weighted pool on (int, dense) pair**
 - 不要往 baseline 身上再压重正则化（dropout 0.3 / wd 1e-2 大概率推过悬崖）
 
 ## 数据关键事实
@@ -122,6 +125,7 @@ output/                本地 ckpt / log / tensorboard（gitignored）
 - ❌ **raise emb_skip_threshold 直接复活全表**：v0.3.4 F21 实证 val ↑ test ↓ / GRAM 24G；reinit × obs/row 约束（spec 附录 D.9）证明全表复活的 obs/row 必然 < 100，模型学不动 → 必须走 hash trick / freq truncate 中转
 - ❌ **cap 512 + LongerEncoder**：v0.3.5 F23 实证 test -0.0181；longer encoder 第一个 block 后 50-query 永久压缩到固定长度，cap 512 是 transformer 主场尺寸，longer 设计 ceiling 必然更低 → longer 路径必须搭配长 cap (≥1024)
 - ❌ **LongerEncoder 整条路径**：v2.1 F25 实证 cap 2048 比 cap 512 还差；4 重失败机制（信息瓶颈 / head gather 自指 / top_k/cap 比例下降 / 近因偏置毒药）；W1.7 转 transformer + 长 cap 子方案 c
+- ❌ **hard-coded log1p / sigmoid weighted pool on (int, dense) pair**：v2.2 F27 实证两组实验 val 持平 / test -0.0022 ~ -0.0054；3 重机制（sigmoid 在 bounded [-1,+1] 上对比度太低 / fid 91 全 0 率 48% 噪声 / val/test divergence 第 5 次触发）；W2.6 v2 必须换 paradigm（learnable transform / attention pool / 显式 pair embedding 三选一）
 - ❌ **白天跑长实验**：被抢卡严重，跑实验尽量挪到半夜
 - ❌ **并行 A/B 跑同一张物理卡**：用 `CUDA_VISIBLE_DEVICES` 隔离到不同 GPU
 - ❌ **改 `taac2026_schema.json` 来做特征工程**：它不上传，改了没用
