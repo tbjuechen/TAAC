@@ -1,13 +1,20 @@
 # W2.6 重写：(int, dense) 平行对的 value-加权 pool 设计
 
-**Status**: v0.1 — design draft, pending spec-document-reviewer + 用户 review
+**Status**: v0.2 — fid 89-91 sigmoid 路径加入；CLI 扩展为 {none, log1p, full}
 **Author**: brainstorming session 2026-05-03
 **Branch**: `feature/pair-weighted-pool`（cut from `main` @ `ba8bded`）
 **Parent spec**: `docs/superpowers/specs/2026-05-01-taac-improvement-plan.md`（v2.0 W2.6 重定义）
-**Goal**: 把 user_int_feats 中 5 个多值离散特征 (fid 62-66) 的 mean-pool 升级为由对齐 dense 数组驱动的 log1p-weighted pool，验证 +0.0015 量级增益
+**Goal**: 把 user_int_feats 中 8 个多值离散特征（fid 62-66 + 89-91）的 mean-pool 升级为由对齐 dense 数组驱动的加权 pool（per-fid transform：62-66 log1p / 89-91 sigmoid），验证 +0.0015 量级增益
 
 ## Changelog
 
+- **v0.2（2026-05-03 晚）**：用户改主意，**fid 89-91 sigmoid 路径并入本期**（不再是 W2.6.5 单独任务）。设计调整：
+  - 新增 `PAIR_WEIGHTED_FIDS_SCORE = [89, 90, 91]`（旧 `PAIR_WEIGHTED_FIDS` 保留为 COUNT 的 alias）
+  - CLI 扩展为 `--pair_weighted_pool {none, log1p, full}`：log1p = 仅 62-66；full = 62-66 log1p + 89-91 sigmoid
+  - **API 重构**：`paired_dense` 语义从"原始 dense 值"改为"已计算好的权重"；helper 不再做 transform，调用方（PCVRHyFormer.\_build\_paired\_dense）按 mode 分派 log1p / sigmoid 后传入。weight_mode 参数从 helper 移除（None vs not None 即可表达）。**好处**：未来加 transform（abs / FiLM / learnable）只改调用方，不动 helper / tokenizer 接口
+  - 测试从 9 → 14：新增 sigmoid happy path、负值仍贡献验证、PCVRHyFormer uniform/log1p/full 三模式 dispatch 测试
+  - run.sh 新增 `PAIR_WEIGHTED_POOL=full` 选项注释
+  - **A/B 计划升级**：现在是 baseline / log1p / full **三档 A/B**（见下方 A/B 节）
 - **v0.1（2026-05-03）**：初稿。EDA 锁定 fid 62-66 = 重尾正值（log1p 适合）/ fid 89-91 = 双边 bounded（log1p 不适合，本期保持 uniform）。范围确认 A1（只动 int 侧 pool，dense 侧不动）
 
 ## 背景
