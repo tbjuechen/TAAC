@@ -202,11 +202,15 @@ def parse_args() -> argparse.Namespace:
                              '(0 = automatically use the number of item groups)')
 
     parser.add_argument('--pair_weighted_pool', type=str, default='none',
-                        choices=['none', 'log1p', 'full'],
+                        choices=['none', 'log1p', 'full', 'transformer'],
                         help='Pair (int, dense) weighted pool mode. '
                              'none = baseline mean-pool (default); '
-                             'log1p = log1p-weighted on fid 62-66 only (89-91 stay mean-pool); '
-                             'full = log1p on fid 62-66 + sigmoid on fid 89-91.')
+                             'log1p = [DEPRECATED, F27 dead] log1p-weighted on fid 62-66 only; '
+                             'full = [DEPRECATED, F27 dead] log1p on 62-66 + sigmoid on 89-91; '
+                             'transformer = W2.6 v2 PairSetEncoder (bucket-emb + 1-layer '
+                             'BERT-style transformer + mean pool) on all 8 paired fids '
+                             '(62-66 + 89-91). See docs/superpowers/specs/'
+                             '2026-05-03-pair-set-encoder-design.md.')
 
     args = parser.parse_args()
 
@@ -293,9 +297,10 @@ def main() -> None:
     # Pair-weighted pool: build {fid: (doff, dlen)} from user_dense_schema for fids
     # in PAIR_WEIGHTED_FIDS_COUNT (62-66) and PAIR_WEIGHTED_FIDS_SCORE (89-91) that
     # are present in the data. PCVRHyFormer dispatches per fid based on pair_weight_mode:
-    #   - 'none'  → no specs used; tokenizer takes mean-pool path
-    #   - 'log1p' → fid 62-66 → log1p-weighted; fid 89-91 → mean-pool (specs ignored)
-    #   - 'full'  → fid 62-66 → log1p; fid 89-91 → sigmoid
+    #   - 'none'        → no specs used; tokenizer takes mean-pool path (baseline)
+    #   - 'log1p'       → [DEAD F27] fid 62-66 log1p-weighted; 89-91 → mean-pool
+    #   - 'full'        → [DEAD F27] fid 62-66 log1p; fid 89-91 → sigmoid
+    #   - 'transformer' → [W2.6 v2] all 8 paired fids → PairSetEncoder (bucket+attn pool)
     user_paired_dense_specs = {}
     if args.pair_weighted_pool != 'none':
         wanted = set(PAIR_WEIGHTED_FIDS_COUNT) | set(PAIR_WEIGHTED_FIDS_SCORE)

@@ -64,6 +64,85 @@ def _pool_multivalue(
     return weighted_pool * use_weighted + uniform_pool * (1 - use_weighted)
 
 
+class PairSetEncoder(nn.Module):
+    """Per-fid set encoder for paired (int, dense) features (W2.6 v2).
+
+    Replaces v1 hard-coded weighted-pool (log1p / sigmoid) with:
+      1. id embedding lookup (emb_dim)
+      2. bucket(dense) → bucket embedding lookup (emb_dim)
+      3. add: tokens = id_emb + bucket_emb
+      4. 1-layer BERT-style transformer block (attn + FFN, no causal mask, pre-norm)
+      5. mean pool over valid (non-padding) positions
+      6. Linear(emb_dim, emb_dim) project
+
+    Input ids: (B, len_f) int64; vals: (B, len_f) float
+    Output: (B, emb_dim) — drop-in replacement for tokenizer per-fid mean-pool
+
+    See docs/superpowers/specs/2026-05-03-pair-set-encoder-design.md.
+    """
+    NUM_BUCKETS: int = 32
+
+    def __init__(self, fid: int, vocab: int, emb_dim: int, nhead: int = 4,
+                 dim_feedforward: Optional[int] = None, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.fid = fid
+        self.emb_dim = emb_dim
+        # padding_idx=0 → id=0 emb is fixed at zero, no gradient (matches baseline lookup)
+        self.id_emb = nn.Embedding(vocab + 1, emb_dim, padding_idx=0)
+        self.bucket_emb = nn.Embedding(self.NUM_BUCKETS, emb_dim)
+        self.transformer = nn.TransformerEncoderLayer(
+            d_model=emb_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward or 2 * emb_dim,
+            activation='gelu',
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.out_proj = nn.Linear(emb_dim, emb_dim)
+
+    def _quantize(self, vals: torch.Tensor) -> torch.Tensor:
+        """Map dense values to bucket indices [0, NUM_BUCKETS).
+
+        - fid 62-66 (heavy-tailed [0, 1.5e9]): log1p(clamp_min(v,0)) → range [0, ~21],
+          divide by 24 to leave buckets 28-31 as outlier reserve.
+        - fid 89-91 (bounded [-1, +1]): linear map (v+1)/2 → [0, 1] → buckets.
+        """
+        if self.fid in PAIR_WEIGHTED_FIDS_COUNT:
+            v_pre = torch.log1p(vals.clamp(min=0.0))
+            bucket = (v_pre / 24.0 * self.NUM_BUCKETS).floor()
+        else:
+            bucket = ((vals + 1.0) / 2.0 * self.NUM_BUCKETS).floor()
+        return bucket.clamp(0, self.NUM_BUCKETS - 1).long()
+
+    def forward(self, ids: torch.Tensor, vals: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            ids:  (B, len_f) int64
+            vals: (B, len_f) float
+        Returns:
+            (B, emb_dim) pooled tensor — replaces tokenizer per-fid mean-pool output.
+        """
+        valid = (ids != 0).float()                                 # (B, len_f)
+        kpm = (ids == 0)                                            # (B, len_f) True=padding
+
+        bucket = self._quantize(vals)                              # (B, len_f)
+        tokens = self.id_emb(ids) + self.bucket_emb(bucket)        # (B, len_f, emb_dim)
+
+        # nn.TransformerEncoderLayer with src_key_padding_mask all-True for a row
+        # produces NaN (0/0 attention weights). With fid 91 all_zero=48%, this case
+        # is common, so we nan_to_num after — those rows' outputs are then zeroed
+        # by the mean-pool mask anyway, but the NaN-cleanup prevents propagation.
+        tokens = self.transformer(tokens, src_key_padding_mask=kpm)
+        tokens = torch.nan_to_num(tokens, nan=0.0)
+
+        masked_sum = (tokens * valid.unsqueeze(-1)).sum(dim=1)     # (B, emb_dim)
+        denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)      # (B, 1)
+        pool = masked_sum / denom                                  # (B, emb_dim)
+
+        return self.out_proj(pool)                                 # (B, emb_dim)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Rotary Position Embedding (RoPE)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1078,7 +1157,8 @@ class GroupNSTokenizer(nn.Module):
         ])
 
     def forward(self, int_feats: torch.Tensor,
-                paired_dense: "dict | None" = None) -> torch.Tensor:
+                paired_dense: "dict | None" = None,
+                paired_pool: "dict | None" = None) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
@@ -1087,6 +1167,10 @@ class GroupNSTokenizer(nn.Module):
                 Caller is responsible for applying any transform (log1p / sigmoid / ...)
                 before calling. fids absent from the dict use uniform mean-pool.
                 Default None = all uniform (bit-equivalent to baseline).
+            paired_pool: Optional dict {fid_idx: (B, emb_dim) pre-pooled tensor}.
+                W2.6 v2 PairSetEncoder output. When provided for a fid, replaces the
+                tokenizer's internal mean-pool / weighted-pool entirely for that fid.
+                Takes precedence over paired_dense for the same fid_idx.
 
         Returns:
             Tokens of shape (B, num_groups, D).
@@ -1105,8 +1189,11 @@ class GroupNSTokenizer(nn.Module):
                     if length == 1:
                         # Single-value feature: direct lookup
                         fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
+                    elif paired_pool is not None and fid_idx in paired_pool:
+                        # W2.6 v2: PairSetEncoder pre-pooled output replaces mean-pool entirely.
+                        fid_emb = paired_pool[fid_idx]                    # (B, emb_dim)
                     else:
-                        # Multi-value feature: optional precomputed-weight pool
+                        # Multi-value feature: optional precomputed-weight pool (v1 / baseline)
                         vals = int_feats[:, offset:offset + length].long()  # (B, length)
                         emb_all = emb_layer(vals)                            # (B, length, emb_dim)
                         paired_weight = (paired_dense or {}).get(fid_idx, None)
@@ -1196,13 +1283,18 @@ class RankMixerNSTokenizer(nn.Module):
         )
 
     def forward(self, int_feats: torch.Tensor,
-                paired_dense: "dict | None" = None) -> torch.Tensor:
+                paired_dense: "dict | None" = None,
+                paired_pool: "dict | None" = None) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
             paired_dense: Optional dict {fid_idx: (B, length) precomputed weight tensor}.
                 See GroupNSTokenizer.forward.
+            paired_pool: Optional dict {fid_idx: (B, emb_dim) pre-pooled tensor}.
+                W2.6 v2 PairSetEncoder output. When provided for a fid, replaces the
+                tokenizer's internal mean-pool / weighted-pool entirely for that fid.
+                Takes precedence over paired_dense for the same fid_idx.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1219,6 +1311,9 @@ class RankMixerNSTokenizer(nn.Module):
                     emb_layer = self.embs[emb_real_idx]
                     if length == 1:
                         fid_emb = emb_layer(int_feats[:, offset].long())
+                    elif paired_pool is not None and fid_idx in paired_pool:
+                        # W2.6 v2: PairSetEncoder pre-pooled output replaces mean-pool entirely.
+                        fid_emb = paired_pool[fid_idx]                    # (B, emb_dim)
                     else:
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
@@ -1302,21 +1397,45 @@ class PCVRHyFormer(nn.Module):
 
         # Pair-weighted pool: build {fid_idx: (doff, dlen)} so the user NS tokenizer
         # can grab the paired dense slice for each multi-value fid in PAIR_WEIGHTED_FIDS_*.
-        # Two fid groups, two transforms:
+        # Two fid groups, two transforms (v1) or one set encoder (v2):
         #   COUNT (fid 62-66): non-negative right-tailed → log1p(clamp_min(v, 0))
         #   SCORE (fid 89-91): bounded ~[-1, +1] → sigmoid(v)
-        self.pair_weight_mode = pair_weight_mode  # 'uniform' / 'log1p' / 'full'
+        # 'transformer' (W2.6 v2): both groups go through PairSetEncoder (bucket+attn pool).
+        self.pair_weight_mode = pair_weight_mode  # 'uniform'/'none'/'log1p'/'full'/'transformer'
         self._paired_count_idx_to_slice: dict = {}
         self._paired_score_idx_to_slice: dict = {}
-        if user_paired_dense_specs and user_int_fids and pair_weight_mode != 'uniform':
+        if (user_paired_dense_specs and user_int_fids
+                and pair_weight_mode not in ('uniform', 'none')):
             for fid_idx, fid in enumerate(user_int_fids):
                 if fid not in user_paired_dense_specs:
                     continue
                 if fid in PAIR_WEIGHTED_FIDS_COUNT:
                     self._paired_count_idx_to_slice[fid_idx] = user_paired_dense_specs[fid]
-                elif fid in PAIR_WEIGHTED_FIDS_SCORE and pair_weight_mode == 'full':
+                elif fid in PAIR_WEIGHTED_FIDS_SCORE and pair_weight_mode in ('full', 'transformer'):
                     self._paired_score_idx_to_slice[fid_idx] = user_paired_dense_specs[fid]
+
+        # W2.6 v2: instantiate PairSetEncoder per paired fid (transformer mode only).
+        # See docs/superpowers/specs/2026-05-03-pair-set-encoder-design.md.
+        self.pair_set_encoders = nn.ModuleDict()
+        if pair_weight_mode == 'transformer':
+            all_paired_slices = {**self._paired_count_idx_to_slice,
+                                 **self._paired_score_idx_to_slice}
+            for fid_idx in all_paired_slices.keys():
+                vs, _off, _len = user_int_feature_specs[fid_idx]
+                fid = user_int_fids[fid_idx] if user_int_fids else fid_idx
+                self.pair_set_encoders[str(fid_idx)] = PairSetEncoder(
+                    fid=fid, vocab=int(vs), emb_dim=emb_dim,
+                )
+            if self.pair_set_encoders:
+                logging.info(
+                    f"PairSetEncoder enabled (W2.6 v2): {len(self.pair_set_encoders)} paired fids "
+                    f"covered (count={list(self._paired_count_idx_to_slice.keys())}, "
+                    f"score={list(self._paired_score_idx_to_slice.keys())})"
+                )
+
         self.ns_tokenizer_type = ns_tokenizer_type
+        # Stash for _build_pair_set_pools (need int slices to read ids; dense slices already cached)
+        self._user_int_feature_specs_for_pair = user_int_feature_specs
 
         # ================== NS Tokens Construction ==================
 
@@ -1705,18 +1824,19 @@ class PCVRHyFormer(nn.Module):
         return output
 
     def _build_paired_dense(self, inputs: ModelInput) -> Optional[dict]:
-        """Slice user_dense_feats and apply per-fid weight transforms.
+        """Slice user_dense_feats and apply per-fid weight transforms (W2.6 v1 path).
 
         Returns dict {fid_idx: (B, length) precomputed weight tensor}, or None if
         pair-weighted pool is disabled. Returning None makes downstream tokenizer
         take the original mean-pool path (bit-equivalent to baseline).
 
         Transforms per pair_weight_mode:
-        - 'uniform': returns None.
+        - 'uniform' / 'none' / 'transformer': returns None (transformer goes through
+          _build_pair_set_pools instead).
         - 'log1p': fid 62-66 → log1p(clamp_min(v, 0)); 89-91 untouched (mean-pool).
         - 'full':  fid 62-66 → log1p(clamp_min(v, 0)); 89-91 → sigmoid(v).
         """
-        if self.pair_weight_mode == 'uniform':
+        if self.pair_weight_mode in ('uniform', 'none', 'transformer'):
             return None
         if not self._paired_count_idx_to_slice and not self._paired_score_idx_to_slice:
             return None
@@ -1730,13 +1850,40 @@ class PCVRHyFormer(nn.Module):
             weights[fid_idx] = torch.sigmoid(v)
         return weights
 
+    def _build_pair_set_pools(self, inputs: ModelInput) -> Optional[dict]:
+        """Pre-compute per-fid pool via PairSetEncoder (W2.6 v2 path).
+
+        Returns dict {fid_idx: (B, emb_dim)} for tokenizer to use in place of its own
+        per-fid mean-pool, or None if not in transformer mode / no encoders set up.
+        """
+        if self.pair_weight_mode != 'transformer':
+            return None
+        if not self.pair_set_encoders:
+            return None
+        ud = inputs.user_dense_feats
+        ui = inputs.user_int_feats
+        all_slices = {**self._paired_count_idx_to_slice, **self._paired_score_idx_to_slice}
+        pools: dict = {}
+        for fid_idx, (doff, dlen) in all_slices.items():
+            _vs, ioff, ilen = self._user_int_feature_specs_for_pair[fid_idx]
+            ids = ui[:, ioff:ioff + ilen].long()                  # (B, len_f)
+            vals = ud[:, doff:doff + dlen]                         # (B, len_f); ilen == dlen by construction
+            pools[fid_idx] = self.pair_set_encoders[str(fid_idx)](ids, vals)
+        return pools
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
-        paired_dense = self._build_paired_dense(inputs)
+        # Dispatch on pair_weight_mode:
+        #   'transformer' (W2.6 v2) → pre-compute (B, emb_dim) per fid via PairSetEncoder
+        #   'log1p' / 'full'        (W2.6 v1) → pre-compute (B, length) weights per fid
+        #   else                                 → tokenizer takes baseline mean-pool path
+        paired_pool = self._build_pair_set_pools(inputs)
+        paired_dense = self._build_paired_dense(inputs) if paired_pool is None else None
         user_ns = self.user_ns_tokenizer(
             inputs.user_int_feats,
             paired_dense=paired_dense,
+            paired_pool=paired_pool,
         )   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
@@ -1780,10 +1927,12 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        paired_dense = self._build_paired_dense(inputs)
+        paired_pool = self._build_pair_set_pools(inputs)
+        paired_dense = self._build_paired_dense(inputs) if paired_pool is None else None
         user_ns = self.user_ns_tokenizer(
             inputs.user_int_feats,
             paired_dense=paired_dense,
+            paired_pool=paired_pool,
         )
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 

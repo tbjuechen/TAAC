@@ -368,3 +368,182 @@ def test_pcvr_full_mode_both_fid_groups():
         out_log1p = m_log1p(inputs)
     assert not torch.allclose(out_full, out_log1p, atol=1e-6), \
         "full mode must differ from log1p mode when fid 89 has non-zero dense values"
+
+
+# ─────────────────────────────────────────────────────────────────
+# W2.6 v2: PairSetEncoder (bucket + 1-layer transformer + mean pool)
+# See docs/superpowers/specs/2026-05-03-pair-set-encoder-design.md
+# ─────────────────────────────────────────────────────────────────
+
+def test_pair_set_encoder_forward_shape_count_fid():
+    """PairSetEncoder for COUNT fid (62-66) outputs (B, emb_dim)."""
+    from model import PairSetEncoder
+    torch.manual_seed(0)
+    enc = PairSetEncoder(fid=62, vocab=10, emb_dim=8, nhead=2)
+    enc.eval()
+    ids = torch.tensor([[1, 2, 3, 0], [4, 0, 0, 0]], dtype=torch.long)
+    vals = torch.tensor([[10.0, 20.0, 5.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    out = enc(ids, vals)
+    assert out.shape == (2, 8)
+    assert torch.isfinite(out).all()
+
+
+def test_pair_set_encoder_forward_shape_score_fid():
+    """PairSetEncoder for SCORE fid (89-91) outputs (B, emb_dim)."""
+    from model import PairSetEncoder
+    torch.manual_seed(0)
+    enc = PairSetEncoder(fid=89, vocab=10, emb_dim=8, nhead=2)
+    enc.eval()
+    ids = torch.tensor([[5, 6, 7], [8, 9, 0]], dtype=torch.long)
+    vals = torch.tensor([[-0.5, 0.3, 0.9], [0.2, -0.4, 0.0]])
+    out = enc(ids, vals)
+    assert out.shape == (2, 8)
+    assert torch.isfinite(out).all()
+
+
+def test_pair_set_encoder_quantize_count_path():
+    """COUNT fids: log1p(v) buckets — v=0 → bucket 0; large v → high bucket; v<0 clamped."""
+    from model import PairSetEncoder
+    enc = PairSetEncoder(fid=62, vocab=10, emb_dim=8, nhead=2)
+    vals = torch.tensor([[0.0, 1e8, -1.0, 1.0]])
+    bucket = enc._quantize(vals)
+    # log1p(0)=0 → bucket 0
+    assert bucket[0, 0].item() == 0
+    # log1p(1)≈0.69 → 0.69/24*32 ≈ 0.92 → floor=0
+    assert bucket[0, 3].item() == 0
+    # log1p(-1) clamped to log1p(0)=0 → bucket 0
+    assert bucket[0, 2].item() == 0
+    # log1p(1e8)≈18.42 → 18.42/24*32 ≈ 24.55 → floor=24
+    assert bucket[0, 1].item() == 24
+
+
+def test_pair_set_encoder_quantize_score_path():
+    """SCORE fids: (v+1)/2 buckets — v=0 → middle bucket; v=±1 → edge buckets."""
+    from model import PairSetEncoder
+    enc = PairSetEncoder(fid=89, vocab=10, emb_dim=8, nhead=2)
+    vals = torch.tensor([[0.0, -1.0, 1.0, -0.5, 0.5]])
+    bucket = enc._quantize(vals)
+    # v=0 → (0+1)/2*32=16 → bucket 16
+    assert bucket[0, 0].item() == 16
+    # v=-1 → 0*32=0 → bucket 0
+    assert bucket[0, 1].item() == 0
+    # v=+1 → 1*32=32 → clamped to 31
+    assert bucket[0, 2].item() == 31
+    # v=-0.5 → 0.25*32=8 → bucket 8
+    assert bucket[0, 3].item() == 8
+    # v=+0.5 → 0.75*32=24 → bucket 24
+    assert bucket[0, 4].item() == 24
+
+
+def test_pair_set_encoder_all_padding_row_no_nan():
+    """Fully-padded row (id=0 everywhere) must produce finite zero output (no NaN)."""
+    from model import PairSetEncoder
+    torch.manual_seed(0)
+    enc = PairSetEncoder(fid=91, vocab=10, emb_dim=8, nhead=2)
+    enc.eval()
+    # Row 0: all valid; Row 1: all padding (simulates fid 91's 48% all_zero case)
+    ids = torch.tensor([[1, 2, 3], [0, 0, 0]], dtype=torch.long)
+    vals = torch.tensor([[0.1, 0.2, 0.3], [0.0, 0.0, 0.0]])
+    out = enc(ids, vals)
+    assert torch.isfinite(out).all(), "all-padded row must not produce NaN"
+    # Fully-padded row mean-pool denom clamp(min=1) → output is masked_sum/1, masked_sum=0
+    # so output should be all zeros pre-projection. Post-projection: bias term only.
+    # We check the row is finite and bounded (smoke test).
+    assert out[1].abs().max() < 100
+
+
+def test_pair_set_encoder_padding_does_not_affect_valid_rows():
+    """Adding padded positions to a row must not change pool of valid positions."""
+    from model import PairSetEncoder
+    torch.manual_seed(0)
+    enc = PairSetEncoder(fid=62, vocab=10, emb_dim=8, nhead=2)
+    enc.eval()
+    # Two equivalent inputs: (a) length=3 valid; (b) length=5 with 2 padding tail
+    ids_a = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    vals_a = torch.tensor([[10.0, 20.0, 5.0]])
+    out_a = enc(ids_a, vals_a)
+
+    ids_b = torch.tensor([[1, 2, 3, 0, 0]], dtype=torch.long)
+    vals_b = torch.tensor([[10.0, 20.0, 5.0, 0.0, 0.0]])
+    out_b = enc(ids_b, vals_b)
+    # Mean pool should be the same (padded positions excluded)
+    # Note: transformer self-attn output for valid positions may differ slightly because
+    # valid tokens see padded positions as keys (masked OK) — but mask should hide them.
+    # Test: out_a ≈ out_b within tolerance.
+    assert torch.allclose(out_a, out_b, atol=1e-5), \
+        "padding tail must not change valid positions' mean pool"
+
+
+# ─────────────────────────────────────────────────────────────────
+# PCVRHyFormer integration: pair_weight_mode='transformer'
+# ─────────────────────────────────────────────────────────────────
+
+def test_pcvr_transformer_mode_instantiates_encoders():
+    """transformer mode must instantiate nn.ModuleDict of PairSetEncoder."""
+    torch.manual_seed(42)
+    m = _make_pcvr(
+        pair_weight_mode='transformer',
+        user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
+    )
+    # Both COUNT (62) and SCORE (89) should be in slice dicts under transformer mode
+    assert 1 in m._paired_count_idx_to_slice  # fid_idx for fid 62
+    assert 2 in m._paired_score_idx_to_slice  # fid_idx for fid 89
+    # PairSetEncoder dict should contain both
+    assert '1' in m.pair_set_encoders
+    assert '2' in m.pair_set_encoders
+    assert len(m.pair_set_encoders) == 2
+
+
+def test_pcvr_transformer_mode_forward_finite():
+    """transformer mode forward produces finite output."""
+    torch.manual_seed(42)
+    m = _make_pcvr(
+        pair_weight_mode='transformer',
+        user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
+    )
+    m.eval()
+    inputs = _make_pcvr_inputs()
+    with torch.no_grad():
+        out = m(inputs)
+    assert torch.isfinite(out).all()
+
+
+def test_pcvr_transformer_mode_differs_from_baseline():
+    """transformer mode output differs from uniform mode (PairSetEncoder applied)."""
+    torch.manual_seed(42)
+    m_baseline = _make_pcvr(pair_weight_mode='uniform')
+    m_baseline.eval()
+    torch.manual_seed(42)
+    m_trans = _make_pcvr(
+        pair_weight_mode='transformer',
+        user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
+    )
+    m_trans.eval()
+
+    inputs = _make_pcvr_inputs()
+    with torch.no_grad():
+        out_b = m_baseline(inputs)
+        out_t = m_trans(inputs)
+    # transformer mode adds extra params (PairSetEncoder), output must differ.
+    assert not torch.allclose(out_b, out_t, atol=1e-5), \
+        "transformer mode must produce different output than baseline mean-pool"
+
+
+def test_pcvr_uniform_mode_no_pair_set_encoders():
+    """uniform/none mode must NOT instantiate any PairSetEncoder (zero regression)."""
+    m_uniform = _make_pcvr(pair_weight_mode='uniform')
+    m_none = _make_pcvr(
+        pair_weight_mode='uniform',
+        user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
+    )
+    assert len(m_uniform.pair_set_encoders) == 0
+    assert len(m_none.pair_set_encoders) == 0
+
+
+def test_pcvr_log1p_mode_no_pair_set_encoders():
+    """log1p mode must NOT instantiate any PairSetEncoder (only v1 weighted-pool)."""
+    m = _make_pcvr(
+        pair_weight_mode='log1p',
+        user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
+    )
+    assert len(m.pair_set_encoders) == 0
