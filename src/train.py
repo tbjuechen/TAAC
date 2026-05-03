@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
                         help='Batch size for both training and validation')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate for dense parameters (AdamW)')
+    parser.add_argument('--dense_weight_decay', type=float, default=0.01,
+                        help='Weight decay for dense parameters (AdamW). '
+                             'PyTorch AdamW default is 0.01; the historical baseline '
+                             'implicitly used this value, so leaving it at 0.01 reproduces '
+                             'baseline behavior exactly.')
     parser.add_argument('--num_epochs', type=int, default=999,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
@@ -368,6 +373,7 @@ def main() -> None:
         focal_gamma=args.focal_gamma,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
+        dense_weight_decay=args.dense_weight_decay,
         reinit_sparse_after_epoch=args.reinit_sparse_after_epoch,
         reinit_cardinality_threshold=args.reinit_cardinality_threshold,
         ckpt_params=ckpt_params,
