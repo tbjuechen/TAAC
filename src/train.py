@@ -20,7 +20,7 @@ import torch
 
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
-from model import PCVRHyFormer
+from model import PCVRHyFormer, PAIR_WEIGHTED_FIDS_COUNT, PAIR_WEIGHTED_FIDS_SCORE
 from trainer import PCVRHyFormerRankingTrainer
 
 
@@ -226,6 +226,17 @@ def parse_args() -> argparse.Namespace:
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
 
+    parser.add_argument('--pair_weighted_pool', type=str, default='none',
+                        choices=['none', 'log1p', 'full', 'transformer'],
+                        help='Pair (int, dense) weighted pool mode. '
+                             'none = baseline mean-pool (default); '
+                             'log1p = [DEPRECATED, F27 dead] log1p-weighted on fid 62-66 only; '
+                             'full = [DEPRECATED, F27 dead] log1p on 62-66 + sigmoid on 89-91; '
+                             'transformer = W2.6 v2 PairSetEncoder (bucket-emb + 1-layer '
+                             'BERT-style transformer + mean pool) on all 8 paired fids '
+                             '(62-66 + 89-91). See docs/superpowers/specs/'
+                             '2026-05-03-pair-set-encoder-design.md.')
+
     args = parser.parse_args()
 
     # Environment variables take precedence.
@@ -308,6 +319,23 @@ def main() -> None:
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
 
+    # Pair-weighted pool: build {fid: (doff, dlen)} from user_dense_schema for fids
+    # in PAIR_WEIGHTED_FIDS_COUNT (62-66) and PAIR_WEIGHTED_FIDS_SCORE (89-91) that
+    # are present in the data. PCVRHyFormer dispatches per fid based on pair_weight_mode:
+    #   - 'none'        → no specs used; tokenizer takes mean-pool path (baseline)
+    #   - 'log1p'       → [DEAD F27] fid 62-66 log1p-weighted; 89-91 → mean-pool
+    #   - 'full'        → [DEAD F27] fid 62-66 log1p; fid 89-91 → sigmoid
+    #   - 'transformer' → [W2.6 v2] all 8 paired fids → PairSetEncoder (bucket+attn pool)
+    user_paired_dense_specs = {}
+    if args.pair_weighted_pool != 'none':
+        wanted = set(PAIR_WEIGHTED_FIDS_COUNT) | set(PAIR_WEIGHTED_FIDS_SCORE)
+        for fid, doff, dlen in pcvr_dataset.user_dense_schema.entries:
+            if fid in wanted:
+                user_paired_dense_specs[fid] = (doff, dlen)
+        logging.info(f"Pair-weighted pool enabled (mode={args.pair_weighted_pool}); "
+                     f"paired fids: {sorted(user_paired_dense_specs.keys())}")
+    user_int_fids = [fid for fid, _doff, _dlen in pcvr_dataset.user_int_schema.entries]
+
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
@@ -337,6 +365,9 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "user_paired_dense_specs": user_paired_dense_specs,
+        "user_int_fids": user_int_fids,
+        "pair_weight_mode": args.pair_weighted_pool,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

@@ -3,16 +3,24 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
 # ============================================================
-# 实验切换区 —— 改这里就够了 (W1.0.3 / W1.7)
+# 大杂烩分支 (feature/everything-bagel) —— 三件套同时开
 # ============================================================
-# Daily driver (transformer baseline): 不传任何 env var
-# Longer head A/B (W1.7-L1):       SEQ_ENCODER_TYPE=longer GATHER_SIDE=head ./run.sh
-# Longer tail A/B (W1.0.3 验证):   SEQ_ENCODER_TYPE=longer GATHER_SIDE=tail ./run.sh
-# 长序列 (W1.7-L2):  SEQ_ENCODER_TYPE=longer GATHER_SIDE=head SEQ_MAX_LENS='seq_a:256,seq_b:256,seq_c:512,seq_d:2048' ./run.sh
-SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
+# 三件套 default ON：
+#   1. LongerEncoder   (SEQ_ENCODER_TYPE=longer, GATHER_SIDE=head)
+#   2. seq cap up      (seq_a:512, seq_b:512, seq_c:1024, seq_d:1024)
+#   3. PairSetEncoder v2 transformer pool  (PAIR_WEIGHTED_POOL=transformer)
+#   + Warmup+cosine LR (默认 warmup_steps=500，在 train.py 默认开)
+#
+# 关掉某项做对照：
+#   SEQ_ENCODER_TYPE=transformer ./run.sh         # 用回 transformer encoder
+#   SEQ_MAX_LENS='seq_a:256,seq_b:256,seq_c:512,seq_d:512' ./run.sh  # 用回 baseline cap
+#   PAIR_WEIGHTED_POOL=none ./run.sh              # 关 PairSetEncoder
+#   --warmup_steps 0 (CLI)                        # 关 warmup+cosine
+SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-longer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
-SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
+SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:512,seq_b:512,seq_c:1024,seq_d:1024}"
+PAIR_WEIGHTED_POOL="${PAIR_WEIGHTED_POOL:-transformer}"
 # ============================================================
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
@@ -31,6 +39,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --seq_top_k "${SEQ_TOP_K}" \
     --longer_gather_side "${GATHER_SIDE}" \
     --seq_max_lens "${SEQ_MAX_LENS}" \
+    --pair_weighted_pool "${PAIR_WEIGHTED_POOL}" \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
@@ -48,4 +57,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --use_amp \
 #     --use_compile \
 #     --compile_mode reduce-overhead \
+#     --seq_encoder_type "${SEQ_ENCODER_TYPE}" \
+#     --seq_top_k "${SEQ_TOP_K}" \
+#     --longer_gather_side "${GATHER_SIDE}" \
+#     --seq_max_lens "${SEQ_MAX_LENS}" \
+#     --pair_weighted_pool "${PAIR_WEIGHTED_POOL}" \
 #     "$@"
