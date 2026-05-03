@@ -1,6 +1,6 @@
 # W2.6 v2 重启：PairSetEncoder（bucket + 1-layer transformer pool）
 
-**Status**: v1.0 — 初稿
+**Status**: v1.1 — wiring correctness 自查后修订（emb_dim vs d_model + train.py gating）
 **Author**: brainstorming session 2026-05-03（W2.6 v1 失败 F27 后重启）
 **Branch**: `feature/pair-weighted-pool`（continued from v1 weighted pool 实验）
 **Parent spec**: `docs/superpowers/specs/2026-05-01-taac-improvement-plan.md`（v2.2 W2.6 v1 已闭环）
@@ -9,6 +9,10 @@
 
 ## Changelog
 
+- **v1.1（2026-05-03 下午）**：自查后修订 wiring：
+  - 🔧 **PairSetEncoder 输出维度 emb_dim 而非 d_model**：tokenizer 内部每 fid 的 mean-pool 输出是 `(B, emb_dim)`（不是 d_model），下游有 `Linear(num_fids × emb_dim → d_model)` 投影负责升维。PairSetEncoder 是 mean-pool 的替换，必须保持同样接口
+  - 🔧 **train.py gating 需扩展**：`if args.pair_weighted_pool != 'none'` 需改为允许 `'transformer'` 也填充 `user_paired_dense_specs`（否则 PairSetEncoder 拿不到 dense slice）
+  - 🔧 **bucket 上界微调**：fid 62-66 用 24 作 log1p 上界余量，fid 65/66 max log1p≈21 → 桶 28，桶 29-31 留给极端 outliers（保留余量优于撑满）
 - **v1.0（2026-05-03 下午）**：初稿。v1 paradigm（hard-coded log1p / sigmoid weighted pool）已 F27 闭环。v2 完全换 paradigm：把 dense 从 pool weight 角色改为 token feature 角色，pool 机制改为 BERT-style 1 层 transformer block + mean pool
 
 ## 背景
@@ -54,37 +58,39 @@
 
 ### 架构（PairSetEncoder）
 
+**重要：PairSetEncoder 输出 `(B, emb_dim)`**（不是 d_model），跟 tokenizer 内部 per-fid mean-pool 接口一致。下游有 `Linear(num_fids × emb_dim → d_model)` 投影负责拼接后升维。baseline 默认 emb_dim = d_model = 64，但二者概念不同，PairSetEncoder 必须按 emb_dim 设计。
+
 ```python
 class PairSetEncoder(nn.Module):
     """Per-fid set encoder for paired (int, dense) features.
 
     Pipeline:
-    1. id embedding lookup
-    2. bucket(dense) → bucket embedding lookup
+    1. id embedding lookup (emb_dim)
+    2. bucket(dense) → bucket embedding lookup (emb_dim)
     3. add: tokens = id_emb + bucket_emb
     4. 1-layer BERT-style transformer block (attn + FFN, no causal mask)
     5. mean pool over valid (non-padding) positions
-    6. Linear(D, D) project
+    6. Linear(emb_dim, emb_dim) project
     """
     NUM_BUCKETS = 32
 
-    def __init__(self, fid: int, vocab: int, d_model: int, nhead: int = 4,
+    def __init__(self, fid: int, vocab: int, emb_dim: int, nhead: int = 4,
                  dim_feedforward: Optional[int] = None, dropout: float = 0.1):
         super().__init__()
         self.fid = fid
-        self.d_model = d_model
-        self.id_emb = nn.Embedding(vocab, d_model, padding_idx=0)
-        self.bucket_emb = nn.Embedding(self.NUM_BUCKETS, d_model)
+        self.emb_dim = emb_dim
+        self.id_emb = nn.Embedding(vocab, emb_dim, padding_idx=0)
+        self.bucket_emb = nn.Embedding(self.NUM_BUCKETS, emb_dim)
         self.transformer = nn.TransformerEncoderLayer(
-            d_model=d_model,
+            d_model=emb_dim,             # transformer "d_model" = our emb_dim
             nhead=nhead,
-            dim_feedforward=dim_feedforward or 2 * d_model,
+            dim_feedforward=dim_feedforward or 2 * emb_dim,
             activation='gelu',           # BERT-style
             dropout=dropout,
             batch_first=True,
             norm_first=True,             # pre-norm，更稳
         )
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(emb_dim, emb_dim)
 
     def _quantize(self, vals: Tensor) -> Tensor:
         """Map dense values to bucket indices [0, NUM_BUCKETS)."""
@@ -101,7 +107,7 @@ class PairSetEncoder(nn.Module):
             ids:  (B, len_f) int64
             vals: (B, len_f) float
         Returns:
-            (B, D) pooled tensor
+            (B, emb_dim) pooled tensor — replaces tokenizer's per-fid mean-pool output
         """
         # Mask
         valid = (ids != 0).float()                       # (B, len_f)
@@ -109,17 +115,17 @@ class PairSetEncoder(nn.Module):
 
         # Inject dense
         bucket = self._quantize(vals)                    # (B, len_f) int64
-        tokens = self.id_emb(ids) + self.bucket_emb(bucket)   # (B, len_f, D)
+        tokens = self.id_emb(ids) + self.bucket_emb(bucket)   # (B, len_f, emb_dim)
 
         # 1-layer transformer (BERT-style, no causal)
-        tokens = self.transformer(tokens, src_key_padding_mask=kpm)   # (B, len_f, D)
+        tokens = self.transformer(tokens, src_key_padding_mask=kpm)   # (B, len_f, emb_dim)
 
         # Mean pool over valid positions
-        masked_sum = (tokens * valid.unsqueeze(-1)).sum(dim=1)        # (B, D)
+        masked_sum = (tokens * valid.unsqueeze(-1)).sum(dim=1)        # (B, emb_dim)
         denom = valid.sum(dim=1, keepdim=True).clamp(min=1)            # (B, 1)
         pool = masked_sum / denom
 
-        return self.out_proj(pool)                                     # (B, D)
+        return self.out_proj(pool)                                     # (B, emb_dim)
 ```
 
 ### 分桶方案细节
@@ -167,32 +173,44 @@ PAIR_WEIGHTED_POOL=full  ./run.sh
 
 **v2 新增 transformer 路径**：
 
-PCVRHyFormer 持有 `nn.ModuleDict[fid_idx → PairSetEncoder]`，在 forward 里 pre-compute 每个 fid 的 (B, D) 池化输出，传给 tokenizer：
+PCVRHyFormer 持有 `nn.ModuleDict[fid_idx → PairSetEncoder]`，在 forward 里 pre-compute 每个 fid 的 `(B, emb_dim)` 池化输出，传给 tokenizer。**关键复用**：现有的 `_paired_count_idx_to_slice` / `_paired_score_idx_to_slice` 已经把 `fid_idx → (doff, dlen)` 映射好（dense slice），v2 直接复用，不重复维护。`(ioff, ilen)` int slice 通过 `user_int_feature_specs[fid_idx]` 拿到（PCVRHyFormer 已持有）。
 
 ```python
 class PCVRHyFormer(nn.Module):
     def __init__(self, ..., pair_weight_mode='none', ...):
         ...
-        if pair_weight_mode == 'transformer':
+        # v1 modes ('log1p', 'full') 已有路径不动
+        # v2 mode ('transformer') 新增 PairSetEncoder dict
+        if pair_weight_mode == 'transformer' and (
+            self._paired_count_idx_to_slice or self._paired_score_idx_to_slice
+        ):
+            int_vocab_per_fid = ...   # 从 user_int_feature_specs 拿到 vs (vocab) per fid
             self.pair_set_encoders = nn.ModuleDict({
-                str(fid): PairSetEncoder(fid, vocab=int_vocab[fid], d_model=d_model)
-                for fid in PAIR_WEIGHTED_FIDS_COUNT + PAIR_WEIGHTED_FIDS_SCORE
-                if fid in user_paired_dense_specs and fid in user_int_specs
+                str(fid_idx): PairSetEncoder(
+                    fid=user_int_fids[fid_idx],
+                    vocab=int_vocab_per_fid[fid_idx],
+                    emb_dim=emb_dim,
+                )
+                for fid_idx in (
+                    list(self._paired_count_idx_to_slice.keys()) +
+                    list(self._paired_score_idx_to_slice.keys())
+                )
             })
 
     def _build_pair_set_pools(self, inputs: ModelInput) -> Optional[dict]:
-        """Pre-compute (B, D) pool per fid for transformer mode."""
+        """Pre-compute (B, emb_dim) pool per fid for transformer mode."""
         if self.pair_weight_mode != 'transformer':
             return None
+        if not hasattr(self, 'pair_set_encoders'):
+            return None
         pools = {}
-        for fid_str, encoder in self.pair_set_encoders.items():
-            fid = int(fid_str)
-            fid_idx = self._user_int_fid_to_idx[fid]
-            ioff, ilen = self._user_int_idx_to_slice[fid_idx]
-            doff, dlen = self._user_paired_dense_specs[fid]
-            ids = inputs.user_int_feats[:, ioff:ioff + ilen]
+        # 复用已有的 slice 映射（COUNT 和 SCORE 合并迭代）
+        all_slices = {**self._paired_count_idx_to_slice, **self._paired_score_idx_to_slice}
+        for fid_idx, (doff, dlen) in all_slices.items():
+            ioff, ilen = self.user_int_feature_specs[fid_idx]   # (vs, offset, length)
+            ids = inputs.user_int_feats[:, ioff:ioff + ilen].long()
             vals = inputs.user_dense_feats[:, doff:doff + dlen]
-            pools[fid_idx] = encoder(ids, vals)         # (B, D)
+            pools[fid_idx] = self.pair_set_encoders[str(fid_idx)](ids, vals)   # (B, emb_dim)
         return pools
 
     def forward(self, inputs):
@@ -213,23 +231,35 @@ class PCVRHyFormer(nn.Module):
 def forward(self, int_feats, paired_dense=None, paired_pool=None):
     """
     paired_dense: dict {fid_idx: (B, length)} — v1 weighted pool weights
-    paired_pool:  dict {fid_idx: (B, D)} — v2 pre-pooled outputs
+    paired_pool:  dict {fid_idx: (B, emb_dim)} — v2 pre-pooled outputs
     """
     for fid_idx in multi_value_fids:
         if paired_pool is not None and fid_idx in paired_pool:
-            pooled = paired_pool[fid_idx]              # (B, D), 直接用
+            fid_emb = paired_pool[fid_idx]              # (B, emb_dim), 直接用
         elif paired_dense is not None and fid_idx in paired_dense:
             # v1 weighted pool 路径（保留）
-            ...
+            fid_emb = _pool_multivalue(emb_all, vals, paired_dense[fid_idx])
         else:
             # baseline mean pool 路径
-            ...
+            fid_emb = _pool_multivalue(emb_all, vals, None)
+```
+
+**train.py CLI gating 扩展**（重要修订）：
+
+`train.py:300` 当前是 `if args.pair_weighted_pool != 'none':` 来填充 `user_paired_dense_specs`。v2 加入 `'transformer'` 后，这个 gating 仍然正确（`'transformer' != 'none'` → 填充 specs），不需要修改逻辑，**只需要把 `'transformer'` 加入 CLI choices**：
+
+```python
+# train.py:204
+parser.add_argument('--pair_weighted_pool', type=str, default='none',
+                    choices=['none', 'log1p', 'full', 'transformer'],
+                    help='... transformer = v2 PairSetEncoder (set self-attn + bucket-emb dense)')
 ```
 
 **好处**：
 - v1 路径完全不动（zero regression risk）
 - v2 路径独立增加，跟 v1 共存
-- tokenizer 接口扩展是 additive（默认 paired_pool=None，旧调用不受影响）
+- 复用已有的 `_paired_*_idx_to_slice` 映射（不引入新数据结构）
+- tokenizer 接口扩展是 additive（默认 `paired_pool=None`，旧调用不受影响）
 
 ### 等价性 / Fallback / 边界情况
 
@@ -259,14 +289,18 @@ def forward(self, int_feats, paired_dense=None, paired_pool=None):
 
 ## 参数账
 
+baseline emb_dim = d_model = 64（默认值，二者数值相等但概念独立）。所有 PairSetEncoder 内部组件按 emb_dim 算：
+
 | 模块 | 单 fid 参数 | 8 fid 合计 | 备注 |
 |---|---|---|---|
-| bucket_emb (32 × 64) | 2,048 | 16,384 | 新增 |
-| TransformerEncoderLayer (d=64, nhead=4, ff=128, gelu, dropout=0.1, pre-norm) | ~50,000 | ~400,000 | 新增（占比最大）|
-| out_proj Linear(D, D) | 4,160 | 33,280 | 新增 |
+| bucket_emb (32 × emb_dim) | 2,048 | 16,384 | 新增 |
+| TransformerEncoderLayer (d=emb_dim, nhead=4, ff=128, gelu, dropout=0.1, pre-norm) | ~50,000 | ~400,000 | 新增（占比最大）|
+| out_proj Linear(emb_dim, emb_dim) | 4,160 | 33,280 | 新增 |
 | **总增量** | **~56K** | **~450K** | |
 | baseline PCVRHyFormer | — | ~100M+ | 对比 |
 | **增量占比** | — | **~0.4%** | 安全 |
+
+如果将来调高 emb_dim（比如 emb_dim=96 同 F26 实验），参数线性增长但仍可控。
 
 显存增量预估：
 - forward activations 峰值 ≈ B × len_max × D × 4 bytes × 几个 layer 中间态
