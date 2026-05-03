@@ -24,39 +24,43 @@ class ModelInput(NamedTuple):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # fid 列表（vocab fid number, NOT schema index）— 触发 weighted pool 的 user_int 多值特征
-# fid 89-91 不在此列表（log1p 不适合双边 bounded 分布；本期保持 uniform）
-PAIR_WEIGHTED_FIDS = [62, 63, 64, 65, 66]
+# fid 62-66：count/duration-like 重尾正值，用 log1p 转权重
+# fid 89-91：score-like 双边 bounded [-0.92, +0.92]，用 sigmoid 转权重（保留方向性）
+PAIR_WEIGHTED_FIDS_COUNT = [62, 63, 64, 65, 66]
+PAIR_WEIGHTED_FIDS_SCORE = [89, 90, 91]
+# 旧名保留兼容；新代码用 *_COUNT
+PAIR_WEIGHTED_FIDS = PAIR_WEIGHTED_FIDS_COUNT
 
 
 def _pool_multivalue(
     emb_all: torch.Tensor,                    # (B, length, emb_dim)
     vals: torch.Tensor,                       # (B, length) int values used for padding mask
-    paired_value: Optional[torch.Tensor],     # (B, length) dense values, or None
-    weight_mode: str,                         # 'uniform' or 'log1p'
+    paired_weight: Optional[torch.Tensor],    # (B, length) precomputed weight, or None
 ) -> torch.Tensor:
-    """Pool multi-value embeddings, optionally weighted by paired dense values.
+    """Pool multi-value embeddings, optionally weighted by precomputed weights.
 
     Returns: (B, emb_dim).
 
-    - weight_mode='uniform' or paired_value is None: mean-pool ignoring padding (=0).
-    - weight_mode='log1p': w_i = log1p(clamp_min(paired_value_i, 0)) * mask_i.
-      If sum(w) ~ 0 (dense all zero but ids valid), fall back to uniform mean-pool.
-      If mask sum ~ 0 (ids all padding), output 0 (matches baseline behavior).
+    - paired_weight is None: mean-pool ignoring padding (id=0).
+    - paired_weight given: weight_i = paired_weight_i * mask_i. Caller is
+      responsible for applying any transform (log1p / sigmoid / abs / ...)
+      before passing in. Helper does pure weighted-mean + fallback.
+      If sum(weight) ~ 0 → fall back to uniform mean-pool (baseline behavior).
+      If mask sum ~ 0 → output 0 (unknown user, matches baseline).
     """
     mask = (vals != 0).float().unsqueeze(-1)              # (B, length, 1)
     mask_count = mask.sum(dim=1).clamp(min=1)             # (B, 1)
     uniform_pool = (emb_all * mask).sum(dim=1) / mask_count  # (B, emb_dim)
 
-    if weight_mode == 'uniform' or paired_value is None:
+    if paired_weight is None:
         return uniform_pool
 
-    # log1p weighted pool
     eps = 1e-8
-    w = torch.log1p(paired_value.clamp(min=0)) * mask.squeeze(-1)  # (B, length)
-    W = w.sum(dim=1, keepdim=True)                                  # (B, 1)
+    w = paired_weight * mask.squeeze(-1)                  # (B, length)
+    W = w.sum(dim=1, keepdim=True)                        # (B, 1)
     weighted_pool = (emb_all * w.unsqueeze(-1)).sum(dim=1) / W.clamp(min=eps)
-    # Fallback: where W <= eps (dense all zero), use uniform_pool
-    use_weighted = (W > eps).float()                                # (B, 1)
+    # Fallback: where W <= eps (weight all zero), use uniform_pool
+    use_weighted = (W > eps).float()                      # (B, 1)
     return weighted_pool * use_weighted + uniform_pool * (1 - use_weighted)
 
 
@@ -1074,17 +1078,15 @@ class GroupNSTokenizer(nn.Module):
         ])
 
     def forward(self, int_feats: torch.Tensor,
-                paired_dense: "dict | None" = None,
-                weight_mode: str = 'uniform') -> torch.Tensor:
+                paired_dense: "dict | None" = None) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
             int_feats: (B, total_int_dim), concatenated integer features.
-            paired_dense: Optional dict {fid_idx: (B, length) dense tensor} for
-                value-weighted pooling. Only fid_idx in this dict gets weighted
-                treatment; others use uniform mean-pool. Default None = all uniform.
-            weight_mode: 'uniform' (default, bit-equivalent to baseline) or
-                'log1p' (use log1p(clamp_min(value, 0)) as pool weights).
+            paired_dense: Optional dict {fid_idx: (B, length) precomputed weight tensor}.
+                Caller is responsible for applying any transform (log1p / sigmoid / ...)
+                before calling. fids absent from the dict use uniform mean-pool.
+                Default None = all uniform (bit-equivalent to baseline).
 
         Returns:
             Tokens of shape (B, num_groups, D).
@@ -1104,11 +1106,11 @@ class GroupNSTokenizer(nn.Module):
                         # Single-value feature: direct lookup
                         fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
                     else:
-                        # Multi-value feature: optional value-weighted pool
+                        # Multi-value feature: optional precomputed-weight pool
                         vals = int_feats[:, offset:offset + length].long()  # (B, length)
                         emb_all = emb_layer(vals)                            # (B, length, emb_dim)
-                        paired_value = (paired_dense or {}).get(fid_idx, None)
-                        fid_emb = _pool_multivalue(emb_all, vals, paired_value, weight_mode)
+                        paired_weight = (paired_dense or {}).get(fid_idx, None)
+                        fid_emb = _pool_multivalue(emb_all, vals, paired_weight)
                 fid_embs.append(fid_emb)
             cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
@@ -1194,15 +1196,13 @@ class RankMixerNSTokenizer(nn.Module):
         )
 
     def forward(self, int_feats: torch.Tensor,
-                paired_dense: "dict | None" = None,
-                weight_mode: str = 'uniform') -> torch.Tensor:
+                paired_dense: "dict | None" = None) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
-            paired_dense: Optional dict {fid_idx: (B, length) dense tensor} for
-                value-weighted pooling. See GroupNSTokenizer.forward.
-            weight_mode: 'uniform' (default, bit-equivalent to baseline) or 'log1p'.
+            paired_dense: Optional dict {fid_idx: (B, length) precomputed weight tensor}.
+                See GroupNSTokenizer.forward.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1222,8 +1222,8 @@ class RankMixerNSTokenizer(nn.Module):
                     else:
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
-                        paired_value = (paired_dense or {}).get(fid_idx, None)
-                        fid_emb = _pool_multivalue(emb_all, vals, paired_value, weight_mode)
+                        paired_weight = (paired_dense or {}).get(fid_idx, None)
+                        fid_emb = _pool_multivalue(emb_all, vals, paired_weight)
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -1301,13 +1301,21 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
 
         # Pair-weighted pool: build {fid_idx: (doff, dlen)} so the user NS tokenizer
-        # can grab the paired dense slice for each multi-value fid in PAIR_WEIGHTED_FIDS.
-        self.pair_weight_mode = pair_weight_mode
-        self._paired_fid_idx_to_slice: dict = {}
-        if user_paired_dense_specs and user_int_fids:
+        # can grab the paired dense slice for each multi-value fid in PAIR_WEIGHTED_FIDS_*.
+        # Two fid groups, two transforms:
+        #   COUNT (fid 62-66): non-negative right-tailed → log1p(clamp_min(v, 0))
+        #   SCORE (fid 89-91): bounded ~[-1, +1] → sigmoid(v)
+        self.pair_weight_mode = pair_weight_mode  # 'uniform' / 'log1p' / 'full'
+        self._paired_count_idx_to_slice: dict = {}
+        self._paired_score_idx_to_slice: dict = {}
+        if user_paired_dense_specs and user_int_fids and pair_weight_mode != 'uniform':
             for fid_idx, fid in enumerate(user_int_fids):
-                if fid in user_paired_dense_specs:
-                    self._paired_fid_idx_to_slice[fid_idx] = user_paired_dense_specs[fid]
+                if fid not in user_paired_dense_specs:
+                    continue
+                if fid in PAIR_WEIGHTED_FIDS_COUNT:
+                    self._paired_count_idx_to_slice[fid_idx] = user_paired_dense_specs[fid]
+                elif fid in PAIR_WEIGHTED_FIDS_SCORE and pair_weight_mode == 'full':
+                    self._paired_score_idx_to_slice[fid_idx] = user_paired_dense_specs[fid]
         self.ns_tokenizer_type = ns_tokenizer_type
 
         # ================== NS Tokens Construction ==================
@@ -1697,18 +1705,30 @@ class PCVRHyFormer(nn.Module):
         return output
 
     def _build_paired_dense(self, inputs: ModelInput) -> Optional[dict]:
-        """Slice user_dense_feats into per-fid_idx (B, length) tensors for weighted pool.
+        """Slice user_dense_feats and apply per-fid weight transforms.
 
-        Returns None if pair-weighted pool is disabled (uniform mode or empty specs),
-        which makes downstream tokenizer take the original mean-pool path.
+        Returns dict {fid_idx: (B, length) precomputed weight tensor}, or None if
+        pair-weighted pool is disabled. Returning None makes downstream tokenizer
+        take the original mean-pool path (bit-equivalent to baseline).
+
+        Transforms per pair_weight_mode:
+        - 'uniform': returns None.
+        - 'log1p': fid 62-66 → log1p(clamp_min(v, 0)); 89-91 untouched (mean-pool).
+        - 'full':  fid 62-66 → log1p(clamp_min(v, 0)); 89-91 → sigmoid(v).
         """
-        if self.pair_weight_mode == 'uniform' or not self._paired_fid_idx_to_slice:
+        if self.pair_weight_mode == 'uniform':
+            return None
+        if not self._paired_count_idx_to_slice and not self._paired_score_idx_to_slice:
             return None
         ud = inputs.user_dense_feats
-        return {
-            fid_idx: ud[:, doff:doff + dlen]
-            for fid_idx, (doff, dlen) in self._paired_fid_idx_to_slice.items()
-        }
+        weights: dict = {}
+        for fid_idx, (doff, dlen) in self._paired_count_idx_to_slice.items():
+            v = ud[:, doff:doff + dlen]
+            weights[fid_idx] = torch.log1p(v.clamp(min=0))
+        for fid_idx, (doff, dlen) in self._paired_score_idx_to_slice.items():
+            v = ud[:, doff:doff + dlen]
+            weights[fid_idx] = torch.sigmoid(v)
+        return weights
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
@@ -1717,7 +1737,6 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(
             inputs.user_int_feats,
             paired_dense=paired_dense,
-            weight_mode=self.pair_weight_mode,
         )   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
@@ -1765,7 +1784,6 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(
             inputs.user_int_feats,
             paired_dense=paired_dense,
-            weight_mode=self.pair_weight_mode,
         )
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 

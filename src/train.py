@@ -20,7 +20,7 @@ import torch
 
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
-from model import PCVRHyFormer, PAIR_WEIGHTED_FIDS
+from model import PCVRHyFormer, PAIR_WEIGHTED_FIDS_COUNT, PAIR_WEIGHTED_FIDS_SCORE
 from trainer import PCVRHyFormerRankingTrainer
 
 
@@ -202,10 +202,11 @@ def parse_args() -> argparse.Namespace:
                              '(0 = automatically use the number of item groups)')
 
     parser.add_argument('--pair_weighted_pool', type=str, default='none',
-                        choices=['none', 'log1p'],
-                        help='Pair (int, dense) weighted pool mode for user_int_feats_{62-66}. '
-                             'none = baseline mean-pool (default, equivalent to current behavior); '
-                             'log1p = log1p-weighted by paired user_dense_feats_{62-66}.')
+                        choices=['none', 'log1p', 'full'],
+                        help='Pair (int, dense) weighted pool mode. '
+                             'none = baseline mean-pool (default); '
+                             'log1p = log1p-weighted on fid 62-66 only (89-91 stay mean-pool); '
+                             'full = log1p on fid 62-66 + sigmoid on fid 89-91.')
 
     args = parser.parse_args()
 
@@ -290,13 +291,16 @@ def main() -> None:
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
 
     # Pair-weighted pool: build {fid: (doff, dlen)} from user_dense_schema for fids
-    # in PAIR_WEIGHTED_FIDS that are present in the data. If --pair_weighted_pool=none
-    # the dict is left empty (model.forward then returns None for paired_dense and
-    # downstream tokenizer takes the original mean-pool path).
+    # in PAIR_WEIGHTED_FIDS_COUNT (62-66) and PAIR_WEIGHTED_FIDS_SCORE (89-91) that
+    # are present in the data. PCVRHyFormer dispatches per fid based on pair_weight_mode:
+    #   - 'none'  → no specs used; tokenizer takes mean-pool path
+    #   - 'log1p' → fid 62-66 → log1p-weighted; fid 89-91 → mean-pool (specs ignored)
+    #   - 'full'  → fid 62-66 → log1p; fid 89-91 → sigmoid
     user_paired_dense_specs = {}
     if args.pair_weighted_pool != 'none':
+        wanted = set(PAIR_WEIGHTED_FIDS_COUNT) | set(PAIR_WEIGHTED_FIDS_SCORE)
         for fid, doff, dlen in pcvr_dataset.user_dense_schema.entries:
-            if fid in PAIR_WEIGHTED_FIDS:
+            if fid in wanted:
                 user_paired_dense_specs[fid] = (doff, dlen)
         logging.info(f"Pair-weighted pool enabled (mode={args.pair_weighted_pool}); "
                      f"paired fids: {sorted(user_paired_dense_specs.keys())}")

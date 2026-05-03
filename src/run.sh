@@ -4,7 +4,8 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
 # ---- W2.6 pair-weighted pool A/B (default = baseline) ----
 #   PAIR_WEIGHTED_POOL=none  bash run.sh   # baseline mean-pool
-#   PAIR_WEIGHTED_POOL=log1p bash run.sh   # treatment: log1p-weighted pool on fid 62-66
+#   PAIR_WEIGHTED_POOL=log1p bash run.sh   # treatment 1: log1p on fid 62-66; 89-91 mean-pool
+#   PAIR_WEIGHTED_POOL=full  bash run.sh   # treatment 2: log1p on 62-66 + sigmoid on 89-91
 PAIR_WEIGHTED_POOL="${PAIR_WEIGHTED_POOL:-none}"
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
