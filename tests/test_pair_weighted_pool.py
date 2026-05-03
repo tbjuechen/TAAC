@@ -547,3 +547,116 @@ def test_pcvr_log1p_mode_no_pair_set_encoders():
         user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
     )
     assert len(m.pair_set_encoders) == 0
+
+
+# ─────────────────────────────────────────────────────────────────
+# W2.6 v2: id_emb sharing with tokenizer + reset behavior (F15 interaction)
+# ─────────────────────────────────────────────────────────────────
+
+def test_pcvr_transformer_mode_shares_id_emb_with_tokenizer():
+    """v2 PairSetEncoder.id_emb must be the SAME tensor as tokenizer.embs[fid_idx].
+
+    Required so the existing reinit_high_cardinality_params path resets it (F15).
+    """
+    torch.manual_seed(42)
+    m = _make_pcvr(
+        pair_weight_mode='transformer',
+        user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
+    )
+    for fid_idx_str, encoder in m.pair_set_encoders.items():
+        fid_idx = int(fid_idx_str)
+        real_idx = m.user_ns_tokenizer._emb_index[fid_idx]
+        tok_emb = m.user_ns_tokenizer.embs[real_idx]
+        # PairSetEncoder must use tokenizer's emb via shared list (no own id_emb)
+        assert encoder._shared_id_emb is not None
+        assert encoder.id_emb is None
+        assert encoder._shared_id_emb[0] is tok_emb, \
+            f"fid_idx {fid_idx} shared_id_emb must be SAME object as tokenizer's emb"
+        # data_ptr equal confirms no copy
+        assert encoder._shared_id_emb[0].weight.data_ptr() == tok_emb.weight.data_ptr()
+
+
+def test_pcvr_transformer_mode_id_emb_reset_via_reinit_path():
+    """After reinit_high_cardinality_params(0), shared id_emb is reset (xavier);
+    bucket_emb (owned) is NOT reset.
+    """
+    torch.manual_seed(42)
+    m = _make_pcvr(
+        pair_weight_mode='transformer',
+        user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
+    )
+
+    # Snapshot before reinit
+    encoder = m.pair_set_encoders['1']  # fid 62
+    id_emb_before = encoder._shared_id_emb[0].weight.data.clone()
+    bucket_emb_before = encoder.bucket_emb.weight.data.clone()
+    transformer_w_before = encoder.transformer.linear1.weight.data.clone()
+
+    # Run reinit with threshold=0 (baseline behavior: vs > 0 → reset all built emb)
+    reinit_ptrs = m.reinit_high_cardinality_params(cardinality_threshold=0)
+
+    id_emb_after = encoder._shared_id_emb[0].weight.data
+    bucket_emb_after = encoder.bucket_emb.weight.data
+    transformer_w_after = encoder.transformer.linear1.weight.data
+
+    # id_emb (shared with tokenizer) MUST be reset
+    assert encoder._shared_id_emb[0].weight.data_ptr() in reinit_ptrs, \
+        "id_emb (shared with tokenizer) must be in reinit_ptrs"
+    assert not torch.allclose(id_emb_before, id_emb_after), \
+        "shared id_emb must change after reinit (xavier_normal_)"
+
+    # bucket_emb MUST NOT be reset (owned by PairSetEncoder, analogous to time_embedding)
+    assert encoder.bucket_emb.weight.data_ptr() not in reinit_ptrs, \
+        "bucket_emb must NOT be in reinit_ptrs (analogous to time_embedding)"
+    assert torch.allclose(bucket_emb_before, bucket_emb_after), \
+        "bucket_emb must be unchanged after reinit"
+
+    # Transformer weights are dense params, NOT touched by reinit
+    assert torch.allclose(transformer_w_before, transformer_w_after), \
+        "transformer block weights must be unchanged after reinit"
+
+
+def test_pair_set_encoder_no_double_param_registration():
+    """When PairSetEncoder uses shared id_emb, that emb's params should appear ONCE
+    in the parent model's parameters() (i.e. only via tokenizer, not via encoder).
+    """
+    torch.manual_seed(42)
+    m = _make_pcvr(
+        pair_weight_mode='transformer',
+        user_paired_dense_specs={62: (0, 4), 89: (4, 3)},
+    )
+    # Collect all param data_ptrs and count duplicates.
+    ptrs = [p.data_ptr() for p in m.parameters()]
+    dup = [p for p in set(ptrs) if ptrs.count(p) > 1]
+    assert not dup, f"Duplicate params (would be optimized 2x): {dup}"
+
+
+def test_pair_set_encoder_standalone_owns_id_emb():
+    """When id_emb_module is None, PairSetEncoder owns its own id_emb (test path)."""
+    from model import PairSetEncoder
+    enc = PairSetEncoder(fid=62, vocab=10, emb_dim=8, nhead=2)
+    assert enc.id_emb is not None
+    assert enc._shared_id_emb is None
+    # id_emb appears in parameters
+    ptrs = [p.data_ptr() for p in enc.parameters()]
+    assert enc.id_emb.weight.data_ptr() in ptrs
+
+
+def test_pair_set_encoder_shared_id_emb_path():
+    """When id_emb_module is provided, PairSetEncoder uses it without registering."""
+    from model import PairSetEncoder
+    shared = torch.nn.Embedding(11, 8, padding_idx=0)
+    enc = PairSetEncoder(fid=62, vocab=10, emb_dim=8, nhead=2, id_emb_module=shared)
+    assert enc.id_emb is None
+    assert enc._shared_id_emb is not None
+    # Shared emb's params NOT in encoder's parameters
+    ptrs = [p.data_ptr() for p in enc.parameters()]
+    assert shared.weight.data_ptr() not in ptrs, \
+        "shared id_emb must not be registered as encoder's submodule"
+    # But forward still works using the shared table
+    enc.eval()
+    ids = torch.tensor([[1, 2, 3, 0]], dtype=torch.long)
+    vals = torch.tensor([[10.0, 20.0, 5.0, 0.0]])
+    out = enc(ids, vals)
+    assert out.shape == (1, 8)
+    assert torch.isfinite(out).all()

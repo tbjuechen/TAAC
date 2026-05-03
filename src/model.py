@@ -68,8 +68,12 @@ class PairSetEncoder(nn.Module):
     """Per-fid set encoder for paired (int, dense) features (W2.6 v2).
 
     Replaces v1 hard-coded weighted-pool (log1p / sigmoid) with:
-      1. id embedding lookup (emb_dim)
-      2. bucket(dense) → bucket embedding lookup (emb_dim)
+      1. id embedding lookup (emb_dim) — SHARED with NS tokenizer's emb table when
+         id_emb_module is provided (so reinit_high_cardinality_params automatically
+         covers it via the tokenizer's path; avoids duplicate emb tables).
+      2. bucket(dense) → bucket embedding lookup (emb_dim) — owned by this module,
+         NOT reset across epochs (analogous to time_embedding: semantic is fixed by
+         the quantize function, not arbitrarily learned, so it accumulates safely).
       3. add: tokens = id_emb + bucket_emb
       4. 1-layer BERT-style transformer block (attn + FFN, no causal mask, pre-norm)
       5. mean pool over valid (non-padding) positions
@@ -83,12 +87,38 @@ class PairSetEncoder(nn.Module):
     NUM_BUCKETS: int = 32
 
     def __init__(self, fid: int, vocab: int, emb_dim: int, nhead: int = 4,
-                 dim_feedforward: Optional[int] = None, dropout: float = 0.1) -> None:
+                 dim_feedforward: Optional[int] = None, dropout: float = 0.1,
+                 id_emb_module: Optional[nn.Embedding] = None) -> None:
+        """
+        Args:
+            fid: Feature id (62-66 COUNT or 89-91 SCORE) — controls _quantize path.
+            vocab: int vocab size for fid (used only when id_emb_module is None).
+            emb_dim: Embedding dimension; transformer / out_proj operate at this dim.
+            nhead: Multi-head attn heads (must divide emb_dim).
+            dim_feedforward: FFN hidden dim; default 2 * emb_dim.
+            dropout: Transformer block dropout.
+            id_emb_module: Optional shared nn.Embedding from the NS tokenizer for this
+                fid. When provided, this PairSetEncoder uses it via a non-registered
+                reference (list-wrapped to bypass nn.Module __setattr__) so the
+                emb table is owned/reset by the tokenizer, not duplicated here.
+                When None (e.g. unit tests), a private nn.Embedding is constructed.
+        """
         super().__init__()
         self.fid = fid
         self.emb_dim = emb_dim
-        # padding_idx=0 → id=0 emb is fixed at zero, no gradient (matches baseline lookup)
-        self.id_emb = nn.Embedding(vocab + 1, emb_dim, padding_idx=0)
+
+        if id_emb_module is None:
+            # Standalone: build own id_emb. Reset behavior depends on caller's reinit
+            # logic — by default this private id_emb is NOT auto-reset.
+            self.id_emb = nn.Embedding(vocab + 1, emb_dim, padding_idx=0)
+            self._shared_id_emb: Optional[List[nn.Embedding]] = None
+        else:
+            # Production: share with tokenizer's emb table. Stash in a list so
+            # nn.Module.__setattr__ does NOT register it as a submodule of this
+            # PairSetEncoder (otherwise the optimizer would see the param twice).
+            self.id_emb = None  # type: ignore[assignment]
+            self._shared_id_emb = [id_emb_module]
+
         self.bucket_emb = nn.Embedding(self.NUM_BUCKETS, emb_dim)
         self.transformer = nn.TransformerEncoderLayer(
             d_model=emb_dim,
@@ -100,6 +130,12 @@ class PairSetEncoder(nn.Module):
             norm_first=True,
         )
         self.out_proj = nn.Linear(emb_dim, emb_dim)
+
+    def _id_emb_lookup(self, ids: torch.Tensor) -> torch.Tensor:
+        """Dispatch to shared (tokenizer-owned) emb or private emb."""
+        if self._shared_id_emb is not None:
+            return self._shared_id_emb[0](ids)
+        return self.id_emb(ids)
 
     def _quantize(self, vals: torch.Tensor) -> torch.Tensor:
         """Map dense values to bucket indices [0, NUM_BUCKETS).
@@ -127,7 +163,7 @@ class PairSetEncoder(nn.Module):
         kpm = (ids == 0)                                            # (B, len_f) True=padding
 
         bucket = self._quantize(vals)                              # (B, len_f)
-        tokens = self.id_emb(ids) + self.bucket_emb(bucket)        # (B, len_f, emb_dim)
+        tokens = self._id_emb_lookup(ids) + self.bucket_emb(bucket)  # (B, len_f, emb_dim)
 
         # nn.TransformerEncoderLayer with src_key_padding_mask all-True for a row
         # produces NaN (0/0 attention weights). With fid 91 all_zero=48%, this case
@@ -1414,24 +1450,11 @@ class PCVRHyFormer(nn.Module):
                 elif fid in PAIR_WEIGHTED_FIDS_SCORE and pair_weight_mode in ('full', 'transformer'):
                     self._paired_score_idx_to_slice[fid_idx] = user_paired_dense_specs[fid]
 
-        # W2.6 v2: instantiate PairSetEncoder per paired fid (transformer mode only).
-        # See docs/superpowers/specs/2026-05-03-pair-set-encoder-design.md.
+        # PairSetEncoder dict (W2.6 v2) is built AFTER NS tokenizer so we can share
+        # tokenizer's id_emb table (avoids duplicate emb tables and lets the existing
+        # reinit_high_cardinality_params path cover id_emb resets automatically).
+        # See "Reset behavior" section of design doc for the F15 reasoning.
         self.pair_set_encoders = nn.ModuleDict()
-        if pair_weight_mode == 'transformer':
-            all_paired_slices = {**self._paired_count_idx_to_slice,
-                                 **self._paired_score_idx_to_slice}
-            for fid_idx in all_paired_slices.keys():
-                vs, _off, _len = user_int_feature_specs[fid_idx]
-                fid = user_int_fids[fid_idx] if user_int_fids else fid_idx
-                self.pair_set_encoders[str(fid_idx)] = PairSetEncoder(
-                    fid=fid, vocab=int(vs), emb_dim=emb_dim,
-                )
-            if self.pair_set_encoders:
-                logging.info(
-                    f"PairSetEncoder enabled (W2.6 v2): {len(self.pair_set_encoders)} paired fids "
-                    f"covered (count={list(self._paired_count_idx_to_slice.keys())}, "
-                    f"score={list(self._paired_score_idx_to_slice.keys())})"
-                )
 
         self.ns_tokenizer_type = ns_tokenizer_type
         # Stash for _build_pair_set_pools (need int slices to read ids; dense slices already cached)
@@ -1486,6 +1509,50 @@ class PCVRHyFormer(nn.Module):
             num_item_ns = item_ns_tokens
         else:
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
+
+        # W2.6 v2: instantiate PairSetEncoder per paired fid (transformer mode only).
+        # Built AFTER tokenizer so we can share its id_emb table.
+        # Reset behavior:
+        #   - id_emb is shared with tokenizer.embs[real_idx] (gets reset via tokenizer's
+        #     existing reinit_high_cardinality_params path; matches gender/age semantics
+        #     where emb is "arbitrarily learned" and needs reset to avoid memorization)
+        #   - bucket_emb is owned here and NOT reset (analogous to time_embedding:
+        #     32 buckets with semantic anchored by quantize fn → safe to accumulate
+        #     across epochs; ~170K obs/bucket per epoch on val data ensures convergence)
+        #   - transformer / out_proj are dense params (accumulate across epochs naturally)
+        # See docs/superpowers/specs/2026-05-03-pair-set-encoder-design.md.
+        if pair_weight_mode == 'transformer':
+            all_paired_slices = {**self._paired_count_idx_to_slice,
+                                 **self._paired_score_idx_to_slice}
+            tok_embs = self.user_ns_tokenizer.embs
+            tok_emb_index = self.user_ns_tokenizer._emb_index
+            for fid_idx in all_paired_slices.keys():
+                vs, _off, _len = user_int_feature_specs[fid_idx]
+                fid = user_int_fids[fid_idx] if user_int_fids else fid_idx
+                # Get tokenizer's emb for this fid; if the fid was skipped by
+                # emb_skip_threshold, fall back to PairSetEncoder owning its own
+                # (won't auto-reset, but should never trigger for paired fids since
+                # 62-66 + 89-91 vocabs are well below typical thresholds).
+                real_idx = tok_emb_index[fid_idx]
+                shared_emb = tok_embs[real_idx] if real_idx >= 0 else None
+                if shared_emb is None:
+                    logging.warning(
+                        f"PairSetEncoder fid={fid} (idx={fid_idx}) tokenizer emb is "
+                        f"skipped (vocab={vs} > emb_skip_threshold={emb_skip_threshold}); "
+                        f"PairSetEncoder will own a private id_emb (NOT auto-reset)."
+                    )
+                self.pair_set_encoders[str(fid_idx)] = PairSetEncoder(
+                    fid=fid, vocab=int(vs), emb_dim=emb_dim,
+                    id_emb_module=shared_emb,
+                )
+            if self.pair_set_encoders:
+                logging.info(
+                    f"PairSetEncoder enabled (W2.6 v2): {len(self.pair_set_encoders)} paired fids "
+                    f"covered (count={list(self._paired_count_idx_to_slice.keys())}, "
+                    f"score={list(self._paired_score_idx_to_slice.keys())}); "
+                    f"id_emb shared with tokenizer (resets via reinit path); "
+                    f"bucket_emb owned + accumulating (analogous to time_embedding)"
+                )
 
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0

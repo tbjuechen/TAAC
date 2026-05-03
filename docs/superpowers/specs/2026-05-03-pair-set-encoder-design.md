@@ -1,6 +1,6 @@
 # W2.6 v2 重启：PairSetEncoder（bucket + 1-layer transformer pool）
 
-**Status**: v1.1 — wiring correctness 自查后修订（emb_dim vs d_model + train.py gating）
+**Status**: v1.2 — reset behavior 设计：id_emb 共享 tokenizer（reset 路径自动覆盖）/ bucket_emb 不 reset（time_embedding 类比）
 **Author**: brainstorming session 2026-05-03（W2.6 v1 失败 F27 后重启）
 **Branch**: `feature/pair-weighted-pool`（continued from v1 weighted pool 实验）
 **Parent spec**: `docs/superpowers/specs/2026-05-01-taac-improvement-plan.md`（v2.2 W2.6 v1 已闭环）
@@ -9,6 +9,10 @@
 
 ## Changelog
 
+- **v1.2（2026-05-03 下午）**：reset behavior 关键设计修订：
+  - 🔧 **id_emb 共享 tokenizer 现有 emb 表**（v1.1 是 PairSetEncoder 自持独立表）：避免双 register；走 tokenizer 已有的 reinit_high_cardinality_params 路径，自动覆盖 reset
+  - 🔧 **bucket_emb 不进 reinit 路径**（不是疏忽，是设计）：跟 baseline `time_embedding` 同构——semantic 由 quantize 函数定义、跨 epoch 稳定，不会被模型当 shortcut 记忆，可以累积学习
+  - 📝 新增"Reset behavior (F15 interaction)" section，论证 time_embedding 类比 + obs/bucket 估算
 - **v1.1（2026-05-03 下午）**：自查后修订 wiring：
   - 🔧 **PairSetEncoder 输出维度 emb_dim 而非 d_model**：tokenizer 内部每 fid 的 mean-pool 输出是 `(B, emb_dim)`（不是 d_model），下游有 `Linear(num_fids × emb_dim → d_model)` 投影负责升维。PairSetEncoder 是 mean-pool 的替换，必须保持同样接口
   - 🔧 **train.py gating 需扩展**：`if args.pair_weighted_pool != 'none'` 需改为允许 `'transformer'` 也填充 `user_paired_dense_specs`（否则 PairSetEncoder 拿不到 dense slice）
@@ -301,6 +305,106 @@ baseline emb_dim = d_model = 64（默认值，二者数值相等但概念独立�
 | **增量占比** | — | **~0.4%** | 安全 |
 
 如果将来调高 emb_dim（比如 emb_dim=96 同 F26 实验），参数线性增长但仍可控。
+
+## Reset behavior（F15 reinit 交互——关键设计）
+
+### baseline F15 行为回顾
+
+`reinit_cardinality_threshold=0` 是模型不崩的底线（spec parent F15）。每 epoch 末调 `reinit_high_cardinality_params(0)` 把所有 `vs > 0` 的 nn.Embedding 重置成 xavier_normal_。Run Y (threshold=10000) 实证不 reset 低基数 emb → 模型 epoch 2 崩。
+
+但**不是所有低基数 emb 都需要 reset**。baseline `time_embedding` (vocab=65) 始终被显式排除（`model.py:1715` 注释 `# time_embedding is always preserved`），baseline 工作得很好。
+
+### 区分原则：semantic 是任意学的还是数据定义的
+
+| emb 类型 | vocab 量级 | semantic 来源 | 需要 reset？ | 类比 |
+|---|---|---|---|---|
+| user_int_feats id_emb (gender / age / device 等) | 小（3-100）| **任意学**（id 0 vs id 1 哪个表示啥纯靠数据）| ✅ 必须 | F15 实证 |
+| seq emb（用户行为序列 id）| 中-大（100-1M）| **任意学**（同上）| ✅ 必须 | F15 实证 |
+| time_embedding | 65 | **数据定义**（bucket k 永远表示同样的时间区间，quantize 函数锁住）| ❌ 不需要 | baseline 实证 |
+| **bucket_emb (W2.6 v2)** | 32 | **数据定义**（bucket k 永远表示同样的 v 区间，`_quantize` 函数锁住）| ❌ 跟 time_embedding 同构 | 本设计 |
+
+### 为什么 bucket_emb 跟 time_embedding 同构
+
+两者都用 quantize 函数把连续值映射到固定语义的桶：
+- `time_embedding`: `floor((delta_seconds / max_window) * NUM_BUCKETS)` → bucket k 表示固定时间区间
+- `bucket_emb` (COUNT 路径): `floor(log1p(v) / 24 * 32)` → bucket k 表示固定 v 范围
+- `bucket_emb` (SCORE 路径): `floor((v + 1) / 2 * 32)` → bucket k 表示固定 v 范围
+
+bucket 编号有内在排序（bucket 5 永远比 bucket 4 表示"更大"的 v / 更久之前的事件）。模型**不能**靠 bucket emb 来"记住特定用户"——bucket 是按 v 切的，不是按用户切的。
+
+### 跟 gender_emb 不同构（为什么 F15 trap 不适用）
+
+F15 失败机制：低基数 emb 被许多 user 共享 → 不 reset → dense 参数把它当 shortcut 记忆 → 跨 epoch 累积 → val 越涨 test 越坏。
+
+bucket_emb **抗这个机制**因为：
+1. 每 user 不止 1 次 lookup（fid 66 dim=150 → 一个 user 一次 forward 触 150 个桶 lookup）；不是"per-user 1 个 emb 当身份卡"
+2. semantic 锁定（quantize 决定哪些 v 落进哪个桶），不能任意调 bucket emb 内容来 fit 单个样本
+3. 桶共享性：bucket 16 在 fid 91 上是 48% user 共享的（v=0 落桶），是"群体共享 prior"，不是"个体 shortcut"
+
+### obs/bucket 估算（说明每 epoch 学得动）
+
+fid 62（dim=6, val 集 907K rows）：
+- 总 lookup ≈ 907K × 6 = **5.4M**
+- 平摊 32 桶 ≈ **170K obs/bucket**
+
+fid 66（dim=150）：
+- 总 lookup ≈ 907K × 150 = **136M**
+- 平摊 32 桶 ≈ **4.25M obs/bucket**
+
+参考：
+- baseline NS emb（保留的）每 fid 约 1K-3K obs/id（spec 附录 D.9）
+- F21 失败的复活方案 fid 29 进 reinit 范围后 55 obs/id 学不动
+- bucket_emb 远超学习门槛 → 累积学习是合理的
+
+### id_emb 共享 tokenizer：让现有 reset 路径自动覆盖
+
+PairSetEncoder.id_emb 是**任意学 semantic**（同 gender_emb），按 F15 必须 reset。最干净的实现是**共享 tokenizer 现有的 emb 表**（不是 PairSetEncoder 自己再建一份）：
+
+```python
+# PCVRHyFormer.__init__:
+shared_emb = self.user_ns_tokenizer.embs[real_idx]  # tokenizer 已建的表
+self.pair_set_encoders[str(fid_idx)] = PairSetEncoder(
+    fid=fid, vocab=int(vs), emb_dim=emb_dim,
+    id_emb_module=shared_emb,  # 共享，不是复制
+)
+```
+
+PairSetEncoder 内部用 list 包裹避免双 register（不然 optimizer 看到同一参数两次）：
+
+```python
+class PairSetEncoder(nn.Module):
+    def __init__(self, ..., id_emb_module=None):
+        super().__init__()
+        if id_emb_module is None:
+            self.id_emb = nn.Embedding(vocab + 1, emb_dim, padding_idx=0)
+            self._shared_id_emb = None
+        else:
+            self.id_emb = None  # 不持有 ParameterContainer
+            self._shared_id_emb = [id_emb_module]  # list 绕过 nn.Module 注册
+        self.bucket_emb = nn.Embedding(self.NUM_BUCKETS, emb_dim)  # 自有，不 reset
+
+    def _id_emb_lookup(self, ids):
+        return (self._shared_id_emb[0] if self._shared_id_emb else self.id_emb)(ids)
+```
+
+**好处**：
+1. 一份 emb 表 / fid（省 ~5M 参数 vs 自持）
+2. v1 weighted-pool 路径用的是 tokenizer 那张；v2 transformer 路径也是同一张 → 模式之间公平对比
+3. tokenizer 已有的 `reinit_high_cardinality_params` 自动覆盖 id_emb reset，不需要改 reinit 代码
+4. forward / weighted-pool / set-encoder 三条路径 emb lookup 一致
+
+### 总结：v2 各组件 reset 行为
+
+| 组件 | reset 每 epoch？| 理由 |
+|---|---|---|
+| `id_emb`（tokenizer 共享）| ✅ 是 | 任意 semantic，跨 epoch 不 reset 会被 dense 当 shortcut 记忆（F15）|
+| `bucket_emb`（PairSetEncoder 自有）| ❌ 否 | 数据定义 semantic（quantize 锁住），跟 time_embedding 同构 |
+| `transformer` block 权重 | ❌ 否 | dense 参数累积学习（baseline transformer / RankMixer 一致）|
+| `out_proj` Linear | ❌ 否 | 同上 |
+
+### 风险
+
+如果 bucket_emb 不 reset 实测仍引入 val/test divergence，回退方案是把它加进 reinit 路径（vs > 0 触发，等同 id_emb 处理）。但理论上不应触发，因为 bucket semantic 锁死无法 shortcut。
 
 显存增量预估：
 - forward activations 峰值 ≈ B × len_max × D × 4 bytes × 几个 layer 中间态
