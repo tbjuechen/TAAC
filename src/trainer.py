@@ -304,6 +304,12 @@ class PCVRHyFormerRankingTrainer:
         self.model.train()
         total_step = 0
 
+        # Smoothed train loss logging: window-mean every TRAIN_LOG_EVERY steps.
+        # Per-step `Loss/train` is still written for fine-grained inspection.
+        TRAIN_LOG_EVERY = 500
+        window_sum = 0.0
+        window_count = 0
+
         for epoch in range(1, self.num_epochs + 1):
             train_pbar = tqdm(enumerate(self.train_loader), total=len(self.train_loader),
                               dynamic_ncols=True)
@@ -313,11 +319,25 @@ class PCVRHyFormerRankingTrainer:
                 loss = self._train_step(batch)
                 total_step += 1
                 loss_sum += loss
+                window_sum += loss
+                window_count += 1
 
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+
+                # Smoothed train-loss point + console line every TRAIN_LOG_EVERY steps.
+                if window_count >= TRAIN_LOG_EVERY:
+                    window_avg = window_sum / window_count
+                    if self.writer:
+                        self.writer.add_scalar('Loss/train_smoothed', window_avg, total_step)
+                    logging.info(
+                        f"Step {total_step} | train loss avg(last {TRAIN_LOG_EVERY}): "
+                        f"{window_avg:.6f}"
+                    )
+                    window_sum = 0.0
+                    window_count = 0
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
