@@ -26,7 +26,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    PCVRParquetDataset,
+    NUM_TIME_BUCKETS,
+    NUM_DELTA_BUCKETS,
+)
 from model import PCVRHyFormer, ModelInput
 
 
@@ -47,6 +52,10 @@ logging.basicConfig(
 # ``dataset.BUCKET_BOUNDARIES`` and is NOT an independent hyperparameter.
 # When the feature is enabled we therefore use the constant exposed by the
 # dataset module; ``0`` means disabled.
+#
+# ``num_delta_buckets`` follows the same pattern: training stores the boolean
+# ``use_delta_buckets`` CLI flag in ``train_config.json``, while the actual
+# bucket count comes from ``dataset.NUM_DELTA_BUCKETS``.
 _FALLBACK_MODEL_CFG = {
     'd_model': 64,
     'emb_dim': 64,
@@ -60,6 +69,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_causal': False,
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
+    'num_delta_buckets': 0,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
@@ -126,13 +136,14 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
     """Extract model hyperparameters from ``train_config``; missing keys fall
     back to ``_FALLBACK_MODEL_CFG``.
 
-    Special handling for ``num_time_buckets``: it is not exposed on the CLI
-    as an independent hyperparameter; the bucket count is uniquely determined
-    by the length of ``dataset.BUCKET_BOUNDARIES``. Resolution order:
+    Special handling for bucket features: ``num_time_buckets`` and
+    ``num_delta_buckets`` are not exposed on the CLI as independent
+    hyperparameters; the bucket counts are determined by constants in
+    ``dataset.py``. Resolution order:
 
-      1) ``train_config`` contains ``num_time_buckets`` directly (legacy ckpt)
+      1) ``train_config`` contains ``num_*_buckets`` directly (legacy ckpt)
          -> use that value;
-      2) ``train_config`` contains ``use_time_buckets`` (new-style training)
+      2) ``train_config`` contains ``use_*_buckets`` (new-style training)
          -> derive as ``NUM_TIME_BUCKETS`` or ``0``;
       3) neither is present -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
     """
@@ -147,6 +158,17 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
                 cfg[key] = _FALLBACK_MODEL_CFG[key]
                 logging.warning(
                     f"train_config missing both 'num_time_buckets' and 'use_time_buckets', "
+                    f"using fallback = {cfg[key]}")
+            continue
+        if key == 'num_delta_buckets':
+            if 'num_delta_buckets' in train_config:
+                cfg[key] = train_config['num_delta_buckets']
+            elif 'use_delta_buckets' in train_config:
+                cfg[key] = NUM_DELTA_BUCKETS if train_config['use_delta_buckets'] else 0
+            else:
+                cfg[key] = _FALLBACK_MODEL_CFG[key]
+                logging.warning(
+                    f"train_config missing both 'num_delta_buckets' and 'use_delta_buckets', "
                     f"using fallback = {cfg[key]}")
             continue
 
