@@ -1,6 +1,6 @@
 # TAAC v7 开源结构迁移梳理
 
-**Status**: draft v0.1 — 根据 TAAC v7 / SPHINX+ 结构图整理，目标是把开源结构拆成我们 baseline 上可落地的任务清单。
+**Status**: draft v0.2 — DenseGroupProjector 首轮校准失败：val 约 +0.001、test 约 -0.003，触发 dense 侧 val/test divergence。Dense v7 从最高优先级降级，后续先推进 SemanticSeqEmbedder 单独实验。
 **Context**: 当前 main 是 PCVRHyFormer baseline：RankMixer NS tokenizer + sequence transformer + HyFormer blocks + AMP/compile。已有实验证明裸 depth scaling、warmup+cosine、LongerEncoder 固定压缩、hard-coded weighted pool 都不稳。
 
 ---
@@ -259,14 +259,15 @@ Ablation flags:
 
 优先级排序：
 
-1. **DenseGroupProjector + QuantileTrendEncoder**
-   - 工程量低于重写 sequence。
-   - 直接命中 v7 新模块。
-   - 针对我们 v1 weighted pool 失败的同一批 dense/int 对齐特征，但换成更合理的表示。
-
-2. **SemanticSeqEmbedder with item role hash**
+1. **SemanticSeqEmbedder with item role hash / typed roles**
    - 命中 v7 的 sequence redesign。
+   - DenseGroupProjector 已出现 val/test 反向，输入侧主线转向 sequence typed tokenization。
    - 复活 fid 69/29 的方式比简单 emb_skip threshold 更合理。
+
+2. **DenseGroupProjector + QuantileTrendEncoder（降级）**
+   - 首轮：val 约 +0.001 / test 约 -0.003。
+   - 结论：typed dense projection 能拟合本地 val，但 test OOD 反向；不要与后续方案默认组合。
+   - 后续若重启，只做更强约束版本：zero-init residual、drop quantile、或只保留 emb group。
 
 3. **DomainGate**
    - zero-init，风险低。
@@ -308,4 +309,3 @@ Ablation flags:
    - dense groups + quantile trend
 
 4. 若 dense groups 不崩，再推进 `SemanticSeqEmbedder`。
-

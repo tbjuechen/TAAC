@@ -1,6 +1,6 @@
 # TAAC 下一步行动路线：文章原则 + v7 架构图
 
-**Status**: v0.1
+**Status**: v0.2 — DenseGroupProjector 首轮校准失败：val 约 +0.001、test 约 -0.003。dense typed tokenization 暂时降级，下一步先跑 SemanticSeqEncoder 单独实验。
 **Goal**: 把三篇文章的共识和 v7 开源结构图落成当前代码库的执行顺序。
 
 ---
@@ -308,16 +308,14 @@ CLI:
 
 ### P0: 立刻做
 
-1. `tools/inspect_tokenization.py`
-2. dense group offset / chunk 审计
-3. `DenseGroupProjector`
-4. `QuantileTrendEncoder`
+1. SemanticSeqEncoder v7 单独完整训练。
+2. 记录 semantic seq 的 val/test 是否同向。
+3. 若 semantic seq 有效，再做 B/C item role hash 或 truncate。
 
-### P1: 下一轮做
+### P1: 暂缓 / 降级
 
-1. SemanticSeqEmbedder role 审计
-2. fid 69 / 29 hash 或 truncate
-3. B/C domain typed sequence embedding
+1. DenseGroupProjector：首轮 val +0.001 / test -0.003，暂不默认组合。
+2. 若重启 dense，只做 ablation：emb group only / stat group only / no quantile trend / zero-init residual。
 
 ### P2: 组合增强
 
@@ -348,9 +346,9 @@ CLI:
 
 ### Day 3
 
-- 跑完整 dense group A/B。
-- 如果不崩，提交 test 校准。
-- 同步做 seq role 审计。
+- Dense group test 校准已完成：val 约 +0.001，test 约 -0.003。
+- 结论：dense v7 降级，不进入默认组合。
+- 同步推进 semantic seq 单独实验。
 
 ### Day 4-5
 
@@ -369,6 +367,7 @@ CLI:
 
 - 不要继续裸扫 dropout、LR、depth。
 - 不要再做 hard-coded dense weighted pool。
+- 不要默认组合 DenseGroupProjector；它已出现 val/test 反向。
 - 不要直接 raise `emb_skip_threshold`。
 - 不要把长序列理解成单纯增大 cap。
 - 不要直接照 v7 上 12 层。
@@ -377,5 +376,4 @@ CLI:
 
 ## 一句话路线
 
-先用 EDA 把 baseline 的 tokenization 错位找出来；第一刀改 dense typed tokens；第二刀改 sequence typed tokens；第三刀加 domain/head 融合；最后才在 LayerScale 保护下重新尝试 scaling。
-
+先用 EDA 把 baseline 的 tokenization 错位找出来；dense typed tokens 首轮已反向，当前第一主线改为 sequence typed tokens；若 sequence 同向，再加 domain/head 融合；最后才在 LayerScale 保护下重新尝试 scaling。
