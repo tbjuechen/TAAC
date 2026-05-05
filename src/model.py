@@ -1205,6 +1205,104 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class QuantileTrendEncoder(nn.Module):
+    """Encode fid 89/90/91 rank vectors as one dense NS token.
+
+    The second convolution is zero-initialized so enabling the module starts as
+    a conservative perturbation rather than a large random feature injection.
+    """
+
+    def __init__(self, d_model: int, mid_dim: int = 32) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv1d(3, mid_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(mid_dim, d_model, kernel_size=3, padding=1)
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Args:
+            x: Tensor of shape ``(B, 30)`` ordered as fid 89/90/91.
+
+        Returns:
+            A dense token of shape ``(B, d_model)``.
+        """
+        bsz = x.shape[0]
+        x = x.view(bsz, 3, 10)
+        h = F.silu(self.conv1(x))
+        h = self.conv2(h)
+        h = self.pool(h).squeeze(-1)
+        return self.norm(h)
+
+
+class DenseGroupProjector(nn.Module):
+    """v7-style typed projector for user dense features.
+
+    The current schema stores user dense fids in this flattened order:
+    61(256), 62(6), 63(19), 64(26), 65(111), 66(150), 87(320),
+    89(10), 90(10), 91(10). This module emits three NS tokens:
+    emb-like dense, raw/stat dense, and quantile/rank dense.
+    """
+
+    EXPECTED_DIM = 918
+
+    def __init__(
+        self,
+        user_dense_dim: int,
+        d_model: int,
+        stat_transform: str = 'log1p_clip',
+        use_quantile_trend: bool = True,
+    ) -> None:
+        super().__init__()
+        if user_dense_dim != self.EXPECTED_DIM:
+            raise ValueError(
+                f"DenseGroupProjector expects user_dense_dim={self.EXPECTED_DIM} "
+                f"for the TAAC v7 dense layout, got {user_dense_dim}."
+            )
+        if stat_transform not in {'raw', 'log1p', 'log1p_clip'}:
+            raise ValueError(f"Unknown stat_transform: {stat_transform}")
+        self.stat_transform = stat_transform
+        self.use_quantile_trend = use_quantile_trend
+
+        self.emb_proj = nn.Sequential(
+            nn.Linear(576, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.stat_proj = nn.Sequential(
+            nn.Linear(312, d_model),
+            nn.LayerNorm(d_model),
+        )
+        if use_quantile_trend:
+            self.quantile_proj = QuantileTrendEncoder(d_model=d_model)
+        else:
+            self.quantile_proj = nn.Sequential(
+                nn.Linear(30, d_model),
+                nn.LayerNorm(d_model),
+            )
+
+    def _transform_stat(self, x: torch.Tensor) -> torch.Tensor:
+        if self.stat_transform == 'raw':
+            return x
+        x = torch.log1p(torch.clamp_min(x, 0.0))
+        if self.stat_transform == 'log1p_clip':
+            x = torch.clamp(x, max=20.0)
+        return x
+
+    def forward(self, dense_feats: torch.Tensor) -> torch.Tensor:
+        emb_group = torch.cat([
+            dense_feats[:, 0:256],
+            dense_feats[:, 568:888],
+        ], dim=-1)
+        stat_group = dense_feats[:, 256:568]
+        quantile_group = dense_feats[:, 888:918]
+
+        emb_tok = F.silu(self.emb_proj(emb_group))
+        stat_tok = F.silu(self.stat_proj(self._transform_stat(stat_group)))
+        quantile_tok = F.silu(self.quantile_proj(quantile_group))
+        return torch.stack([emb_tok, stat_tok, quantile_tok], dim=1)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1246,6 +1344,9 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        dense_group_projector: str = 'none',
+        stat_dense_transform: str = 'log1p_clip',
+        use_quantile_trend: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1261,6 +1362,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.dense_group_projector = dense_group_projector
 
         # ================== NS Tokens Construction ==================
 
@@ -1314,23 +1416,38 @@ class PCVRHyFormer(nn.Module):
 
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
+        self.user_dense_num_tokens = 0
         if self.has_user_dense:
-            self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
-                nn.LayerNorm(d_model),
-            )
+            if dense_group_projector == 'none':
+                self.user_dense_proj = nn.Sequential(
+                    nn.Linear(user_dense_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+                self.user_dense_num_tokens = 1
+            elif dense_group_projector == 'v7':
+                self.user_dense_proj = DenseGroupProjector(
+                    user_dense_dim=user_dense_dim,
+                    d_model=d_model,
+                    stat_transform=stat_dense_transform,
+                    use_quantile_trend=use_quantile_trend,
+                )
+                self.user_dense_num_tokens = 3
+            else:
+                raise ValueError(f"Unknown dense_group_projector: {dense_group_projector}")
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
+        self.item_dense_num_tokens = 0
         if self.has_item_dense:
             self.item_dense_proj = nn.Sequential(
                 nn.Linear(item_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+            self.item_dense_num_tokens = 1
 
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+        self.num_ns = (num_user_ns + self.user_dense_num_tokens
+                       + num_item_ns + self.item_dense_num_tokens)
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1657,7 +1774,9 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)
+            if self.dense_group_projector == 'none':
+                user_dense_tok = F.silu(user_dense_tok).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1700,7 +1819,9 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            user_dense_tok = self.user_dense_proj(inputs.user_dense_feats)
+            if self.dense_group_projector == 'none':
+                user_dense_tok = F.silu(user_dense_tok).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:

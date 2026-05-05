@@ -9,10 +9,14 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # Longer head A/B (W1.7-L1):       SEQ_ENCODER_TYPE=longer GATHER_SIDE=head ./run.sh
 # Longer tail A/B (W1.0.3 验证):   SEQ_ENCODER_TYPE=longer GATHER_SIDE=tail ./run.sh
 # 长序列 (W1.7-L2):  SEQ_ENCODER_TYPE=longer GATHER_SIDE=head SEQ_MAX_LENS='seq_a:256,seq_b:256,seq_c:512,seq_d:2048' ./run.sh
+# v7 dense groups: DENSE_GROUP_PROJECTOR=v7 requires d_model/T compatibility
+#   (baseline T=16; v7 dense groups T=18, so use e.g. --d_model 72 or --rank_mixer_mode ffn_only)
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
 SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
+DENSE_GROUP_PROJECTOR="${DENSE_GROUP_PROJECTOR:-none}"
+STAT_DENSE_TRANSFORM="${STAT_DENSE_TRANSFORM:-log1p_clip}"
 # ============================================================
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
@@ -31,6 +35,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --seq_top_k "${SEQ_TOP_K}" \
     --longer_gather_side "${GATHER_SIDE}" \
     --seq_max_lens "${SEQ_MAX_LENS}" \
+    --dense_group_projector "${DENSE_GROUP_PROJECTOR}" \
+    --stat_dense_transform "${STAT_DENSE_TRANSFORM}" \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

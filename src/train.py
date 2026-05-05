@@ -211,6 +211,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--dense_group_projector', type=str, default='none',
+                        choices=['none', 'v7'],
+                        help='User dense tokenizer variant: '
+                             'none = baseline single Linear token; '
+                             'v7 = split user dense into emb/stat/quantile NS tokens')
+    parser.add_argument('--stat_dense_transform', type=str, default='log1p_clip',
+                        choices=['raw', 'log1p', 'log1p_clip'],
+                        help='Transform applied to v7 dense stat group '
+                             '(effective only with --dense_group_projector=v7)')
+    parser.add_argument('--use_quantile_trend', action='store_true', default=True,
+                        help='Use Conv1d QuantileTrendEncoder for dense fid 89-91 '
+                             '(default on when --dense_group_projector=v7)')
+    parser.add_argument('--no_quantile_trend', dest='use_quantile_trend',
+                        action='store_false',
+                        help='Use a simple Linear projection for dense fid 89-91')
 
     args = parser.parse_args()
 
@@ -323,6 +338,9 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "dense_group_projector": args.dense_group_projector,
+        "stat_dense_transform": args.stat_dense_transform,
+        "use_quantile_trend": args.use_quantile_trend,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
