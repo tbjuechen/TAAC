@@ -1239,6 +1239,7 @@ class PCVRHyFormer(nn.Module):
         action_num: int = 1,
         num_time_buckets: int = 65,
         per_domain_time_embeddings: bool = False,
+        domain_time_residual_embeddings: bool = False,
         num_delta_buckets: int = 0,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
@@ -1260,6 +1261,7 @@ class PCVRHyFormer(nn.Module):
         self.num_sequences = len(self.seq_domains)
         self.num_time_buckets = num_time_buckets
         self.per_domain_time_embeddings = per_domain_time_embeddings
+        self.domain_time_residual_embeddings = domain_time_residual_embeddings
         self.num_delta_buckets = num_delta_buckets
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
@@ -1404,6 +1406,11 @@ class PCVRHyFormer(nn.Module):
                 })
             else:
                 self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+                if domain_time_residual_embeddings:
+                    self.time_residual_embeddings = nn.ModuleDict({
+                        d: nn.Embedding(num_time_buckets, d_model, padding_idx=0)
+                        for d in self.seq_domains
+                    })
 
         # ================== Delta-t Bucket Embedding (W2.7, per-domain, optional) ==================
         if num_delta_buckets > 0:
@@ -1507,6 +1514,9 @@ class PCVRHyFormer(nn.Module):
             else:
                 nn.init.xavier_normal_(self.time_embedding.weight.data)
                 self.time_embedding.weight.data[0, :] = 0
+                if self.domain_time_residual_embeddings:
+                    for emb in self.time_residual_embeddings.values():
+                        nn.init.zeros_(emb.weight.data)
 
         if self.num_delta_buckets > 0:
             for emb in self.delta_embeddings.values():
@@ -1569,6 +1579,8 @@ class PCVRHyFormer(nn.Module):
         # time_embedding is always preserved
         if self.num_time_buckets > 0:
             skip_count += len(self.time_embeddings) if self.per_domain_time_embeddings else 1
+            if self.domain_time_residual_embeddings and not self.per_domain_time_embeddings:
+                skip_count += len(self.time_residual_embeddings)
         # delta_embeddings always preserved (W2.7, per-domain)
         if self.num_delta_buckets > 0:
             skip_count += len(self.delta_embeddings)
@@ -1624,6 +1636,9 @@ class PCVRHyFormer(nn.Module):
                 token_emb = token_emb + self.time_embeddings[domain_name](time_bucket_ids)
             else:
                 token_emb = token_emb + self.time_embedding(time_bucket_ids)
+                if self.domain_time_residual_embeddings:
+                    token_emb = token_emb + self.time_residual_embeddings[domain_name](
+                        time_bucket_ids)
 
         # Add delta-t bucket embedding (W2.7, per-domain; padding_idx=0 zeros out
         # padding positions and the last token of each seq, which has no neighbor)

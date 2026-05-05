@@ -70,6 +70,7 @@ _FALLBACK_MODEL_CFG = {
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
     'per_domain_time_embeddings': False,
+    'domain_time_residual_embeddings': False,
     'num_delta_buckets': 0,
     'rank_mixer_mode': 'full',
     'use_rope': False,
