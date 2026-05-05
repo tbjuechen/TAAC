@@ -141,6 +141,9 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--per_domain_time_embeddings', action='store_true', default=False,
+                        help='Use one recency time-bucket embedding table per sequence '
+                             'domain while keeping the global bucket boundaries unchanged.')
     parser.add_argument('--use_delta_buckets', action='store_true', default=False,
                         help='Enable per-domain delta-t bucket embedding (W2.7). '
                              'Models adjacent-token time gaps within sequences. '
@@ -321,6 +324,7 @@ def main() -> None:
         "seq_longer_gather_side": args.longer_gather_side,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "per_domain_time_embeddings": args.per_domain_time_embeddings,
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
@@ -333,6 +337,13 @@ def main() -> None:
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
+    if model.num_time_buckets > 0 and model.per_domain_time_embeddings:
+        n_domains = len(model.seq_domains)
+        logging.info(
+            f"W2.7.1 per-domain recency time embeddings enabled: "
+            f"{n_domains} x {NUM_TIME_BUCKETS} x {args.d_model}, "
+            f"+{(n_domains - 1) * NUM_TIME_BUCKETS * args.d_model} params vs shared"
+        )
     if model.num_delta_buckets > 0:
         n_domains = len(model.seq_domains)
         logging.info(

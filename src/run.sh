@@ -10,15 +10,18 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # Longer tail A/B (W1.0.3 验证):   SEQ_ENCODER_TYPE=longer GATHER_SIDE=tail ./run.sh
 # 长序列 (W1.7-L2):  SEQ_ENCODER_TYPE=longer GATHER_SIDE=head SEQ_MAX_LENS='seq_a:256,seq_b:256,seq_c:512,seq_d:2048' ./run.sh
 # W2.7 delta buckets:              USE_DELTA_BUCKETS=1 ./run.sh
+# W2.7.1 per-domain time emb:      PER_DOMAIN_TIME_EMB=1 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
 SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
 USE_DELTA_BUCKETS="${USE_DELTA_BUCKETS:-0}"
+PER_DOMAIN_TIME_EMB="${PER_DOMAIN_TIME_EMB:-0}"
 # ============================================================
 
 EXTRA_FLAGS=""
 [ "${USE_DELTA_BUCKETS}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_delta_buckets"
+[ "${PER_DOMAIN_TIME_EMB}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_time_embeddings"
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
