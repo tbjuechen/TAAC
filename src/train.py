@@ -226,6 +226,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--no_quantile_trend', dest='use_quantile_trend',
                         action='store_false',
                         help='Use a simple Linear projection for dense fid 89-91')
+    parser.add_argument('--semantic_seq_encoder', type=str, default='none',
+                        choices=['none', 'v7'],
+                        help='Sequence tokenizer variant: '
+                             'none = baseline concat-project; '
+                             'v7 = split side-info into item/action/stat roles')
 
     args = parser.parse_args()
 
@@ -315,6 +320,7 @@ def main() -> None:
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
+        "seq_feature_ids": pcvr_dataset.sideinfo_fids,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
         "d_model": args.d_model,
@@ -341,6 +347,7 @@ def main() -> None:
         "dense_group_projector": args.dense_group_projector,
         "stat_dense_transform": args.stat_dense_transform,
         "use_quantile_trend": args.use_quantile_trend,
+        "semantic_seq_encoder": args.semantic_seq_encoder,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

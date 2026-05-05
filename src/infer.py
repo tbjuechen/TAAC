@@ -71,6 +71,7 @@ _FALLBACK_MODEL_CFG = {
     'dense_group_projector': 'none',
     'stat_dense_transform': 'log1p_clip',
     'use_quantile_trend': True,
+    'semantic_seq_encoder': 'none',
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -230,6 +231,7 @@ def build_model(
         user_dense_dim=dataset.user_dense_schema.total_dim,
         item_dense_dim=dataset.item_dense_schema.total_dim,
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
+        seq_feature_ids=dataset.sideinfo_fids,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
         **model_cfg,

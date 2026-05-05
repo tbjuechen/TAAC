@@ -17,6 +17,7 @@ SEQ_TOP_K="${SEQ_TOP_K:-50}"
 SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
 DENSE_GROUP_PROJECTOR="${DENSE_GROUP_PROJECTOR:-none}"
 STAT_DENSE_TRANSFORM="${STAT_DENSE_TRANSFORM:-log1p_clip}"
+SEMANTIC_SEQ_ENCODER="${SEMANTIC_SEQ_ENCODER:-none}"
 # ============================================================
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
@@ -37,6 +38,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --seq_max_lens "${SEQ_MAX_LENS}" \
     --dense_group_projector "${DENSE_GROUP_PROJECTOR}" \
     --stat_dense_transform "${STAT_DENSE_TRANSFORM}" \
+    --semantic_seq_encoder "${SEMANTIC_SEQ_ENCODER}" \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

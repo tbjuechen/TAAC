@@ -1303,6 +1303,14 @@ class DenseGroupProjector(nn.Module):
         return torch.stack([emb_tok, stat_tok, quantile_tok], dim=1)
 
 
+V7_SEQ_ROLES = {
+    'seq_a': {'item': [38], 'action': [40], 'stat': [42, 43, 44, 45]},
+    'seq_b': {'item': [69], 'action': [68], 'stat': [70, 71, 72, 73, 74, 75, 76, 77, 78, 79]},
+    'seq_c': {'item': [29], 'action': [28], 'stat': [30, 31, 32, 33, 34, 35, 36, 37]},
+    'seq_d': {'item': [], 'action': [17], 'stat': [18, 19, 20, 21, 22, 23, 24, 25]},
+}
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1321,6 +1329,7 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        seq_feature_ids: Optional["dict[str, List[int]]"] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1347,6 +1356,7 @@ class PCVRHyFormer(nn.Module):
         dense_group_projector: str = 'none',
         stat_dense_transform: str = 'log1p_clip',
         use_quantile_trend: bool = True,
+        semantic_seq_encoder: str = 'none',
     ) -> None:
         super().__init__()
 
@@ -1363,6 +1373,13 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.dense_group_projector = dense_group_projector
+        self.semantic_seq_encoder = semantic_seq_encoder
+        self.seq_feature_ids = seq_feature_ids or {
+            domain: list(range(len(seq_vocab_sizes[domain])))
+            for domain in sorted(seq_vocab_sizes.keys())
+        }
+        if semantic_seq_encoder not in {'none', 'v7'}:
+            raise ValueError(f"Unknown semantic_seq_encoder: {semantic_seq_encoder}")
 
         # ================== NS Tokens Construction ==================
 
@@ -1494,6 +1511,9 @@ class PCVRHyFormer(nn.Module):
         self._seq_is_id = {}        # domain -> is_id list
         self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
         self._seq_proj = nn.ModuleDict()
+        self._seq_role_slots = {}
+        self._seq_role_proj = nn.ModuleDict()
+        self._seq_leftover_proj = nn.ModuleDict()
 
         for domain in self.seq_domains:
             vs = seq_vocab_sizes[domain]
@@ -1506,6 +1526,36 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(len(vs) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+            if semantic_seq_encoder == 'v7':
+                fid_to_slot = {
+                    int(fid): i for i, fid in enumerate(self.seq_feature_ids[domain])
+                }
+                role_slots = {}
+                role_proj = nn.ModuleDict()
+                for role, fids in V7_SEQ_ROLES.get(domain, {}).items():
+                    slots = [fid_to_slot[fid] for fid in fids if fid in fid_to_slot]
+                    role_slots[role] = slots
+                    if slots:
+                        role_proj[role] = nn.Sequential(
+                            nn.Linear(len(slots) * emb_dim, d_model),
+                            nn.LayerNorm(d_model),
+                        )
+                self._seq_role_slots[domain] = role_slots
+                self._seq_role_proj[domain] = role_proj
+                used_slots = {slot for slots in role_slots.values() for slot in slots}
+                leftover_slots = [i for i in range(len(vs)) if i not in used_slots]
+                if leftover_slots:
+                    self._seq_leftover_proj[domain] = nn.Sequential(
+                        nn.Linear(len(leftover_slots) * emb_dim, d_model),
+                        nn.LayerNorm(d_model),
+                    )
+                logging.info(
+                    "SemanticSeqEmbedder[%s]: item=%s action=%s stat=%s",
+                    domain,
+                    role_slots.get('item', []),
+                    role_slots.get('action', []),
+                    role_slots.get('stat', []),
+                )
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1684,6 +1734,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        domain: Optional[str] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1699,8 +1750,31 @@ class PCVRHyFormer(nn.Module):
                 if is_id[i] and self.training:
                     e = self.seq_id_emb_dropout(e)
                 emb_list.append(e)
-        cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
-        token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
+        if self.semantic_seq_encoder == 'v7' and domain is not None:
+            token_emb = seq.new_zeros(B, L, self.d_model, dtype=torch.float)
+            role_slots = self._seq_role_slots.get(domain, {})
+            role_proj = self._seq_role_proj[domain] if domain in self._seq_role_proj else nn.ModuleDict()
+            used_slots = set()
+            for role, slots in role_slots.items():
+                if not slots or role not in role_proj:
+                    continue
+                used_slots.update(slots)
+                role_emb = torch.cat([emb_list[i] for i in slots], dim=-1)
+                token_emb = token_emb + F.gelu(role_proj[role](role_emb))
+
+            # Keep unassigned side-info instead of dropping it. This makes v7
+            # typed embedding a conservative split: semantic roles are
+            # separated, leftover fields still contribute through a residual
+            # projection.
+            leftover_slots = [i for i in range(S) if i not in used_slots]
+            if leftover_slots:
+                leftover_emb = torch.cat([emb_list[i] for i in leftover_slots], dim=-1)
+                if domain not in self._seq_leftover_proj:
+                    raise KeyError(f"Missing leftover projection for {domain}")
+                token_emb = token_emb + F.gelu(self._seq_leftover_proj[domain](leftover_emb))
+        else:
+            cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
+            token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
@@ -1793,7 +1867,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                domain=domain)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1837,7 +1912,8 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                domain=domain)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
