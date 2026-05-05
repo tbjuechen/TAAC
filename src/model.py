@@ -16,6 +16,7 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    seq_delta_buckets: dict  # {domain: tensor [B, L]} - W2.7 adjacent-token delta_t buckets
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1237,6 +1238,7 @@ class PCVRHyFormer(nn.Module):
         seq_longer_gather_side: str = 'head',
         action_num: int = 1,
         num_time_buckets: int = 65,
+        num_delta_buckets: int = 0,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1256,6 +1258,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
         self.num_time_buckets = num_time_buckets
+        self.num_delta_buckets = num_delta_buckets
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1394,6 +1397,13 @@ class PCVRHyFormer(nn.Module):
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        # ================== Delta-t Bucket Embedding (W2.7, per-domain, optional) ==================
+        if num_delta_buckets > 0:
+            self.delta_embeddings = nn.ModuleDict({
+                d: nn.Embedding(num_delta_buckets, d_model, padding_idx=0)
+                for d in self.seq_domains
+            })
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1485,6 +1495,11 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+        if self.num_delta_buckets > 0:
+            for emb in self.delta_embeddings.values():
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
@@ -1541,6 +1556,9 @@ class PCVRHyFormer(nn.Module):
         # time_embedding is always preserved
         if self.num_time_buckets > 0:
             skip_count += 1
+        # delta_embeddings always preserved (W2.7, per-domain)
+        if self.num_delta_buckets > 0:
+            skip_count += len(self.delta_embeddings)
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1567,6 +1585,8 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        delta_bucket_ids: torch.Tensor,
+        domain_name: str,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1588,6 +1608,11 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        # Add delta-t bucket embedding (W2.7, per-domain; padding_idx=0 zeros out
+        # padding positions and the last token of each seq, which has no neighbor)
+        if self.num_delta_buckets > 0:
+            token_emb = token_emb + self.delta_embeddings[domain_name](delta_bucket_ids)
 
         return token_emb
 
@@ -1674,7 +1699,9 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_delta_buckets[domain],
+                domain)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -1716,7 +1743,9 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inputs.seq_delta_buckets[domain],
+                domain)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

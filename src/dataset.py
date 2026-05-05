@@ -131,6 +131,19 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Delta-t bucket boundaries (W2.7): log2 spacing from 1s to ~34 years.
+# 31 boundaries -> bucket ids in [1..32]; padding=0; total 33 slots.
+# delta_t[i] = seq_ts[i] - seq_ts[i+1]: gap between adjacent tokens
+# (reverse-order seq, pos 0 = most recent). Encodes user behavior pacing
+# (misclick / deep-browse / cross-session return).
+DELTA_BOUNDARIES = np.array([
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
+    4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
+    1048576, 2097152, 4194304, 8388608, 16777216, 33554432,
+    67108864, 134217728, 268435456, 536870912, 1073741824,
+], dtype=np.int64)
+NUM_DELTA_BUCKETS = len(DELTA_BOUNDARIES) + 2  # +1 padding(0), +1 upper-bound = 33
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -220,12 +233,14 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_db = {}
         self._buf_seq_lens = {}
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_db[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -630,6 +645,8 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            delta_bucket = self._buf_seq_db[domain][:B]
+            delta_bucket[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -664,7 +681,21 @@ class PCVRParquetDataset(IterableDataset):
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
 
+                delta_t = np.zeros((B, max_len), dtype=np.int64)
+                delta_t[:, :-1] = ts_padded[:, :-1] - ts_padded[:, 1:]
+                delta_t = np.maximum(delta_t, 0)
+                raw_delta_buckets = np.clip(
+                    np.searchsorted(DELTA_BOUNDARIES, delta_t.ravel()),
+                    0, len(DELTA_BOUNDARIES),
+                )
+                delta_buckets = raw_delta_buckets.reshape(B, max_len) + 1
+                pair_valid = (ts_padded[:, :-1] > 0) & (ts_padded[:, 1:] > 0)
+                delta_buckets[:, :-1][~pair_valid] = 0
+                delta_buckets[:, -1] = 0
+                delta_bucket[:] = delta_buckets
+
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_delta_bucket'] = torch.from_numpy(delta_bucket.copy())
 
         return result
 
