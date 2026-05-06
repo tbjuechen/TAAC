@@ -235,6 +235,8 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_seq_tb = {}
         self._buf_seq_db = {}
         self._buf_seq_lens = {}
+        self._time_summary_dim = len(self.seq_domains) * 8
+        self._buf_time_summary = np.zeros((B, self._time_summary_dim), dtype=np.float32)
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
@@ -597,7 +599,10 @@ class PCVRParquetDataset(IterableDataset):
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
-        for domain in self.seq_domains:
+        time_summary = self._buf_time_summary[:B]
+        time_summary[:] = 0
+        summary_log_age_denom = np.log1p(730.0 * 86400.0)
+        for domain_idx, domain in enumerate(self.seq_domains):
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
 
@@ -694,9 +699,40 @@ class PCVRParquetDataset(IterableDataset):
                 delta_buckets[:, -1] = 0
                 delta_bucket[:] = delta_buckets
 
+                valid_ts = ts_padded > 0
+                ts_lengths = valid_ts.sum(axis=1)
+                if ts_lengths.any():
+                    last_age = np.where(valid_ts[:, 0], time_diff[:, 0], 0)
+                    oldest_idx = np.maximum(ts_lengths - 1, 0)
+                    oldest_age = time_diff[np.arange(B), oldest_idx]
+                    oldest_age = np.where(ts_lengths > 0, oldest_age, 0)
+                    span = np.where(
+                        ts_lengths > 0,
+                        np.maximum(ts_padded[:, 0] - ts_padded[np.arange(B), oldest_idx], 0),
+                        0,
+                    )
+                    span_days = span.astype(np.float32) / 86400.0
+                    density = ts_lengths.astype(np.float32) / np.log1p(span_days + 1.0)
+                    count_denom = np.log1p(float(max_len))
+                    counts_1h = ((time_diff <= 3600) & valid_ts).sum(axis=1)
+                    counts_1d = ((time_diff <= 86400) & valid_ts).sum(axis=1)
+                    counts_7d = ((time_diff <= 604800) & valid_ts).sum(axis=1)
+                    counts_30d = ((time_diff <= 2592000) & valid_ts).sum(axis=1)
+
+                    base = domain_idx * 8
+                    time_summary[:, base + 0] = np.log1p(last_age) / summary_log_age_denom
+                    time_summary[:, base + 1] = np.log1p(oldest_age) / summary_log_age_denom
+                    time_summary[:, base + 2] = np.log1p(span) / summary_log_age_denom
+                    time_summary[:, base + 3] = np.log1p(density) / np.log1p(float(max_len))
+                    time_summary[:, base + 4] = np.log1p(counts_1h) / count_denom
+                    time_summary[:, base + 5] = np.log1p(counts_1d) / count_denom
+                    time_summary[:, base + 6] = np.log1p(counts_7d) / count_denom
+                    time_summary[:, base + 7] = np.log1p(counts_30d) / count_denom
+
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
             result[f'{domain}_delta_bucket'] = torch.from_numpy(delta_bucket.copy())
 
+        result['time_summary_feats'] = torch.from_numpy(time_summary.copy())
         return result
 
 

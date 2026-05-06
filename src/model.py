@@ -13,6 +13,7 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
+    time_summary_feats: torch.Tensor
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
@@ -1241,6 +1242,7 @@ class PCVRHyFormer(nn.Module):
         per_domain_time_embeddings: bool = False,
         domain_time_residual_embeddings: bool = False,
         num_delta_buckets: int = 0,
+        use_time_summary_features: bool = False,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1263,6 +1265,7 @@ class PCVRHyFormer(nn.Module):
         self.per_domain_time_embeddings = per_domain_time_embeddings
         self.domain_time_residual_embeddings = domain_time_residual_embeddings
         self.num_delta_buckets = num_delta_buckets
+        self.use_time_summary_features = use_time_summary_features
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1420,6 +1423,16 @@ class PCVRHyFormer(nn.Module):
             })
 
         # ================== HyFormer Components ==================
+        if use_time_summary_features:
+            time_summary_dim = self.num_sequences * 8
+            self.time_summary_proj = nn.Sequential(
+                nn.Linear(time_summary_dim, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model, d_model),
+            )
+
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
             d_model=d_model,
@@ -1745,6 +1758,8 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
+        if self.use_time_summary_features:
+            output = output + self.time_summary_proj(inputs.time_summary_feats)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1787,6 +1802,8 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+        if self.use_time_summary_features:
+            output = output + self.time_summary_proj(inputs.time_summary_feats)
 
         logits = self.clsfier(output)
         return logits, output

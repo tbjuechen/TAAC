@@ -427,6 +427,15 @@ class PCVRHyFormerRankingTrainer:
             item_int_feats=device_batch['item_int_feats'],
             user_dense_feats=device_batch['user_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
+            time_summary_feats=device_batch.get(
+                'time_summary_feats',
+                torch.zeros(
+                    device_batch['user_int_feats'].shape[0],
+                    0,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            ),
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
