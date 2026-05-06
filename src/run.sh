@@ -12,7 +12,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.7 delta buckets:              USE_DELTA_BUCKETS=1 ./run.sh
 # W2.7.1 per-domain time emb:      PER_DOMAIN_TIME_EMB=1 ./run.sh
 # W2.7.2 time residual emb:        DOMAIN_TIME_RESIDUAL_EMB=1 ./run.sh
-# W2.8 time summary features:      USE_TIME_SUMMARY=1 ./run.sh
+# W2.8 time summary NS token:      USE_TIME_SUMMARY=1 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
@@ -21,6 +21,13 @@ USE_DELTA_BUCKETS="${USE_DELTA_BUCKETS:-0}"
 PER_DOMAIN_TIME_EMB="${PER_DOMAIN_TIME_EMB:-0}"
 DOMAIN_TIME_RESIDUAL_EMB="${DOMAIN_TIME_RESIDUAL_EMB:-0}"
 USE_TIME_SUMMARY="${USE_TIME_SUMMARY:-0}"
+if [ -z "${D_MODEL+x}" ]; then
+    if [ "${USE_TIME_SUMMARY}" = "1" ]; then
+        D_MODEL=68
+    else
+        D_MODEL=64
+    fi
+fi
 # ============================================================
 
 EXTRA_FLAGS=""
@@ -35,6 +42,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --num_queries 2 \
+    --d_model "${D_MODEL}" \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \

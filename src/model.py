@@ -1341,6 +1341,8 @@ class PCVRHyFormer(nn.Module):
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
+        if use_time_summary_features:
+            self.num_ns += 1
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1430,7 +1432,6 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
                 nn.SiLU(),
                 nn.Dropout(dropout_rate),
-                nn.Linear(d_model, d_model),
             )
 
         # MultiSeqQueryGenerator
@@ -1732,6 +1733,9 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        if self.use_time_summary_features:
+            time_summary_tok = self.time_summary_proj(inputs.time_summary_feats).unsqueeze(1)
+            ns_parts.append(time_summary_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1758,8 +1762,6 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=self.training
         )
-        if self.use_time_summary_features:
-            output = output + self.time_summary_proj(inputs.time_summary_feats)
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -1779,6 +1781,9 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        if self.use_time_summary_features:
+            time_summary_tok = self.time_summary_proj(inputs.time_summary_feats).unsqueeze(1)
+            ns_parts.append(time_summary_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
@@ -1802,8 +1807,6 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
-        if self.use_time_summary_features:
-            output = output + self.time_summary_proj(inputs.time_summary_feats)
 
         logits = self.clsfier(output)
         return logits, output
