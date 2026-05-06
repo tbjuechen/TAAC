@@ -13,6 +13,11 @@ SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
 SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
+GATED_INT_RESIDUAL="${GATED_INT_RESIDUAL:-0}"
+GATED_INT_RESIDUAL_ARGS=()
+if [ "${GATED_INT_RESIDUAL}" = "1" ]; then
+    GATED_INT_RESIDUAL_ARGS+=(--gated_int_residual)
+fi
 # ============================================================
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
@@ -31,6 +36,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --seq_top_k "${SEQ_TOP_K}" \
     --longer_gather_side "${GATHER_SIDE}" \
     --seq_max_lens "${SEQ_MAX_LENS}" \
+    "${GATED_INT_RESIDUAL_ARGS[@]}" \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

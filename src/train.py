@@ -211,6 +211,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--gated_int_residual', action='store_true', default=False,
+                        help='Apply a zero-initialized gated residual adapter to '
+                             'each non-skipped user/item int feature embedding '
+                             'inside the NS tokenizer before concat/projection')
+    parser.add_argument('--gated_int_residual_gate_bias', type=float, default=-2.0,
+                        help='Initial bias for the gated int residual sigmoid gate '
+                             '(more negative = colder residual start)')
 
     args = parser.parse_args()
 
@@ -323,6 +330,8 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "gated_int_residual": args.gated_int_residual,
+        "gated_int_residual_gate_bias": args.gated_int_residual_gate_bias,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

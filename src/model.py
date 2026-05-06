@@ -1001,6 +1001,29 @@ class MultiSeqHyFormerBlock(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+class GatedFeatureResidual(nn.Module):
+    """Lightweight gated residual adapter for one int feature embedding."""
+
+    def __init__(self, emb_dim: int, gate_bias_init: float = -2.0) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(emb_dim)
+        self.residual = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        self.gate = nn.Linear(emb_dim, emb_dim)
+
+        nn.init.zeros_(self.residual[-1].weight)
+        nn.init.zeros_(self.residual[-1].bias)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, gate_bias_init)
+
+    def forward(self, feature_emb: torch.Tensor) -> torch.Tensor:
+        h = self.norm(feature_emb)
+        return feature_emb + torch.sigmoid(self.gate(h)) * self.residual(h)
+
+
 class GroupNSTokenizer(nn.Module):
     """NS tokenizer used by ns_tokenizer_type='group'.
 
@@ -1011,12 +1034,15 @@ class GroupNSTokenizer(nn.Module):
 
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
-                 emb_skip_threshold: int = 0) -> None:
+                 emb_skip_threshold: int = 0,
+                 gated_int_residual: bool = False,
+                 gated_int_residual_gate_bias: float = -2.0) -> None:
         super().__init__()
         self.feature_specs = feature_specs
         self.groups = groups
         self.emb_dim = emb_dim
         self.emb_skip_threshold = emb_skip_threshold
+        self.gated_int_residual = gated_int_residual
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1028,6 +1054,10 @@ class GroupNSTokenizer(nn.Module):
             else:
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
+        self.feature_residuals = nn.ModuleList([
+            GatedFeatureResidual(emb_dim, gated_int_residual_gate_bias)
+            for e in embs if e is not None
+        ]) if gated_int_residual else None
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
         real_idx = 0
@@ -1077,6 +1107,8 @@ class GroupNSTokenizer(nn.Module):
                         mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
                         count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
                         fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                    if self.feature_residuals is not None:
+                        fid_emb = self.feature_residuals[emb_real_idx](fid_emb)
                 fid_embs.append(fid_emb)
             cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
@@ -1099,6 +1131,8 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        gated_int_residual: bool = False,
+        gated_int_residual_gate_bias: float = -2.0,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1116,6 +1150,7 @@ class RankMixerNSTokenizer(nn.Module):
         self.emb_dim = emb_dim
         self.num_ns_tokens = num_ns_tokens
         self.emb_skip_threshold = emb_skip_threshold
+        self.gated_int_residual = gated_int_residual
 
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
@@ -1127,6 +1162,10 @@ class RankMixerNSTokenizer(nn.Module):
             else:
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
         self.embs = nn.ModuleList([e for e in embs if e is not None])
+        self.feature_residuals = nn.ModuleList([
+            GatedFeatureResidual(emb_dim, gated_int_residual_gate_bias)
+            for e in embs if e is not None
+        ]) if gated_int_residual else None
         # Map from fid index to position in self.embs (or -1 if filtered)
         self._emb_index = []
         real_idx = 0
@@ -1188,6 +1227,8 @@ class RankMixerNSTokenizer(nn.Module):
                         mask = (vals != 0).float().unsqueeze(-1)
                         count = mask.sum(dim=1).clamp(min=1)
                         fid_emb = (emb_all * mask).sum(dim=1) / count
+                    if self.feature_residuals is not None:
+                        fid_emb = self.feature_residuals[emb_real_idx](fid_emb)
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -1246,6 +1287,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        gated_int_residual: bool = False,
+        gated_int_residual_gate_bias: float = -2.0,
     ) -> None:
         super().__init__()
 
@@ -1272,6 +1315,8 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                gated_int_residual=gated_int_residual,
+                gated_int_residual_gate_bias=gated_int_residual_gate_bias,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1281,6 +1326,8 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                gated_int_residual=gated_int_residual,
+                gated_int_residual_gate_bias=gated_int_residual_gate_bias,
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
@@ -1297,6 +1344,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                gated_int_residual=gated_int_residual,
+                gated_int_residual_gate_bias=gated_int_residual_gate_bias,
             )
             num_user_ns = user_ns_tokens
 
@@ -1307,6 +1356,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                gated_int_residual=gated_int_residual,
+                gated_int_residual_gate_bias=gated_int_residual_gate_bias,
             )
             num_item_ns = item_ns_tokens
         else:
@@ -1649,9 +1700,8 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection
+    def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
+        """Builds non-sequence tokens from int tokenizer outputs and dense features."""
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
@@ -1664,7 +1714,12 @@ class PCVRHyFormer(nn.Module):
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
 
-        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        return torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+
+    def forward(self, inputs: ModelInput) -> torch.Tensor:
+        """Runs the forward pass of the PCVRHyFormer model."""
+        # 1. NS tokens: grouped projection
+        ns_tokens = self._build_ns_tokens(inputs)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1695,19 +1750,7 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)
+        ns_tokens = self._build_ns_tokens(inputs)
 
         seq_tokens_list = []
         seq_masks_list = []
