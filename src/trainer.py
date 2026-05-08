@@ -61,6 +61,7 @@ class PCVRHyFormerRankingTrainer:
         train_config: Optional[Dict[str, Any]] = None,
         use_amp: bool = False,
         warmup_steps: int = 0,
+        use_cosine_decay: bool = False,
         cosine_total_steps: int = 0,
         cosine_min_lr_ratio: float = 0.1,
     ) -> None:
@@ -117,15 +118,18 @@ class PCVRHyFormerRankingTrainer:
             'cuda', enabled=False
         )
 
-        # LR scheduler (linear warmup -> cosine decay -> floor at min_lr_ratio).
-        # Active only when warmup_steps > 0; otherwise dense AdamW runs at constant lr.
+        # LR scheduler for dense AdamW. Warmup can run alone; cosine decay is
+        # gated separately so the default schedule is warmup -> constant lr.
+        # Active when warmup_steps > 0 or cosine is enabled; otherwise dense
+        # AdamW runs at constant lr.
         # Applied to dense_optimizer only; sparse Adagrad keeps its constant lr.
         self.warmup_steps: int = warmup_steps
+        self.use_cosine_decay: bool = use_cosine_decay
         self.cosine_total_steps: int = cosine_total_steps
         self.cosine_min_lr_ratio: float = cosine_min_lr_ratio
         self.lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR]
-        if warmup_steps > 0:
-            if cosine_total_steps <= warmup_steps:
+        if warmup_steps > 0 or use_cosine_decay:
+            if use_cosine_decay and cosine_total_steps <= warmup_steps:
                 raise ValueError(
                     f"cosine_total_steps ({cosine_total_steps}) must be > "
                     f"warmup_steps ({warmup_steps})"
@@ -137,6 +141,8 @@ class PCVRHyFormerRankingTrainer:
             def lr_lambda(step: int) -> float:
                 if step < W:
                     return float(step) / float(max(1, W))
+                if not use_cosine_decay:
+                    return 1.0
                 if step >= T:
                     return r
                 progress = (step - W) / float(T - W)
@@ -145,10 +151,21 @@ class PCVRHyFormerRankingTrainer:
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.dense_optimizer, lr_lambda=lr_lambda
             )
-            logging.info(
-                f"LR scheduler: linear warmup {W} steps -> cosine decay to "
-                f"step {T} (min_lr_ratio={r}); applied to dense AdamW only"
-            )
+            if use_cosine_decay and warmup_steps > 0:
+                logging.info(
+                    f"LR scheduler: linear warmup {W} steps -> cosine decay to "
+                    f"step {T} (min_lr_ratio={r}); applied to dense AdamW only"
+                )
+            elif use_cosine_decay:
+                logging.info(
+                    f"LR scheduler: cosine decay to step {T} "
+                    f"(min_lr_ratio={r}); applied to dense AdamW only"
+                )
+            else:
+                logging.info(
+                    f"LR scheduler: linear warmup {W} steps -> constant lr; "
+                    f"applied to dense AdamW only"
+                )
         else:
             self.lr_scheduler = None
             logging.info("LR scheduler: disabled (warmup_steps=0); dense AdamW uses constant lr")

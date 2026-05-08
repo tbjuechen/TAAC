@@ -27,26 +27,28 @@ baseline 现在是常数 lr，没有 LR scheduler 任何形式；
 - ❌ 不 sweep peak_lr（dense lr 仍 1e-4），这支只看 schedule 形状是否单独有效
 - ❌ 不引入 LR scheduler 抽象（不抽象成可插拔模块），单纯一个 LambdaLR
 
-## CLI 设计（`train.py` 新增 3 个 flag）
+## CLI 设计（`train.py` 新增 4 个 flag）
 
 | flag | type | default | 含义 |
 |---|---|---|---|
-| `--warmup_steps` | int | `500` | linear ramp 0→peak 步数。**`0` = 关闭整个 schedule**，回到 baseline 常数 lr 行为 |
-| `--cosine_total_epochs` | float | `8.0` | cosine 终点位置 = `epochs × len(train_loader)` 步。8 epoch 对齐典型 early-stop 收敛点 |
-| `--cosine_min_lr_ratio` | float | `0.1` | cosine 谷底 lr = `peak × ratio`。peak=1e-4 时谷底=1e-5。到达谷底后保持不再降 |
+| `--warmup_steps` | int | `500` | linear ramp 0→peak 步数。**`0` = 关闭 warmup** |
+| `--use_cosine_decay` | bool flag | off | cosine decay 独立开关。默认关闭；打开后 warmup 后接 cosine，若 `warmup_steps=0` 则直接 cosine |
+| `--cosine_total_epochs` | float | `8.0` | cosine 终点位置 = `epochs × len(train_loader)` 步。仅 `--use_cosine_decay` 打开时生效 |
+| `--cosine_min_lr_ratio` | float | `0.1` | cosine 谷底 lr = `peak × ratio`。peak=1e-4 时谷底=1e-5。到达谷底后保持不再降。仅 `--use_cosine_decay` 打开时生效 |
 
-`--warmup_steps 0` 即"开关关"：scheduler 不构建、不调 step、零行为差异。
-`run.sh` 不改，所以默认 ON。
+默认行为是 warmup ON、cosine OFF，即 `linear warmup -> constant lr`。
+`--warmup_steps 0` 且不传 `--use_cosine_decay` 时 scheduler 不构建、不调 step、零行为差异。
 
 ## 行为规范
 
-设 `peak = args.lr`、`W = warmup_steps`、`T = cosine_total_epochs × len(train_loader)`、`r = cosine_min_lr_ratio`。
-**约束**：`T > W`，否则 raise（配置错误，不静默退化）。
+设 `peak = args.lr`、`W = warmup_steps`、`C = use_cosine_decay`、`T = cosine_total_epochs × len(train_loader)`、`r = cosine_min_lr_ratio`。
+**约束**：当 `C` 打开时 `T > W`，否则 raise（配置错误，不静默退化）。
 
 LR multiplier `f(step)`：
 
 ```
 if step < W:                            f = step / W
+elif not C:                             f = 1.0
 elif step < T:  progress = (step - W) / (T - W)
                 f = r + (1 - r) * 0.5 * (1 + cos(pi * progress))
 else:                                   f = r
@@ -58,15 +60,15 @@ else:                                   f = r
 
 ### `trainer.py`
 
-- `__init__` 新增参数：`warmup_steps`、`cosine_total_epochs`、`cosine_min_lr_ratio`
+- `__init__` 新增参数：`warmup_steps`、`use_cosine_decay`、`cosine_total_epochs`、`cosine_min_lr_ratio`
 - `__init__` 末尾按上面公式构建 `torch.optim.lr_scheduler.LambdaLR(self.dense_optimizer, lr_lambda=...)`
-- 当 `warmup_steps == 0`：`self.lr_scheduler = None`，所有调用点用 `if self.lr_scheduler is not None` 守卫
+- 当 `warmup_steps == 0` 且 `use_cosine_decay == False`：`self.lr_scheduler = None`，所有调用点用 `if self.lr_scheduler is not None` 守卫
 - `_train_step` 中：在 `self.scaler.step(self.dense_optimizer)` 之后、`self.scaler.update()` 之前调 `self.lr_scheduler.step()`（PyTorch 在用 GradScaler 时官方推荐这样：先 unscale + step optimizer，再 step scheduler）
 - TensorBoard：每 `--eval_every_n_steps` 或每 epoch 末（沿用现有 cadence）记 `LR/dense = self.dense_optimizer.param_groups[0]['lr']`
 
 ### `train.py`
 
-- 3 个 flag 加入 argparse
+- 4 个 flag 加入 argparse
 - 透传给 trainer 构造
 - `total_steps` 在 train.py 里算（需要 `len(train_loader)`）传给 trainer，避免 trainer 反算
 

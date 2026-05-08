@@ -167,19 +167,24 @@ def parse_args() -> argparse.Namespace:
                              'Embeddings whose vocab_size exceeds this value are reset '
                              'at each epoch end (0 = never reset any Embedding)')
 
-    # LR scheduler (linear warmup -> cosine decay) for dense AdamW.
+    # LR scheduler for dense AdamW. Warmup is enabled by default; cosine decay
+    # is opt-in so the default schedule is warmup -> constant lr.
     # Sparse Adagrad is unaffected.
     parser.add_argument('--warmup_steps', type=int, default=500,
-                        help='Linear warmup steps for dense AdamW (0 = disable scheduler '
-                             'entirely; dense lr stays constant at --lr).')
+                        help='Linear warmup steps for dense AdamW '
+                             '(0 = disable warmup).')
+    parser.add_argument('--use_cosine_decay', action='store_true',
+                        help='After warmup, enable cosine decay for dense AdamW. '
+                             'Off by default; without this flag, lr stays at --lr '
+                             'after warmup.')
     parser.add_argument('--cosine_total_epochs', type=float, default=8.0,
                         help='Cosine decay reaches its floor after this many epochs '
                              '(total_steps = epochs * len(train_loader)). '
-                             'Effective only when --warmup_steps > 0.')
+                             'Effective only when --use_cosine_decay is set.')
     parser.add_argument('--cosine_min_lr_ratio', type=float, default=0.1,
                         help='Cosine floor expressed as a fraction of peak --lr '
                              '(0.1 means floor lr = 0.1 * --lr). '
-                             'Effective only when --warmup_steps > 0.')
+                             'Effective only when --use_cosine_decay is set.')
 
     # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
@@ -364,9 +369,10 @@ def main() -> None:
     # Cosine schedule terminus, in steps. Computed here because trainer should
     # not have to peek at len(train_loader) just to convert epochs->steps.
     cosine_total_steps = int(args.cosine_total_epochs * len(train_loader))
-    if args.warmup_steps > 0:
+    if args.warmup_steps > 0 or args.use_cosine_decay:
         logging.info(
             f"Warmup-LR config: warmup_steps={args.warmup_steps}, "
+            f"use_cosine_decay={args.use_cosine_decay}, "
             f"cosine_total_steps={cosine_total_steps} "
             f"(={args.cosine_total_epochs} epochs * {len(train_loader)} steps/epoch), "
             f"cosine_min_lr_ratio={args.cosine_min_lr_ratio}"
@@ -396,6 +402,7 @@ def main() -> None:
         train_config=vars(args),
         use_amp=args.use_amp,
         warmup_steps=args.warmup_steps,
+        use_cosine_decay=args.use_cosine_decay,
         cosine_total_steps=cosine_total_steps,
         cosine_min_lr_ratio=args.cosine_min_lr_ratio,
     )
