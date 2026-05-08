@@ -153,6 +153,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_seq_periodic_time_features', action='store_true', default=False,
                         help='Concatenate hour-of-day and day-of-week embeddings to each '
                              'sequence token before the per-domain sequence projection.')
+    parser.add_argument('--use_seq_hour_of_day_feature', action='store_true', default=False,
+                        help='Concatenate hour-of-day embeddings to each sequence token.')
+    parser.add_argument('--use_seq_day_of_week_feature', action='store_true', default=False,
+                        help='Concatenate day-of-week embeddings to each sequence token.')
     parser.add_argument('--per_domain_seq_periodic_time_features', action='store_true', default=False,
                         help='Use per-domain hour-of-day and day-of-week embeddings for '
                              'sequence periodic time features.')
@@ -344,6 +348,8 @@ def main() -> None:
         "domain_time_residual_embeddings": args.domain_time_residual_embeddings,
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
         "use_time_summary_features": args.use_time_summary_features,
+        "use_seq_hour_of_day_feature": args.use_seq_hour_of_day_feature,
+        "use_seq_day_of_week_feature": args.use_seq_day_of_week_feature,
         "use_seq_periodic_time_features": args.use_seq_periodic_time_features,
         "per_domain_seq_periodic_time_features": args.per_domain_seq_periodic_time_features,
         "rank_mixer_mode": args.rank_mixer_mode,
@@ -382,9 +388,14 @@ def main() -> None:
             if model.per_domain_seq_periodic_time_features
             else "shared"
         )
+        periodic_parts = []
+        if model.use_seq_hour_of_day_feature:
+            periodic_parts.append("hour-of-day")
+        if model.use_seq_day_of_week_feature:
+            periodic_parts.append("day-of-week")
         logging.info(
             f"W2.9 seq periodic time features enabled ({periodic_scope}): concat "
-            f"hour-of-day + day-of-week embeddings before seq projection"
+            f"{' + '.join(periodic_parts)} embeddings before seq projection"
         )
     if model.num_delta_buckets > 0:
         n_domains = len(model.seq_domains)

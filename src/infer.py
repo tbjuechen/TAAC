@@ -73,6 +73,8 @@ _FALLBACK_MODEL_CFG = {
     'domain_time_residual_embeddings': False,
     'num_delta_buckets': 0,
     'use_time_summary_features': False,
+    'use_seq_hour_of_day_feature': False,
+    'use_seq_day_of_week_feature': False,
     'use_seq_periodic_time_features': False,
     'per_domain_seq_periodic_time_features': False,
     'rank_mixer_mode': 'full',
