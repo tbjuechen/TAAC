@@ -151,6 +151,15 @@ def parse_args() -> argparse.Namespace:
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
                         help='RoPE base frequency (default 10000)')
+    parser.add_argument('--user_dense_stat_transform', type=str, default='raw',
+                        choices=['raw', 'log1p', 'log1p_clip'],
+                        help='Transform user_dense fids 62-66 before the single '
+                             'user dense projection token. raw reproduces the '
+                             'historical baseline; log1p_clip applies log1p then '
+                             'clips at --user_dense_stat_clip.')
+    parser.add_argument('--user_dense_stat_clip', type=float, default=20.0,
+                        help='Upper clip value after log1p for '
+                             '--user_dense_stat_transform=log1p_clip.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -318,6 +327,7 @@ def main() -> None:
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
+        "user_dense_feature_specs": pcvr_dataset.user_dense_schema.entries,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
@@ -337,6 +347,8 @@ def main() -> None:
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
+        "user_dense_stat_transform": args.user_dense_stat_transform,
+        "user_dense_stat_clip": args.user_dense_stat_clip,
         "emb_skip_threshold": args.emb_skip_threshold,
         "seq_id_threshold": args.seq_id_threshold,
         "ns_tokenizer_type": args.ns_tokenizer_type,

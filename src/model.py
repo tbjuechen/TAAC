@@ -1223,6 +1223,7 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1246,6 +1247,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        user_dense_stat_transform: str = 'raw',
+        user_dense_stat_clip: float = 20.0,
     ) -> None:
         super().__init__()
 
@@ -1261,6 +1264,23 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.user_dense_stat_transform = user_dense_stat_transform
+        self.user_dense_stat_clip = user_dense_stat_clip
+
+        if user_dense_stat_transform not in ('raw', 'log1p', 'log1p_clip'):
+            raise ValueError(
+                f"Unknown user_dense_stat_transform: {user_dense_stat_transform}")
+
+        stat_offsets: List[int] = []
+        if user_dense_feature_specs is not None:
+            for fid, offset, length in user_dense_feature_specs:
+                if fid in (62, 63, 64, 65, 66):
+                    stat_offsets.extend(range(offset, offset + length))
+        self.register_buffer(
+            '_user_dense_stat_offsets',
+            torch.tensor(stat_offsets, dtype=torch.long),
+            persistent=False,
+        )
 
         # ================== NS Tokens Construction ==================
 
@@ -1315,6 +1335,17 @@ class PCVRHyFormer(nn.Module):
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
+            if user_dense_stat_transform != 'raw' and len(stat_offsets) == 0:
+                raise ValueError(
+                    "user_dense_stat_transform requires user_dense_feature_specs "
+                    "containing fids 62-66")
+            if user_dense_stat_transform != 'raw':
+                logging.info(
+                    "User dense stat transform: %s on fids 62-66 (%d dims), clip=%s",
+                    user_dense_stat_transform,
+                    len(stat_offsets),
+                    user_dense_stat_clip,
+                )
             self.user_dense_proj = nn.Sequential(
                 nn.Linear(user_dense_dim, d_model),
                 nn.LayerNorm(d_model),
@@ -1559,6 +1590,22 @@ class PCVRHyFormer(nn.Module):
         sparse_ptrs = {p.data_ptr() for p in self.get_sparse_params()}
         return [p for p in self.parameters() if p.data_ptr() not in sparse_ptrs]
 
+    def _transform_user_dense(self, user_dense_feats: torch.Tensor) -> torch.Tensor:
+        """Apply optional numeric transform to fid 62-66 before dense projection."""
+        if self.user_dense_stat_transform == 'raw':
+            return user_dense_feats
+
+        stat_offsets = self._user_dense_stat_offsets
+        if stat_offsets.numel() == 0:
+            return user_dense_feats
+
+        transformed_feats = user_dense_feats.clone()
+        stat_values = torch.log1p(torch.clamp(user_dense_feats.index_select(1, stat_offsets), min=0.0))
+        if self.user_dense_stat_transform == 'log1p_clip':
+            stat_values = torch.clamp(stat_values, max=self.user_dense_stat_clip)
+        transformed_feats.index_copy_(1, stat_offsets, stat_values)
+        return transformed_feats
+
     def _embed_seq_domain(
         self,
         seq: torch.Tensor,
@@ -1657,7 +1704,8 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_feats = self._transform_user_dense(inputs.user_dense_feats)
+            user_dense_tok = F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1700,7 +1748,8 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            user_dense_feats = self._transform_user_dense(inputs.user_dense_feats)
+            user_dense_tok = F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:

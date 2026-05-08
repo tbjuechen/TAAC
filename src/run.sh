@@ -13,6 +13,8 @@ SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
 SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
+USER_DENSE_STAT_TRANSFORM="${USER_DENSE_STAT_TRANSFORM:-log1p_clip}"
+USER_DENSE_STAT_CLIP="${USER_DENSE_STAT_CLIP:-20.0}"
 # ============================================================
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
@@ -31,6 +33,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --seq_top_k "${SEQ_TOP_K}" \
     --longer_gather_side "${GATHER_SIDE}" \
     --seq_max_lens "${SEQ_MAX_LENS}" \
+    --user_dense_stat_transform "${USER_DENSE_STAT_TRANSFORM}" \
+    --user_dense_stat_clip "${USER_DENSE_STAT_CLIP}" \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
