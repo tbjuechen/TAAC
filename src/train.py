@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
+    parser.add_argument('--use_dense_missing_indicators', action='store_true', default=True,
+                        help='Append one all-zero/null indicator per user_dense fid '
+                             '(default on).')
+    parser.add_argument('--no_dense_missing_indicators',
+                        dest='use_dense_missing_indicators', action='store_false',
+                        help='Disable appended user_dense all-zero/null indicators.')
 
     # Model hyperparameters.
     parser.add_argument('--d_model', type=int, default=64,
@@ -289,6 +295,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        use_dense_missing_indicators=args.use_dense_missing_indicators,
     )
 
     # ---- NS groups ----

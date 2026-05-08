@@ -153,6 +153,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        use_dense_missing_indicators: bool = True,
     ) -> None:
         """
         Args:
@@ -170,6 +171,10 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            use_dense_missing_indicators: if True, append one float indicator
+                per user_dense feature. The indicator is 1 when the raw dense
+                column is null, empty, or has no non-zero finite values in its
+                configured dimension.
         """
         super().__init__()
 
@@ -188,6 +193,7 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.use_dense_missing_indicators = use_dense_missing_indicators
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -249,6 +255,13 @@ class PCVRParquetDataset(IterableDataset):
             ci = self._col_idx.get(f'user_dense_feats_{fid}')
             self._user_dense_plan.append((ci, dim, offset))
             offset += dim
+        self._user_dense_missing_plan = []
+        if self.use_dense_missing_indicators:
+            for fid, dim in self._user_dense_cols:
+                ci = self._col_idx.get(f'user_dense_feats_{fid}')
+                indicator_offset, _ = self.user_dense_schema.get_offset_length(
+                    self._dense_missing_indicator_fid(fid))
+                self._user_dense_missing_plan.append((ci, dim, indicator_offset))
 
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
         self._seq_plan = {}
@@ -295,6 +308,9 @@ class PCVRParquetDataset(IterableDataset):
         self.user_dense_schema: FeatureSchema = FeatureSchema()
         for fid, dim in self._user_dense_cols:
             self.user_dense_schema.add(fid, dim)
+        if self.use_dense_missing_indicators:
+            for fid, _ in self._user_dense_cols:
+                self.user_dense_schema.add(self._dense_missing_indicator_fid(fid), 1)
 
         # ---- item_dense (empty) ----
         self.item_dense_schema: FeatureSchema = FeatureSchema()
@@ -328,6 +344,11 @@ class PCVRParquetDataset(IterableDataset):
 
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
+
+    @staticmethod
+    def _dense_missing_indicator_fid(fid: int) -> int:
+        """Synthetic fid used for appended user_dense missing indicators."""
+        return 1_000_000 + fid
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
@@ -502,6 +523,36 @@ class PCVRParquetDataset(IterableDataset):
 
         return padded
 
+    def _dense_missing_indicator_column(
+        self,
+        arrow_col: "pa.ListArray",
+        max_dim: int,
+        B: int,
+    ) -> "npt.NDArray[np.float32]":
+        """Return 1 for null/empty/all-zero dense rows, else 0."""
+        offsets = arrow_col.offsets.to_numpy()
+        values = arrow_col.values.to_numpy()
+        null_mask = arrow_col.is_null().to_numpy(zero_copy_only=False)
+
+        indicator = np.zeros(B, dtype=np.float32)
+        for i in range(B):
+            if null_mask[i]:
+                indicator[i] = 1.0
+                continue
+
+            start, end = int(offsets[i]), int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                indicator[i] = 1.0
+                continue
+
+            use_len = min(raw_len, max_dim)
+            vals = values[start:start + use_len]
+            if vals.size == 0 or not np.any(np.isfinite(vals) & (vals != 0)):
+                indicator[i] = 1.0
+
+        return indicator
+
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
         """Convert an Arrow RecordBatch into a training-ready dict of tensors."""
         B = batch.num_rows
@@ -569,6 +620,9 @@ class PCVRParquetDataset(IterableDataset):
             col = batch.column(ci)
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
+        for ci, dim, offset in self._user_dense_missing_plan:
+            col = batch.column(ci)
+            user_dense[:, offset] = self._dense_missing_indicator_column(col, dim, B)
 
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
@@ -681,6 +735,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    use_dense_missing_indicators: bool = True,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -729,6 +784,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        use_dense_missing_indicators=use_dense_missing_indicators,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -751,6 +807,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        use_dense_missing_indicators=use_dense_missing_indicators,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

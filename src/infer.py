@@ -331,6 +331,8 @@ def main() -> None:
     # ---- Data loading: reuse batch_size / num_workers from training config ----
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
+    use_dense_missing_indicators = bool(
+        train_config.get('use_dense_missing_indicators', False))
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -340,6 +342,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        use_dense_missing_indicators=use_dense_missing_indicators,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
