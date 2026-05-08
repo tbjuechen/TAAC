@@ -148,8 +148,11 @@ def parse_args() -> argparse.Namespace:
                         help='Add zero-initialized per-domain residual time embeddings on '
                              'top of the shared recency time embedding.')
     parser.add_argument('--use_time_summary_features', action='store_true', default=False,
-                        help='Add per-domain sequence time summary features '
-                             '(last/oldest/span/density/window counts) to the final representation.')
+                        help='Add one NS token from per-domain sequence time summary features '
+                             '(last/oldest/span/density/window counts).')
+    parser.add_argument('--use_seq_periodic_time_features', action='store_true', default=False,
+                        help='Concatenate hour-of-day and day-of-week embeddings to each '
+                             'sequence token before the per-domain sequence projection.')
     parser.add_argument('--use_delta_buckets', action='store_true', default=False,
                         help='Enable per-domain delta-t bucket embedding (W2.7). '
                              'Models adjacent-token time gaps within sequences. '
@@ -338,6 +341,7 @@ def main() -> None:
         "domain_time_residual_embeddings": args.domain_time_residual_embeddings,
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
         "use_time_summary_features": args.use_time_summary_features,
+        "use_seq_periodic_time_features": args.use_seq_periodic_time_features,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
@@ -365,8 +369,13 @@ def main() -> None:
         )
     if model.use_time_summary_features:
         logging.info(
-            f"W2.8 time summary features enabled: "
-            f"{len(model.seq_domains) * 8} dims -> {args.d_model}"
+            f"W2.8 time summary NS token enabled: "
+            f"{len(model.seq_domains) * 8} dims -> 1 x {args.d_model}"
+        )
+    if model.use_seq_periodic_time_features:
+        logging.info(
+            f"W2.9 seq periodic time features enabled: concat "
+            f"hour-of-day + day-of-week embeddings before seq projection"
         )
     if model.num_delta_buckets > 0:
         n_domains = len(model.seq_domains)

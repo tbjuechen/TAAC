@@ -143,6 +143,7 @@ DELTA_BOUNDARIES = np.array([
     67108864, 134217728, 268435456, 536870912, 1073741824,
 ], dtype=np.int64)
 NUM_DELTA_BUCKETS = len(DELTA_BOUNDARIES) + 2  # +1 padding(0), +1 upper-bound = 33
+PERIODIC_TIME_UTC_OFFSET_SECONDS = 8 * 3600
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -234,6 +235,8 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_db = {}
+        self._buf_seq_hour = {}
+        self._buf_seq_dow = {}
         self._buf_seq_lens = {}
         self._time_summary_dim = len(self.seq_domains) * 8
         self._buf_time_summary = np.zeros((B, self._time_summary_dim), dtype=np.float32)
@@ -243,6 +246,8 @@ class PCVRParquetDataset(IterableDataset):
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_db[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_hour[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_dow[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -652,6 +657,10 @@ class PCVRParquetDataset(IterableDataset):
             time_bucket[:] = 0
             delta_bucket = self._buf_seq_db[domain][:B]
             delta_bucket[:] = 0
+            hour_bucket = self._buf_seq_hour[domain][:B]
+            hour_bucket[:] = 0
+            dow_bucket = self._buf_seq_dow[domain][:B]
+            dow_bucket[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -699,6 +708,14 @@ class PCVRParquetDataset(IterableDataset):
                 delta_buckets[:, -1] = 0
                 delta_bucket[:] = delta_buckets
 
+                shifted_ts = ts_padded + PERIODIC_TIME_UTC_OFFSET_SECONDS
+                hour_ids = ((shifted_ts % 86400) // 3600) + 1
+                dow_ids = ((shifted_ts // 86400 + 3) % 7) + 1
+                hour_ids[ts_padded == 0] = 0
+                dow_ids[ts_padded == 0] = 0
+                hour_bucket[:] = hour_ids
+                dow_bucket[:] = dow_ids
+
                 valid_ts = ts_padded > 0
                 ts_lengths = valid_ts.sum(axis=1)
                 if ts_lengths.any():
@@ -731,6 +748,8 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
             result[f'{domain}_delta_bucket'] = torch.from_numpy(delta_bucket.copy())
+            result[f'{domain}_hour_bucket'] = torch.from_numpy(hour_bucket.copy())
+            result[f'{domain}_dow_bucket'] = torch.from_numpy(dow_bucket.copy())
 
         result['time_summary_feats'] = torch.from_numpy(time_summary.copy())
         return result

@@ -73,6 +73,7 @@ _FALLBACK_MODEL_CFG = {
     'domain_time_residual_embeddings': False,
     'num_delta_buckets': 0,
     'use_time_summary_features': False,
+    'use_seq_periodic_time_features': False,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
@@ -310,6 +311,8 @@ def _batch_to_model_input(
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
     seq_delta_buckets: Dict[str, torch.Tensor] = {}
+    seq_hour_buckets: Dict[str, torch.Tensor] = {}
+    seq_dow_buckets: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -319,6 +322,12 @@ def _batch_to_model_input(
             torch.zeros(B, L, dtype=torch.long, device=device))
         seq_delta_buckets[domain] = device_batch.get(
             f'{domain}_delta_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_hour_buckets[domain] = device_batch.get(
+            f'{domain}_hour_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_dow_buckets[domain] = device_batch.get(
+            f'{domain}_dow_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
 
     return ModelInput(
@@ -339,6 +348,8 @@ def _batch_to_model_input(
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
         seq_delta_buckets=seq_delta_buckets,
+        seq_hour_buckets=seq_hour_buckets,
+        seq_dow_buckets=seq_dow_buckets,
     )
 
 

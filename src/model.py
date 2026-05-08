@@ -18,6 +18,8 @@ class ModelInput(NamedTuple):
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
     seq_delta_buckets: dict  # {domain: tensor [B, L]} - W2.7 adjacent-token delta_t buckets
+    seq_hour_buckets: dict  # {domain: tensor [B, L]} - hour-of-day ids, 0=padding
+    seq_dow_buckets: dict  # {domain: tensor [B, L]} - day-of-week ids, 0=padding
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1243,6 +1245,7 @@ class PCVRHyFormer(nn.Module):
         domain_time_residual_embeddings: bool = False,
         num_delta_buckets: int = 0,
         use_time_summary_features: bool = False,
+        use_seq_periodic_time_features: bool = False,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1266,6 +1269,7 @@ class PCVRHyFormer(nn.Module):
         self.domain_time_residual_embeddings = domain_time_residual_embeddings
         self.num_delta_buckets = num_delta_buckets
         self.use_time_summary_features = use_time_summary_features
+        self.use_seq_periodic_time_features = use_seq_periodic_time_features
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1397,10 +1401,15 @@ class PCVRHyFormer(nn.Module):
             self._seq_emb_index[domain] = idx_map
             self._seq_is_id[domain] = is_id
             self._seq_vocab_sizes[domain] = vs
+            seq_proj_in_dim = (len(vs) + (2 if use_seq_periodic_time_features else 0)) * emb_dim
             self._seq_proj[domain] = nn.Sequential(
-                nn.Linear(len(vs) * emb_dim, d_model),
+                nn.Linear(seq_proj_in_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+
+        if use_seq_periodic_time_features:
+            self.seq_hour_embedding = nn.Embedding(25, emb_dim, padding_idx=0)
+            self.seq_dow_embedding = nn.Embedding(8, emb_dim, padding_idx=0)
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1537,6 +1546,11 @@ class PCVRHyFormer(nn.Module):
                 nn.init.xavier_normal_(emb.weight.data)
                 emb.weight.data[0, :] = 0
 
+        if self.use_seq_periodic_time_features:
+            for emb in [self.seq_hour_embedding, self.seq_dow_embedding]:
+                nn.init.xavier_normal_(emb.weight.data)
+                emb.weight.data[0, :] = 0
+
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
@@ -1598,6 +1612,8 @@ class PCVRHyFormer(nn.Module):
         # delta_embeddings always preserved (W2.7, per-domain)
         if self.num_delta_buckets > 0:
             skip_count += len(self.delta_embeddings)
+        if self.use_seq_periodic_time_features:
+            skip_count += 2
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1625,6 +1641,8 @@ class PCVRHyFormer(nn.Module):
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
         delta_bucket_ids: torch.Tensor,
+        hour_bucket_ids: torch.Tensor,
+        dow_bucket_ids: torch.Tensor,
         domain_name: str,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
@@ -1641,6 +1659,9 @@ class PCVRHyFormer(nn.Module):
                 if is_id[i] and self.training:
                     e = self.seq_id_emb_dropout(e)
                 emb_list.append(e)
+        if self.use_seq_periodic_time_features:
+            emb_list.append(self.seq_hour_embedding(hour_bucket_ids))
+            emb_list.append(self.seq_dow_embedding(dow_bucket_ids))
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
@@ -1749,6 +1770,8 @@ class PCVRHyFormer(nn.Module):
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
                 inputs.seq_delta_buckets[domain],
+                inputs.seq_hour_buckets[domain],
+                inputs.seq_dow_buckets[domain],
                 domain)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
@@ -1796,6 +1819,8 @@ class PCVRHyFormer(nn.Module):
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
                 inputs.seq_delta_buckets[domain],
+                inputs.seq_hour_buckets[domain],
+                inputs.seq_dow_buckets[domain],
                 domain)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
