@@ -153,6 +153,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_seq_periodic_time_features', action='store_true', default=False,
                         help='Concatenate hour-of-day and day-of-week embeddings to each '
                              'sequence token before the per-domain sequence projection.')
+    parser.add_argument('--per_domain_seq_periodic_time_features', action='store_true', default=False,
+                        help='Use per-domain hour-of-day and day-of-week embeddings for '
+                             'sequence periodic time features.')
     parser.add_argument('--use_delta_buckets', action='store_true', default=False,
                         help='Enable per-domain delta-t bucket embedding (W2.7). '
                              'Models adjacent-token time gaps within sequences. '
@@ -342,6 +345,7 @@ def main() -> None:
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
         "use_time_summary_features": args.use_time_summary_features,
         "use_seq_periodic_time_features": args.use_seq_periodic_time_features,
+        "per_domain_seq_periodic_time_features": args.per_domain_seq_periodic_time_features,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
@@ -373,8 +377,13 @@ def main() -> None:
             f"{len(model.seq_domains) * 8} dims -> 1 x {args.d_model}"
         )
     if model.use_seq_periodic_time_features:
+        periodic_scope = (
+            "per-domain"
+            if model.per_domain_seq_periodic_time_features
+            else "shared"
+        )
         logging.info(
-            f"W2.9 seq periodic time features enabled: concat "
+            f"W2.9 seq periodic time features enabled ({periodic_scope}): concat "
             f"hour-of-day + day-of-week embeddings before seq projection"
         )
     if model.num_delta_buckets > 0:

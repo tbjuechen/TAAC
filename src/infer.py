@@ -74,6 +74,7 @@ _FALLBACK_MODEL_CFG = {
     'num_delta_buckets': 0,
     'use_time_summary_features': False,
     'use_seq_periodic_time_features': False,
+    'per_domain_seq_periodic_time_features': False,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
