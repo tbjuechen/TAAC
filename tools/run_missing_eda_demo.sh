@@ -1,5 +1,5 @@
 #!/bin/bash
-# Local smoke test for src/missing_eda.py over data/demo.
+# Local smoke test for tools/missing_eda.py over data/demo.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -11,7 +11,7 @@ export PYTHONPATH="${PROJECT_ROOT}/src:${PYTHONPATH:-}"
 OUT_DIR="${PROJECT_ROOT}/output/missing_eda/demo_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${OUT_DIR}"
 
-"${PYTHON_BIN}" -u "${PROJECT_ROOT}/src/missing_eda.py" \
+"${PYTHON_BIN}" -u "${PROJECT_ROOT}/tools/missing_eda.py" \
     --data_dir "${PROJECT_ROOT}/data/demo" \
     --schema_path "${PROJECT_ROOT}/data/demo/schema.json" \
     --log_dir "${OUT_DIR}" \
