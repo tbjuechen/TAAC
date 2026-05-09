@@ -417,7 +417,7 @@ class MultiSeqQueryGenerator(nn.Module):
 
     Generates Q tokens independently for each sequence:
     For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+        GlobalInfo_i = Concat(F1..FM, Pool(Seq_i))
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
     """
 
@@ -427,17 +427,53 @@ class MultiSeqQueryGenerator(nn.Module):
         num_ns: int,
         num_queries: int,
         num_sequences: int,
-        hidden_mult: int = 4
+        hidden_mult: int = 4,
+        pooling_mode: str = 'mean',
+        din_gate_init: float = -2.0,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
+        self.pooling_mode = pooling_mode
+
+        if pooling_mode not in ['mean', 'din', 'din_gated']:
+            raise ValueError(f"Unknown query pooling mode: {pooling_mode}")
 
         global_info_dim = (num_ns + 1) * d_model
 
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
+
+        if pooling_mode in ['din', 'din_gated']:
+            self.target_norm = nn.LayerNorm(d_model)
+            self.target_proj = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.SiLU(),
+                nn.LayerNorm(d_model),
+            )
+            self.din_mlps = nn.ModuleList()
+            for _ in range(num_sequences):
+                scorer = nn.Sequential(
+                    nn.Linear(4 * d_model, d_model * hidden_mult),
+                    nn.SiLU(),
+                    nn.Linear(d_model * hidden_mult, d_model),
+                    nn.SiLU(),
+                    nn.Linear(d_model, 1),
+                )
+                nn.init.zeros_(scorer[-1].weight)
+                nn.init.zeros_(scorer[-1].bias)
+                self.din_mlps.append(scorer)
+            if pooling_mode == 'din_gated':
+                self.din_gates = nn.Parameter(torch.full(
+                    (num_sequences,), float(din_gate_init)))
+            else:
+                self.register_parameter('din_gates', None)
+        else:
+            self.target_norm = None
+            self.target_proj = None
+            self.din_mlps = nn.ModuleList()
+            self.register_parameter('din_gates', None)
 
         # Each sequence has N independent FFNs
         self.query_ffns_per_seq = nn.ModuleList([
@@ -457,7 +493,8 @@ class MultiSeqQueryGenerator(nn.Module):
         self,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
-        seq_padding_masks: list
+        seq_padding_masks: list,
+        target_tokens: Optional[torch.Tensor] = None,
     ) -> list:
         """Generates query tokens for each sequence.
 
@@ -466,21 +503,49 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_tokens_list: List of (B, L_i, D) tensors, length S.
             seq_padding_masks: List of (B, L_i) masks, length S. True
                 indicates padding.
+            target_tokens: Optional (B, K, D) item-side tokens used as the
+                target query for DIN-style sequence pooling.
 
         Returns:
             List of (B, Nq, D) query token tensors, length S.
         """
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
+        target_token = None
+        if self.pooling_mode in ['din', 'din_gated']:
+            if target_tokens is None:
+                raise ValueError("target_tokens is required for DIN query pooling")
+            target_token = target_tokens.mean(dim=1)  # (B, D)
+            target_token = self.target_proj(self.target_norm(target_token))
 
         q_tokens_list = []
         for i in range(self.num_sequences):
-            # MeanPool(Seq_i)
             valid_mask = ~seq_padding_masks[i]  # True = valid
             valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
             seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
             seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
-            seq_pooled = seq_sum / seq_count  # (B, D)
+            seq_mean = seq_sum / seq_count  # (B, D)
+
+            if self.pooling_mode == 'mean':
+                seq_pooled = seq_mean
+            else:
+                seq_tokens = seq_tokens_list[i]
+                target_expanded = target_token.unsqueeze(1).expand_as(seq_tokens)
+                din_input = torch.cat([
+                    seq_tokens,
+                    target_expanded,
+                    seq_tokens * target_expanded,
+                    seq_tokens - target_expanded,
+                ], dim=-1)
+                scores = self.din_mlps[i](din_input).squeeze(-1)  # (B, L_i)
+                weights = 2.0 * torch.sigmoid(scores) * valid_mask.float()
+                seq_din = (seq_tokens * weights.unsqueeze(-1)).sum(dim=1) / seq_count
+
+                if self.pooling_mode == 'din_gated':
+                    gate = torch.sigmoid(self.din_gates[i])
+                    seq_pooled = seq_mean + gate * (seq_din - seq_mean)
+                else:
+                    seq_pooled = seq_din
 
             # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
             global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
@@ -1246,6 +1311,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        query_pooling: str = 'mean',
+        din_gate_init: float = -2.0,
     ) -> None:
         super().__init__()
 
@@ -1261,6 +1328,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.query_pooling = query_pooling
 
         # ================== NS Tokens Construction ==================
 
@@ -1402,6 +1470,8 @@ class PCVRHyFormer(nn.Module):
             num_queries=num_queries,
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
+            pooling_mode=query_pooling,
+            din_gate_init=din_gate_init,
         )
 
         # MultiSeqHyFormerBlock stack
@@ -1660,11 +1730,14 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
+        target_parts = [item_ns]
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+            target_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        target_tokens = torch.cat(target_parts, dim=1)  # (B, num_item_tokens, D)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1680,7 +1753,8 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list, target_tokens=target_tokens)
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
@@ -1703,11 +1777,14 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
+        target_parts = [item_ns]
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+            target_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
+        target_tokens = torch.cat(target_parts, dim=1)
 
         seq_tokens_list = []
         seq_masks_list = []
@@ -1721,7 +1798,8 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list, target_tokens=target_tokens)
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,

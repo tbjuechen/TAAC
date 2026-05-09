@@ -87,7 +87,7 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
@@ -230,6 +230,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--query_pooling', type=str, default='mean',
+                        choices=['mean', 'din', 'din_gated'],
+                        help='Sequence pooling used before query-token generation: '
+                             'mean = masked mean pool, '
+                             'din = item-target-aware DIN weighted pool, '
+                             'din_gated = initialize near mean pool and learn a per-domain DIN gate')
+    parser.add_argument('--din_gate_init', type=float, default=-2.0,
+                        help='Initial logit for each per-domain DIN gate when '
+                             '--query_pooling=din_gated. -2.0 starts close to mean pooling.')
 
     args = parser.parse_args()
 
@@ -342,6 +351,8 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "query_pooling": args.query_pooling,
+        "din_gate_init": args.din_gate_init,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
