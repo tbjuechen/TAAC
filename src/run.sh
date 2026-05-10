@@ -13,8 +13,6 @@ SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
 SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
-SEED="${SEED:-42}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
 # ============================================================
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
@@ -27,11 +25,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
-    --num_workers "${NUM_WORKERS}" \
+    --num_workers 8 \
     --use_amp \
     --use_compile \
     --compile_mode reduce-overhead \
-    --seed "${SEED}" \
     --seq_encoder_type "${SEQ_ENCODER_TYPE}" \
     --seq_top_k "${SEQ_TOP_K}" \
     --longer_gather_side "${GATHER_SIDE}" \
@@ -51,8 +48,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
 #     --num_queries 1 \
 #     --emb_skip_threshold 1000000 \
-#     --num_workers "${NUM_WORKERS}" \
-#     --seed "${SEED}" \
+#     --num_workers 8 \
 #     --use_amp \
 #     --use_compile \
 #     --compile_mode reduce-overhead \
