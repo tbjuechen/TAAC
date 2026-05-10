@@ -240,10 +240,9 @@ def set_seed(seed: int) -> None:
     PyTorch generator and all CUDA generators, then forces cuDNN into
     deterministic mode.
 
-    Note that full bitwise determinism on GPU also requires disabling
-    cuDNN auto-tuning (``torch.backends.cudnn.benchmark = False``) and may
-    come with a non-trivial throughput cost; this helper intentionally
-    only toggles ``deterministic`` to preserve speed for common use cases.
+    Note that full bitwise determinism on GPU may still require avoiding
+    nondeterministic kernels in some operators. This helper disables cuDNN
+    auto-tuning so repeated runs do not pick different convolution kernels.
 
     Args:
         seed: Non-negative integer seed shared by all RNGs listed above.
@@ -255,6 +254,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def sigmoid_focal_loss(
