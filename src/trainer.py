@@ -515,9 +515,21 @@ class PCVRHyFormerRankingTrainer:
         self.scaler.unscale_(self.dense_optimizer)
         if self.sparse_optimizer is not None:
             self.scaler.unscale_(self.sparse_optimizer)
+        # Clip dense and sparse gradients separately so large embedding
+        # gradients do not shrink dense updates through a shared global norm.
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+        dense_params = [
+            p for group in self.dense_optimizer.param_groups
+            for p in group['params']
+        ]
+        torch.nn.utils.clip_grad_norm_(dense_params, max_norm=1.0, foreach=False)
+        if self.sparse_optimizer is not None:
+            sparse_params = [
+                p for group in self.sparse_optimizer.param_groups
+                for p in group['params']
+            ]
+            torch.nn.utils.clip_grad_norm_(sparse_params, max_norm=1.0, foreach=False)
 
         self.scaler.step(self.dense_optimizer)
         if self.sparse_optimizer is not None:
