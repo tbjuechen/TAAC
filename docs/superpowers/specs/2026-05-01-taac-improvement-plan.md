@@ -1,6 +1,6 @@
 # TAAC 2026 PCVR Baseline 改进计划（W1-W2）
 
-**Status**: v2.2 — W2.6 v1 weighted pool 失败（F27）：feature/pair-weighted-pool 两组实验（log1p only vs log1p+sigmoid full）val 全部持平、**test 反向 -0.0022 / -0.0054**；val/test divergence 第 5 次触发；hard-coded log1p / sigmoid weighted pool 范式整体死；W2.6 整体保留，下版换 paradigm（learnable / attention / 显式 pair embedding 三选一）。W1.7 longer encoder 路径**整体闭环失败**（F25），唯一剩 (c) transformer + 长 cap 未试；F26 tokenizer 手工划分待 test 决策
+**Status**: v2.3 — 最近 8 组实验把方向重新排清楚：**时间特征 shared-parameter 是唯一 test 同向正收益**（val 0.863769 / test 0.818879，+0.6%，13G），升级为下一阶段主线；private time、pair weighted pool、pair Transformer、int gated residual、dense 3 tokens、fid 62-69 log1p+clip 全部 val 轻涨或持平但 test 反向，继续强化“test 校准优先于 val”。W2.6 pair v1/v1.5 闭环失败，W2.7 时间特征从候选升级为最高优先级。
 **Author**: brainstorming session 2026-05-01
 **Branch**: this doc lives on `main`; implementation work happens on feature branches
 **Deadline**: 提交截止 2026-05-23 AOE
@@ -8,6 +8,12 @@
 
 ## Changelog
 
+- **v2.3（2026-05-10）**：吸收最近 8 组实验，重排 W2/W3 优先级：
+  - ✅ **F28 时间特征 shared 参数命中**：seq `day_of_week && hour_of_day` shared-parameter，6 epoch，val **0.863769 (+0.15%)** / test **0.818879 (+0.6%)** / 13G / CPU 20%。这是近期唯一 val/test 同向且 test 明显上涨的实验，W2.7 从 brainstorm 候选升级为主线。
+  - ⚠️ **F29 时间特征 private 参数 val 好但 test 不稳**：private-parameter，5 epoch，val **0.863936 (+0.17%)** / test **0.810414 (-0.2%)** / 13G。结论：时间特征有信号，但参数私有化更容易贴 val 分布；下一步优先 shared，再做轻量 ablation。
+  - 🔴 **F30 pair 特征第二轮闭环**：`log1p` 6 epoch val **0.862392 (=)** / test **0.81004 (-0.2%)**；`log1p+sigmoid` 6 epoch val **0.862408 (=)** / test **0.80693 (-0.6%)**；pair Transformer 5 epoch val **0.861612 (-0.06%)** / test **0.808058 (-0.4%)**。hard-coded transform 和重交互建模都未带来 test 收益，W2.6 降级为低优先研究项。
+  - 🔴 **F31 dense/int 特征工程整体不成立**：int feature gated residual 6 epoch val **0.861419 (-0.1%)** / test **0.808318 (-0.4%)** / 15G；dense 3 tokens 5 epoch val **0.863058 (+0.08%)** / test **0.809303 (-0.3%)** / 20G；dense fid 62-69 `log1p+clip` 8 epoch val **0.862982 (+0.07%)** / test **0.810003 (-0.2%)** / 13G。dense tokenization 不能再按 val 轻涨推进，除非有更强机制或与 F28 时间特征正交叠加验证。
+  - 🔄 **执行顺序调整**：先固化 F28 shared time 特征 → 做最小 ablation（dow only / hour only / shared+dropout 或 embedding dim 小扫）→ 再尝试与 LR base / emb_skip hash 的正交叠加；pair/dense/int 暂停新增算力。
 - **v2.2（2026-05-03 下午）**：W2.6 v1 weighted pool 实验记录 + 反模式新增：
   - 🔴 **F27 W2.6 v1 weighted pool 失败**：feature/pair-weighted-pool 两组 6 epoch：(a) `log1p` mode（仅 fid 62-66）val +0.000185 / **test -0.00224**；(b) `full` mode（62-66 log1p + 89-91 sigmoid）val +0.000201 / **test -0.00535**。边际加 sigmoid on fid 89-91：val 零 / **test -0.0031**（比 log1p 反向更狠）。3 重失败机制：sigmoid 在 [-1,+1] 上对比度太低（2.5× vs log1p 21×）/ fid 91 全 0 率 48% 触发非系统性噪声 / val/test divergence **第 5 次触发**
   - 🔄 **W2.6 状态调整**：v1 weighted pool 范式（hard-coded log1p / sigmoid 加权 pool on (int, dense) pair）闭环失败；W2.6 整体保留为"待 v2 重新设计"，下次必须换 paradigm：(α) learnable transform（小 MLP / FiLM 替代 hard-coded log1p / sigmoid）；(β) attention-based pooling（query 来自 ns_token，key/value 来自 (id_emb, dense_value)）；(γ) 显式 pair embedding（每 (int, dense) 对一个独立 emb 表，绕开 pool 机制）
@@ -116,6 +122,10 @@
 | F25 | **W1.7 E4 longer + cap 2048 失败 → longer 路径整体闭环（v2.1）**：8 epoch val **0.861047 (-0.0012)** / test 未提交（省配额）/ 19 min/epoch / 12-13G。**比 E2 cap 512（val 0.861586）还差 -0.0005**！4 重失败机制：**(a) 信息瓶颈**：block 1 cross-attn 一次性把全 cap 压缩到 top_k，下游 N-1 个 block 永远在 K 维上 self-attn，单点失败无救（vs transformer 每个 block 都 refresh 全序列）；**(b) head gather 自指退化**：query=最新 K 个 token 跟 key 前 K 重合，cross-attn 倾向 attend 自己，退化成 self-attn + 一点尾巴，后 L-K 个老 token 被低权重看待；**(c) top_k/cap 比例反而下降**：E2 50/512=9.7%，E4 100/2048=**4.9%**——拉 cap 信息密度反而更低；**(d) val/test divergence 即"近因偏置毒药"**：longer 在 train+val（同时间窗）能学"近期 50 token 模式"，test 时间漂移使该模式失效；transformer 因 self-attn 全连接对最新依赖弱，分布偏移容忍度高 | 用户实验 5/2-5/3 + 架构机制深度诊断 | longer 路径整体死；W1.7 子方案 (a) cap 512 longer ❌（F23）+ (b) 长 cap longer ❌（F25）= 全部闭环；唯一剩下 **(c) transformer + 长 cap**（O(L²) 显存待验证 cap 1024 是否爆 19G） |
 | F26 | **Tokenizer 手工划分实验（val 持平，待 test 决策，v2.1）**：group NS tokenizer + num_queries=3 + d_model=96（**3 变量同改** vs baseline 的 rankmixer + 2 query + d_model=64），5 epoch val **0.861597 (-0.0006)** / test 待提交 / 14-15G / 26 min/epoch。val 持平无法独立判决——可能"d_model 加大涨了 + group tokenizer 拖累 = 抵消"，也可能真持平。spec 之前完全没覆盖这条路径（v2.0 把 tokenizer 命名问题略过未扫架构），test 数据有独立信息价值 → **值得花 test 配额校准** | 用户实验 5/2-5/3 | 待 test：≥0.812 → 开新路径继续挖；<0.808 → 闭环组合死路；中间 → 单独扫 d_model=96（rankmixer 不变）排除组合效应 |
 | F27 | **W2.6 v1 weighted pool 失败（v2.2）**：feature/pair-weighted-pool 实施 hard-coded transform weighted pool（fid 62-66 用 log1p 加权 / fid 89-91 用 sigmoid 加权），两组 6 epoch 实验：(a) `log1p` mode（仅 fid 62-66）val **0.862392 (+0.0002)** / test **0.81004 (-0.0022)** / 25 min/epoch / 12-13G；(b) `full` mode（62-66 log1p + 89-91 sigmoid）val **0.862408 (+0.0002)** / test **0.80693 (-0.0054)** / 23 min/epoch / 12-13G。**边际诊断**（full − log1p = 多加 sigmoid on fid 89-91）：val +0.000016（零）/ test **-0.0031**——sigmoid on 89-91 比 log1p on 62-66 反向幅度还大 1.4×。**机制**：(i) sigmoid 把 [-1,+1] 压到 (0.27, 0.73)，权重最大对比 ~2.5× vs log1p 在 fid 62-66 ~21× 对比，区分度低但仍微扰，等于注入噪声；(ii) fid 91 全 0 率 48% → 一半 fallback mean-pool + 一半微扰权重 = 非系统性噪声；(iii) val/test divergence **第 5 次触发**（前 4 次：F19/F21/F23/F25），dense 数值的 train→test 分布漂移让"基于 dense weight 的 pool 选择"在 test 上失效。**这一版 weighted pool 范式整体死**（hard-coded log1p / sigmoid weighted pool on (int, dense) pair） | 用户实验 5/3 + 边际诊断 | W2.6 v1 闭环；W2.6 整体保留，下次必须换 paradigm（learnable transform / attention pooling / 显式 pair embedding 三选一） |
+| F28 | **seq `day_of_week && hour_of_day` shared-parameter 时间特征命中（v2.3）**：6 epoch，val **0.863769 (+0.15%)** / test **0.818879 (+0.6%)** / CPU 20% / GRAM 13G。相比 baseline daily driver test 0.812282，绝对涨约 +0.0066；相比用户记录口径也为近期唯一显著正向。shared 参数说明“时间语义本身”比“每域私有记忆”更稳，可能捕捉 PCVR 周期性与曝光时段偏置 | 用户实验 5/10 | W2.7 从候选升级为最高优先级；先固化实现并做 dow/hour ablation，再尝试与 LR base、hash revive 等正交叠加 |
+| F29 | **seq `day_of_week && hour_of_day` private-parameter 时间特征 val 高但 test 反向（v2.3）**：5 epoch，val **0.863936 (+0.17%)** / test **0.810414 (-0.2%)** / CPU 20% / GRAM 13G。private 参数比 shared val 更高，但 test 从 +0.6% 变 -0.2%，说明 per-domain/time 参数容量可能记住 val 时间窗或 domain-specific 偏移，泛化不如 shared | 用户实验 5/10 | 时间特征后续默认 shared；private 只作为对照，不进入 final 叠加，除非配合强正则后 test 转正 |
+| F30 | **pair 特征第二轮整体失败（v2.3）**：`log1p` 6 epoch val **0.862392 (=)** / test **0.81004 (-0.2%)** / 12-13G / 25min；`log1p+sigmoid` 6 epoch val **0.862408 (=)** / test **0.80693 (-0.6%)** / 12-13G / 23min；pair Transformer 5 epoch val **0.861612 (-0.06%)** / test **0.808058 (-0.4%)** / 13-14G / 25min。结论从 F27 扩展：不仅 hard-coded weighted pool 不行，直接加重 pair 交互模型也没有 test 收益 | 用户实验 5/10 | W2.6 降级为低优先研究项；近期不再为 pair 特征消耗完整训练配额 |
+| F31 | **int/dense 特征工程三组均未通过 test（v2.3）**：int feature gated residual 6 epoch val **0.861419 (-0.1%)** / test **0.808318 (-0.4%)** / 15G；dense feature 3 dense tokens (`d_model=72`) 5 epoch val **0.863058 (+0.08%)** / test **0.809303 (-0.3%)** / 20G；dense fid 62-69 `log1p+clip` 8 epoch val **0.862982 (+0.07%)** / test **0.810003 (-0.2%)** / 13G。dense 3 tokens 还额外带来 20G 显存压力，超过稳定并行预算 | 用户实验 5/10 | 暂停 dense/int tokenization 单独探索；DenseGroupProjector 只有在与 shared time 正交叠加或有更强 v7 证据时再恢复 |
 
 ---
 
@@ -200,23 +210,23 @@ GPT 第二轮 review 暴露 3 处 baseline 行为/代码与文档不一致——
 
 W2 是**基于 W1 诊断结果分支执行**的。结构：必做项 + 条件项。
 
-### v0.3.2 W2 战略调整：信息层优先（v2.0 加 W2.7 时间特征 + W2.8 LR base）
+### v2.3 W2 战略调整：时间特征优先，pair/dense 暂停
 
-W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（reinit threshold=0 是底线）。所以 W2 任务**按以下优先级排序**，不再用原来的扁平列表：
+W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（reinit threshold=0 是底线）。F19/F21/F23/F25/F27/F29/F30/F31 又反复证明：val 轻涨经常对应 test 反向。v2.3 以后 W2 任务按 **test AUC 实证收益** 重排：
 
-| 层级 | 含义 | 任务 | v2.0 后预期 |
+| 层级 | 含义 | 任务 | v2.3 后预期 |
 |---|---|---|---|
-| **信息层（最高优先）** | 给模型更多/更好的信号 | **W1.7 长序列**（最大金矿，EDA 量化：seq_d 90.5% 截断，1.79B tokens 浪费；E4 跑中）、**W1.10 emb_skip hash trick**（EDA 已给方案 + obs/row 通过门槛）、**W2.6 pair 特征**（5/2 晚深化中）、**W2.7 时间特征建模**（xhs 暗示 +1%，spec 之前缺位） | **+0.003~0.015**（W2.7 单项可能就是 +0.01） |
-| **正则化层（最低优先）** | 在已有信号上加防过拟合 | W2.1/2.2/2.3/2.4/2.5 | **+0.0005~0.002**（每个 trick 命中，因已在重正则化高原 + warmup+cosine F19 实测反向） |
-| **超参扫（中优先）**| 不需要新建模就能上分 | **W2.8 LR base value 扫**（xhs 暗示 1.82719e-4，3 次 train 即可） | **+0.001~0.003**（如果 xhs 数值能迁移） |
-| ❌ **死路** | 已闭环不再做 | F20 hyformer_blocks 类 depth scaling、F18 OOV→UNK 改造（Direction 1 死）、F21 raise emb_skip_threshold、F23 cap 512 + LongerEncoder | — |
+| **已命中主线（最高优先）** | 已经拿到 test 同向收益 | **W2.7 shared time feature**（F28：test +0.6%） | 先保住 +0.006~0.007，再用轻量 ablation/叠加争取 +0.002~0.004 |
+| **正交信息层（中优先）** | 不与时间特征强重叠，且有 EDA 支撑 | **W1.10 emb_skip hash trick**（fid 69/47/29，obs/row 通过门槛）、**W2.8 LR base value 扫** | 单项 +0.001~0.003；必须与 F28 组合后看 test |
+| **正则化层（低优先）** | 在已有信号上加防过拟合 | W2.1/2.2/2.3/2.4/2.5 | +0.0005~0.002；只在 final 配方附近做 |
+| **暂停/死路** | 已被近期实验否定 | W2.6 pair weighted pool / pair Transformer（F30）、dense/int tokenization 单独改造（F31）、private time（F29）、F20 depth scaling、F21 raise emb_skip_threshold、F23/F25 LongerEncoder | — |
 
-→ **W2 算力先砸信息层 4 个金矿候选**：W1.7 长序列单项可能 +0.005~0.010；W1.10 4 fid 复活每个 +0.001~0.003；W2.7 时间特征 xhs 暗示 +0.01；W2.6 pair 5/2 晚深化后估。叠加保守估 **+0.010~0.020**，已超 W2 目标。正则化层退化为"如果还有冗余算力顺手做"。
+→ **W2/W3 算力先围绕 F28 打**：第一步复现并锁定 shared time 配置；第二步做最小 ablation 确认收益来源（dow only / hour only / dow+hour shared）；第三步只叠加与它正交的候选（LR base、hash revive、轻量 EMA/SWA）。pair/dense/int 暂停，避免继续把配额花在“val 漂亮、test 掉分”的方向上。
 
-**v2.0 战略闭环**：
-- ✅ 信息层有量化数据支撑（EDA F18）+ 第 4 金矿候选（W2.7 时间特征）
-- ✅ 反模式有实证（F19 / F20 / F21 / F23）
-- 🔥 当前唯一卡点：W1.7 E4 跑结果（决定 longer 路径生死）
+**v2.3 战略闭环**：
+- ✅ 时间特征不再是猜测：F28 已给 test +0.6% 实证
+- ✅ 反模式进一步确认：F19/F21/F23/F25/F27/F29/F30/F31 都说明 val-only 不可靠
+- 🔥 当前唯一主线：围绕 shared time 做 ablation + 正交叠加，目标先把单模型 test 稳在 0.819+，再冲 0.825
 
 ### W2 必做项（不论诊断结果）
 
@@ -227,8 +237,8 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 | W2.3 | **SWA / Checkpoint averaging（正则化层）**：训练结束前最后 N 个 ckpt state_dict 平均 | 半天 | 平均后比单 ckpt 高 ≥ 0.0005（**v0.3.2 期望降**） |
 | W2.4 | **Label smoothing 试点（正则化层）**：BCE label 1.0/0.0 → 0.95/0.05；一次 A/B | 1 次 train | 跟 baseline A/B 比，若 ≥ 0.0005 就保留（**v0.3.2 期望降，且可能跟 reinit 重叠**） |
 | W2.5 | **Sparse 控制收紧（v0.3.1 简化）**：~~`reinit_cardinality_threshold` 扫参~~（W1.0.1 已证 0 胜出，砍掉）；只保留 Adagrad weight_decay 扫 {0, 1e-4, 1e-3, 1e-2} | 2-3 次 train | 找到 sparse_wd 最佳点；预期收益 ≤ 0.001（baseline 已在重正则化高原） |
-| **W2.6**（v0.3.2 新增 / v2.0 待深化 / v2.2 v1 失败）| **(int, dense) pair 特征建模（信息层）**：原始构想——target ∈ user seq 交互特征（4 个 binary 占位）；后续重定义为 `user_int_feats × user_dense_feats` 配对的加权 pool（fid 62-66 + 89-91，详见 `docs/superpowers/specs/2026-05-03-pair-feature-design.md`）。**v2.2 状态：v1 weighted pool 范式失败**（F27，hard-coded log1p / sigmoid 加权 pool 两组实验 val 持平 / test -0.0022 ~ -0.0054）。整体保留任务，下版必须换 paradigm，候选三选一：**(α) learnable transform**（小 MLP / FiLM 替代 hard-coded log1p / sigmoid，让模型自己学权重函数）；**(β) attention-based pooling**（query 来自 ns_token，key/value 来自 (id_emb, dense_value)，pool weight 由 attention score 决定而非 dense 值直接驱动）；**(γ) 显式 pair embedding**（每个 (int, dense) 对一个独立 emb 表，绕开 pool 机制，dense value 作为 emb 索引或 FiLM modulation） | 重新 brainstorm 半天 + 1 天实施 | val + **test 同向**涨 ≥ 0.002（v2.2 教训：纯靠 val 必反向） | dataset.py 不动（v1 已用 forward pass weighted pool 路径）；下版焦点在 model.py 的 transform / pooling 设计；avoid v1 范式（hard-coded log1p / sigmoid weighted pool） |
-| **W2.7**（v2.0 新增）| **时间特征建模（信息层第 4 金矿候选）**：spec 之前缺位，仅在 F11 提到 ts_fid 设置正确 + time_bucket 在用，但具体用法可能浅。xhs 暗示这条路 +1% 以上。**Brainstorm 题目**：(a) `label_time` vs `row_timestamp` 差值（用户行为发生到曝光的时间差，可能是 PCVR 的强信号）；(b) 各 seq ts vs row_timestamp 的 cross-domain 时间对齐（每个 domain 的"最近一次行为发生在多久前"）；(c) 现有 time_bucket（65 桶）是否被各 seq 充分使用 vs 只是 padding；(d) 可学习时间编码 vs RoPE vs 时间分桶 PE。需要先 brainstorm 出 ≥ 1 个具体方案再实施 | brainstorm 半天 + 实施 1-2 天 | val + test 同向涨 ≥ 0.003；理想 +0.008~0.015（xhs 暗示 +1%） | spec 缺位说明前面没投入分析；可能跟 W2.6 pair 特征有重叠（target 跟 seq 的时间距离也是 pair 信号） |
+| **W2.6**（v2.3 降级）| **(int, dense) pair 特征建模（暂停）**：F27/F30 已覆盖 hard-coded `log1p`、`log1p+sigmoid`、pair Transformer 三条路线，test 分别 -0.2% / -0.6% / -0.4%。结论：pair 信号即使存在，当前建模方式也会放大 val/test divergence。保留文档，不再排完整训练 | 0（暂停） | 只有出现明确新机制且能解释 F30 失败原因时才恢复 | 禁止再用 val 持平/轻涨作为恢复理由 |
+| **W2.7**（v2.3 最高优先）| **时间特征建模（shared 参数主线）**：F28 `seq day_of_week && hour_of_day(shared_parameter)` 已给 6 epoch val **0.863769** / test **0.818879**。下一步不是再 brainstorm，而是做工程固化 + ablation：`day_of_week` only、`hour_of_day` only、`dow+hour shared` 复现、shared time embedding dim 小扫、轻量 dropout/weight_decay 防止 F29 private 化过拟合 | 3-5 次 train + 2-3 次 test | 保底复现 test ≥ 0.818；找到不低于 F28 的更小/更稳配置；与最终配方叠加后不掉 test | private 参数已证 val 高 test 掉（F29），默认不用；所有 ablation 必须 test 校准 |
 | **W2.8**（v2.0 新增）| **LR base value 扫**：F19 闭环的是 schedule（warmup+cosine 反向），不是 base LR。baseline `lr_dense=1e-4 / lr_sparse=0.05` 没扫过 base value。xhs 暗示 lr=1.82719e-4 有奇效（非常具体的数值，可能反映他们扫过）。**A/B 设计**：dense lr ∈ {1e-4 (baseline), 1.82719e-4 (xhs), 3e-4 (上探)} × sparse lr 不变；只扫 dense 因为 sparse 用 Adagrad 对 lr 不敏感 | 3 次 train ≈ 半天 | val + test 同向涨 ≥ 0.001；F19 教训：必须看 test 不能纯靠 val | 比正则化扫参单点 ROI 高（已知 LR 有具体提示数）；但风险是 1.82719e-4 是别人架构的最优，搬到我们 baseline 不一定迁移 |
 
 ### W2 条件项（看 W1 诊断哪个分支命中）
@@ -241,18 +251,19 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 | W1.7 显存试点显示能开更长序列 + 不严重过拟合 | 把 seq_a/b 开到 384 或 512，重跑 baseline | 3 小时 |
 | W1.3 分桶诊断显示长尾 user/item 子群 AUC 显著低 | 长尾子群 oversample 或 loss reweight | 1 天 |
 
-### W2 执行节奏（v0.3.2 调整：信息层先行）
+### W2 执行节奏（v2.3 调整：shared time 先行）
 
-- **D1（5/9）**：W2.6 "target ∈ user seq" 交互特征（dataset 改 + 1 次 train） + W1.7 长序列试点（如果 W1.0.3 已修）
-- **D2-D3（5/10-5/11）**：5 个正则化组合排队跑（W2.1） + 手写 EMA / SWA 代码
-- **D4（5/12）**：拿正则化最佳组合叠加 EMA / SWA 跑一次
-- **D5-D6（5/13-5/14）**：根据 W1 诊断分支，做条件项里命中的 1-2 个
-- **D7（5/15）**：把 W2 所有胜出项叠到一个 "集大成" 配置，跑一次作为 W3 起点
+- **D1**：复现 F28 shared time 配置，确认 test ≥ 0.818；把 run 配置固定成新的 working baseline
+- **D2-D3**：时间特征 ablation：`day_of_week` only、`hour_of_day` only、`dow+hour shared` 复跑；必要时扫 time embedding dim / dropout
+- **D4**：在 F28 配方上叠 W2.8 LR base value（1.82719e-4）或轻量 EMA/SWA，单项看 test
+- **D5-D6**：只做正交信息层：fid 69 / fid 47 hash revive 与 F28 叠加 A/B；掉 test 立即回退
+- **D7**：把 F28 + 所有 test 正向项合成 W3 起点；pair/dense/int 不进入集成
 
 ### W2 结束判定
 
-- 一个比 baseline test AUC 涨 ≥ 0.010 的单模型（保守）；理想 +0.015
-- 至少 3 个独立有效的 trick（每个 ≥ 0.002）
+- 一个稳定复现 test AUC ≥ 0.819 的单模型（F28 已接近达成）
+- 至少 1 个在 F28 基础上仍能正向叠加的独立 trick（LR / hash revive / EMA-SWA 三选一）
+- final 候选必须以 test AUC 判定；val 只用于提前止损
 
 ### W2 算力预算
 
@@ -286,7 +297,7 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 
 ---
 
-## 接续动作（v2.0 增量更新——5/3 早状态）
+## 接续动作（v2.3 增量更新——5/10 状态）
 
 ### ✅ 已完成（v0.1 → v0.3.2）
 
@@ -322,30 +333,38 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 15. **feature/longer-gather-fix merge 进 main**（独立 commit）：分支 run.sh 默认 = baseline transformer，可安全 merge；提供 env var 切换 W1.7 实验
 16. **W2.6 v1 weighted pool 失败**（5/3 上午）：feature/pair-weighted-pool 两组 6 epoch：log1p (62-66) val +0.0002 / test -0.0022；full (62-66+89-91 sigmoid) val +0.0002 / test -0.0054；val/test divergence 第 5 次触发 → v1 范式死，W2.6 整体保留待换 paradigm（F27）
 
-### 🔥 立刻做（5/3，按 ROI 排序）
+### ✅ v2.3 新增已完成
 
-1. **Tokenizer F26 上 test 校准**（0 算力，1 次 test 提交）：只是提交一个 ckpt，立刻知道 group + query 3 + d_model 96 这个组合到底是真持平还是假持平
-2. **W1.7 子方案 c 试点：transformer + cap 1024（仅 seq_d）**（首要算力候选）：先 nvidia-smi 看显存，cap 1024 全 4 domain 大概率爆 19G；建议只拉 seq_d 一家；如果不爆，6 epoch 跑一次看 val + test
-3. **W2.6 v2 重新 brainstorm（v1 已死，F27）**（feature/pair-weighted-pool 仍可复用）：v1 hard-coded log1p / sigmoid weighted pool 范式闭环；v2 必须换 paradigm，候选 (α) learnable transform / (β) attention pool / (γ) 显式 pair embedding 三选一
-4. **W1.10 emb_skip 复活 hash trick 路径 A/B**（独立可并行）：
+17. **W2.7 shared time feature 命中**（5/10）：seq `day_of_week && hour_of_day(shared_parameter)` 6 epoch val 0.863769 / test 0.818879 / 13G → 近期唯一 test 明显正向，升级为主线（F28）
+18. **W2.7 private time 对照失败**（5/10）：private-parameter val 0.863936 高于 shared，但 test 0.810414 反向 → private 容量过拟合，不进 final（F29）
+19. **pair feature 第二轮失败**（5/10）：log1p、log1p+sigmoid、pair Transformer 三组 test 全反向 → W2.6 暂停（F30）
+20. **int/dense feature engineering 失败**（5/10）：gated residual、3 dense tokens、fid 62-69 log1p+clip 全部 test 反向，dense 3 tokens 还升到 20G → 暂停（F31）
+
+### 🔥 立刻做（按 ROI 排序）
+
+1. **固化 F28 shared time 配置**：复跑一次或用同配置补 test，确认 test ≥ 0.818；这就是新的 working baseline
+2. **时间特征最小 ablation**：`day_of_week` only、`hour_of_day` only、`dow+hour shared` 复跑；目标是确认收益来自哪一半，减少 final 配方的不确定性
+3. **F28 + W2.8 LR base value 叠加**：只在 shared time baseline 上扫 `lr_dense=1.82719e-4`；如果 test 正向再进入 final
+4. **W1.10 emb_skip 复活 hash trick路径 A/B**（必须叠在 F28 baseline 上看 test）：
    - 优先 **fid 69 hash 171K**（obs/row=1046）
    - 然后 **fid 47 hash 100K**（obs/row=3148）
    - 可选 **fid 29 freq truncate top-100K + UNK**
-5. **W2.7 时间特征建模 brainstorm**（v2.0 新增）：(a) `label_time` vs `row_timestamp` 差值；(b) seq ts vs row_timestamp 各 domain 时间对齐；(c) 现有 time_bucket 用法是否浅；先 brainstorm 设计再实施
+5. **轻量 EMA/SWA 只做 final 近邻验证**：不要重新开大矩阵扫参；只问“能不能在 F28 上再多 +0.0005~0.001 test”
 
-### 🔧 中优先（5/4-5/5）
+### 🔧 中优先
 
-6. **W2.8 LR base value 扫**（v2.0 新增）：dense lr ∈ {1e-4 baseline, 1.82719e-4 xhs, 3e-4 上探}；3 次 train 半天搞定
-7. **W1.0.2 加 `--dense_weight_decay` CLI 参数**（1h）—— W2.1 扫参前置，但 W2.1 优先级在 v0.3.3 已经降低，不急
-8. **W1.9 row group 时间分布检查**（1h）—— 验证 train tail vs val head 的时间 gap，跟 F19 / F21 / F23 val/test divergence 对照
+6. **Tokenizer F26 上 test 校准**（0 算力，1 次 test 提交）：仍可做，但优先级低于 F28 ablation
+7. **W1.0.2 加 `--dense_weight_decay` CLI 参数**（1h）—— final 正则化小扫前置
+8. **W1.9 row group 时间分布检查**（1h）—— 用来解释 F28 为什么有效，以及 F29/F30/F31 为什么 val/test 分裂
 
 ### 📝 低优先 / 工程债
 
 9. 修 `train.py:158` CLI help 文档错误（"0=never reset" → "0=most aggressive"）
 10. profile_data.py 进度日志 bug（modulo 不对齐，第二次没打 log）
 11. **未来开 causal 前必查 F24**（bug 2 causal mask 实现）
+12. W1.7 子方案 c（transformer + cap 1024）暂缓：F28 已经给出更便宜的 +0.6% test，长序列 O(L²) 风险高，除非 F28 叠加空间耗尽再恢复
 
-### 🚫 不再做（v0.3.3 + v0.3.4 + v0.3.5 + v2.1 闭环）
+### 🚫 不再做（v2.3 闭环）
 
 - ❌ Direction 1 OOV→UNK 改造（F18 实测无 ROI）
 - ❌ 任何 d_model / num_layers / num_blocks 类 depth scaling（F20 实证；注意 F26 d_model=96 待 test 决定，不直接套这条）
@@ -354,13 +373,17 @@ W1.0.1 信号修正后明确：baseline 已在"过拟合悬崖"上走钢丝（re
 - ❌ **raise emb_skip_threshold 直接复活全表**（F21 实证；obs/row 必然 < 1000 不通过门槛）
 - ❌ **LongerEncoder 整条路径**（F23 cap 512 死 + F25 长 cap 也死，4 重机制诊断完整）
 - ❌ **hard-coded log1p / sigmoid weighted pool on (int, dense) pair**（F27 v1 范式实证；下版 W2.6 必须换 paradigm：learnable transform / attention pool / 显式 pair emb）
+- ❌ **pair Transformer / pair 特征完整训练**（F30，test -0.4%，短期不再投入）
+- ❌ **private-parameter 时间特征**（F29，val 最高但 test -0.2%；时间特征默认 shared）
+- ❌ **dense 3 tokens / fid 62-69 log1p+clip / int gated residual 单独路线**（F31，val 轻涨无效且 3 dense tokens 显存到 20G）
 
-### 决策点（W1.7 子方案 c 跑完后）
+### 决策点（F28 ablation 跑完后）
 
-W1.7 子方案 c (transformer + 长 cap) 是 W1.7 信息层最后一根稻草：
-- 涨 ≥ 0.005：W1.7 信息层 leg 活了
-- 持平：长序列收益跟 transformer O(L²) 代价抵消
-- 跌：W1.7 整条 leg 死，信息层金矿候选从 4 个减到 3 个（W1.10 / W2.6 / W2.7）
+F28 shared time 是当前主线，ablation 决定最终配方：
+- `dow+hour shared` 复现 ≥0.818：设为新 baseline，后续所有 trick 都叠在它上面测
+- `hour only` 接近 shared：final 可用更小实现，降低参数/过拟合风险
+- `dow only` / `hour only` 都明显低：说明二者交互重要，保留 joint token
+- 复现掉到 <0.816：优先查随机种子/epoch/提交波动，再决定是否做 2 seed 平均
 
 
 ---
@@ -642,5 +665,3 @@ obs/row = total_observations(fid) / 复活后表的 row 数
 3. **fid 34 是边缘 case**：305 obs/row 在门槛附近，加上 EDA 判信号弱，建议保 skip 不再投入 A/B
 
 **新规则**：写复活方案前先算 obs/row，< 1000 直接砍掉这条路径，不要浪费 A/B 配额。
-
-
