@@ -230,6 +230,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--split_user_int_shared_fids', action='store_true',
+                        help='In rankmixer mode, extract user-int fids '
+                             '62/63/64/65/66/89/90/91 into one dedicated MLP '
+                             'token and split the remaining user-int features '
+                             'across user_ns_tokens-1 RankMixer tokens.')
+    parser.add_argument('--use_dense_group_projector', action='store_true',
+                        help='Project TAAC user dense features into two tokens: '
+                             'fid 61/87 and fid 62/63/64/65/66/89/90/91. '
+                             'When disabled, use the baseline single dense token.')
 
     args = parser.parse_args()
 
@@ -318,9 +327,13 @@ def main() -> None:
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
+        "user_dense_feature_specs": pcvr_dataset.user_dense_schema.entries,
+        "item_dense_feature_specs": pcvr_dataset.item_dense_schema.entries,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
+        "user_int_feature_ids": pcvr_dataset.user_int_schema.feature_ids,
+        "item_int_feature_ids": pcvr_dataset.item_int_schema.feature_ids,
         "d_model": args.d_model,
         "emb_dim": args.emb_dim,
         "num_queries": args.num_queries,
@@ -342,6 +355,8 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "split_user_int_shared_fids": args.split_user_int_shared_fids,
+        "use_dense_group_projector": args.use_dense_group_projector,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

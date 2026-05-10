@@ -20,8 +20,10 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 5 \
+    --user_ns_tokens 4 \
     --item_ns_tokens 2 \
+    --split_user_int_shared_fids \
+    --use_dense_group_projector \
     --num_queries 2 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
@@ -38,8 +40,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
 # Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).
-# With d_model=64 and num_ns=12 (7 user_int + 1 user_dense + 4 item_int),
-# only num_queries=1 satisfies d_model % T == 0 (T = num_queries*4 + num_ns).
+# With d_model=64 and num_ns=13 (7 user_int + 2 user_dense + 4 item_int),
+# rank_mixer_mode=full has no valid num_queries because T=4*num_queries+13
+# does not divide 64 for positive num_queries. Use ffn_only/none or adjust
+# d_model before enabling this block.
 # To switch, comment out the block above and uncomment the block below.
 #
 # python3 -u "${SCRIPT_DIR}/train.py" \

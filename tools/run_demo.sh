@@ -34,8 +34,10 @@ export TRAIN_TF_EVENTS_PATH="${PROJECT_ROOT}/runs/tensorboard"
     --dropout_rate 0.01 \
     --rank_mixer_mode full \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 5 \
+    --user_ns_tokens 4 \
     --item_ns_tokens 2 \
+    --split_user_int_shared_fids \
+    --use_dense_group_projector \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --reinit_sparse_after_epoch 999 \

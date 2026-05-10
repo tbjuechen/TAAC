@@ -1205,6 +1205,174 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class SplitUserIntNSTokenizer(nn.Module):
+    """User-int tokenizer with one selected-fid token plus RankMixer tokens."""
+
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        feature_ids: List[int],
+        special_fids: List[int],
+        groups: List[List[int]],
+        emb_dim: int,
+        d_model: int,
+        num_regular_tokens: int,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        super().__init__()
+        self.feature_specs = feature_specs
+        self.feature_ids = feature_ids
+        self.special_fids = special_fids
+        self.emb_dim = emb_dim
+        self.num_regular_tokens = num_regular_tokens
+        self.emb_skip_threshold = emb_skip_threshold
+
+        fid_to_idx = {fid: idx for idx, fid in enumerate(feature_ids)}
+        self.special_indices = [fid_to_idx[fid] for fid in special_fids]
+        special_index_set = set(self.special_indices)
+        self.regular_groups = [
+            [fid_idx for fid_idx in group if fid_idx not in special_index_set]
+            for group in groups
+        ]
+        self.regular_groups = [group for group in self.regular_groups if group]
+
+        embs = []
+        for vs, offset, length in feature_specs:
+            skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
+            if skip:
+                embs.append(None)
+            else:
+                embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+        self.embs = nn.ModuleList([e for e in embs if e is not None])
+        self._emb_index = []
+        real_idx = 0
+        for e in embs:
+            if e is not None:
+                self._emb_index.append(real_idx)
+                real_idx += 1
+            else:
+                self._emb_index.append(-1)
+
+        special_dim = len(self.special_indices) * emb_dim
+        self.special_proj = nn.Sequential(
+            nn.Linear(special_dim, d_model * 2),
+            nn.SiLU(),
+            nn.Linear(d_model * 2, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+        total_regular_fids = sum(len(g) for g in self.regular_groups)
+        total_regular_dim = total_regular_fids * emb_dim
+        self.chunk_dim = math.ceil(total_regular_dim / num_regular_tokens)
+        self.padded_total_dim = self.chunk_dim * num_regular_tokens
+        self._pad_size = self.padded_total_dim - total_regular_dim
+        self.token_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.chunk_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for _ in range(num_regular_tokens)
+        ])
+
+        logging.info(
+            f"SplitUserIntNSTokenizer: special_fids={special_fids}, "
+            f"regular_fids={total_regular_fids}, special_dim={special_dim}, "
+            f"regular_chunk_dim={self.chunk_dim}, regular_tokens={num_regular_tokens}, "
+            f"pad={self._pad_size}"
+        )
+
+    def _embed_feature(self, int_feats: torch.Tensor, fid_idx: int) -> torch.Tensor:
+        vs, offset, length = self.feature_specs[fid_idx]
+        emb_real_idx = self._emb_index[fid_idx]
+        if emb_real_idx == -1:
+            return int_feats.new_zeros(int_feats.shape[0], self.emb_dim)
+
+        emb_layer = self.embs[emb_real_idx]
+        if length == 1:
+            return emb_layer(int_feats[:, offset].long())
+
+        vals = int_feats[:, offset:offset + length].long()
+        emb_all = emb_layer(vals)
+        mask = (vals != 0).float().unsqueeze(-1)
+        count = mask.sum(dim=1).clamp(min=1)
+        return (emb_all * mask).sum(dim=1) / count
+
+    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+        special_embs = [
+            self._embed_feature(int_feats, fid_idx)
+            for fid_idx in self.special_indices
+        ]
+        special_token = F.silu(
+            self.special_proj(torch.cat(special_embs, dim=-1))
+        ).unsqueeze(1)
+
+        regular_embs = []
+        for group in self.regular_groups:
+            for fid_idx in group:
+                regular_embs.append(self._embed_feature(int_feats, fid_idx))
+
+        cat_emb = torch.cat(regular_embs, dim=-1)
+        if self._pad_size > 0:
+            cat_emb = F.pad(cat_emb, (0, self._pad_size))
+
+        regular_tokens = []
+        for chunk, proj in zip(cat_emb.split(self.chunk_dim, dim=-1), self.token_projs):
+            regular_tokens.append(F.silu(proj(chunk)).unsqueeze(1))
+
+        return torch.cat([special_token] + regular_tokens, dim=1)
+
+
+class DenseGroupProjector(nn.Module):
+    """Projects selected dense feature-id groups into NS tokens."""
+
+    def __init__(
+        self,
+        feature_specs: List[Tuple[int, int, int]],
+        groups: List[List[int]],
+        d_model: int,
+    ) -> None:
+        super().__init__()
+        self.feature_specs = feature_specs
+        self.groups = groups
+
+        fid_to_spec = {fid: (offset, length) for fid, offset, length in feature_specs}
+        self._group_slices = []
+        for group in groups:
+            slices = [fid_to_spec[fid] for fid in group]
+            self._group_slices.append(slices)
+
+        self.group_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(sum(length for _, length in slices), d_model),
+                nn.LayerNorm(d_model),
+            )
+            for slices in self._group_slices
+        ])
+
+        logging.info(
+            "DenseGroupProjector: "
+            + ", ".join(
+                f"group={group}, dim={sum(length for _, length in slices)}"
+                for group, slices in zip(groups, self._group_slices)
+            )
+        )
+
+    @property
+    def num_tokens(self) -> int:
+        return len(self.groups)
+
+    def forward(self, dense_feats: torch.Tensor) -> torch.Tensor:
+        tokens = []
+        for slices, proj in zip(self._group_slices, self.group_projs):
+            group_feats = [
+                dense_feats[:, offset:offset + length]
+                for offset, length in slices
+            ]
+            cat_feats = torch.cat(group_feats, dim=-1)
+            tokens.append(F.silu(proj(cat_feats)).unsqueeze(1))
+        return torch.cat(tokens, dim=1)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1223,6 +1391,10 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_int_feature_ids: Optional[List[int]] = None,
+        item_int_feature_ids: Optional[List[int]] = None,
+        user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
+        item_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1246,6 +1418,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        split_user_int_shared_fids: bool = False,
+        use_dense_group_projector: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1290,14 +1464,35 @@ class PCVRHyFormer(nn.Module):
                 user_ns_tokens = len(user_ns_groups)
             if item_ns_tokens <= 0:
                 item_ns_tokens = len(item_ns_groups)
-            self.user_ns_tokenizer = RankMixerNSTokenizer(
-                feature_specs=user_int_feature_specs,
-                groups=user_ns_groups,
-                emb_dim=emb_dim,
-                d_model=d_model,
-                num_ns_tokens=user_ns_tokens,
-                emb_skip_threshold=emb_skip_threshold,
-            )
+            split_user_int_fids = [62, 63, 64, 65, 66, 89, 90, 91]
+            user_int_fid_set = set(user_int_feature_ids or [])
+            if (split_user_int_shared_fids and user_ns_tokens > 1
+                    and set(split_user_int_fids).issubset(user_int_fid_set)):
+                self.user_ns_tokenizer = SplitUserIntNSTokenizer(
+                    feature_specs=user_int_feature_specs,
+                    feature_ids=user_int_feature_ids or [],
+                    special_fids=split_user_int_fids,
+                    groups=user_ns_groups,
+                    emb_dim=emb_dim,
+                    d_model=d_model,
+                    num_regular_tokens=user_ns_tokens - 1,
+                    emb_skip_threshold=emb_skip_threshold,
+                )
+            else:
+                if split_user_int_shared_fids:
+                    logging.warning(
+                        "split_user_int_shared_fids is enabled but the expected "
+                        "TAAC user-int fids are unavailable or user_ns_tokens <= 1; "
+                        "falling back to baseline RankMixer user-int tokenizer."
+                    )
+                self.user_ns_tokenizer = RankMixerNSTokenizer(
+                    feature_specs=user_int_feature_specs,
+                    groups=user_ns_groups,
+                    emb_dim=emb_dim,
+                    d_model=d_model,
+                    num_ns_tokens=user_ns_tokens,
+                    emb_skip_threshold=emb_skip_threshold,
+                )
             num_user_ns = user_ns_tokens
 
             self.item_ns_tokenizer = RankMixerNSTokenizer(
@@ -1314,23 +1509,50 @@ class PCVRHyFormer(nn.Module):
 
         # User dense feature projection (if available)
         self.has_user_dense = user_dense_dim > 0
+        self.user_dense_num_tokens = 0
         if self.has_user_dense:
-            self.user_dense_proj = nn.Sequential(
-                nn.Linear(user_dense_dim, d_model),
-                nn.LayerNorm(d_model),
+            dense_emb_group = [61, 87]
+            dense_other_group = [62, 63, 64, 65, 66, 89, 90, 91]
+            dense_fids = {
+                fid for fid, _, _ in (user_dense_feature_specs or [])
+            }
+            if (use_dense_group_projector
+                    and set(dense_emb_group + dense_other_group).issubset(dense_fids)):
+                self.user_dense_proj = DenseGroupProjector(
+                    feature_specs=user_dense_feature_specs or [],
+                    groups=[dense_emb_group, dense_other_group],
+                    d_model=d_model,
+                )
+            else:
+                if use_dense_group_projector:
+                    logging.warning(
+                        "use_dense_group_projector is enabled but the expected "
+                        "TAAC dense fids are unavailable; falling back to a "
+                        "single dense NS token."
+                    )
+                self.user_dense_proj = nn.Sequential(
+                    nn.Linear(user_dense_dim, d_model),
+                    nn.LayerNorm(d_model),
+                )
+            self.user_dense_num_tokens = (
+                self.user_dense_proj.num_tokens
+                if isinstance(self.user_dense_proj, DenseGroupProjector)
+                else 1
             )
 
         # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
+        self.item_dense_num_tokens = 0
         if self.has_item_dense:
             self.item_dense_proj = nn.Sequential(
                 nn.Linear(item_dense_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+            self.item_dense_num_tokens = 1
 
         # Total NS token count
-        self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+        self.num_ns = (num_user_ns + self.user_dense_num_tokens
+                       + num_item_ns + self.item_dense_num_tokens)
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1649,6 +1871,11 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
+    def _project_user_dense_tokens(self, user_dense_feats: torch.Tensor) -> torch.Tensor:
+        if isinstance(self.user_dense_proj, DenseGroupProjector):
+            return self.user_dense_proj(user_dense_feats)
+        return F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -1657,7 +1884,7 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
+            user_dense_tok = self._project_user_dense_tokens(inputs.user_dense_feats)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
@@ -1700,7 +1927,7 @@ class PCVRHyFormer(nn.Module):
 
         ns_parts = [user_ns]
         if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            user_dense_tok = self._project_user_dense_tokens(inputs.user_dense_feats)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
         if self.has_item_dense:
