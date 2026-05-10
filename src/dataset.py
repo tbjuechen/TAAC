@@ -16,8 +16,6 @@ import logging
 import random
 import json
 import gc
-import inspect
-from functools import partial
 
 import numpy as np
 import pyarrow as pa
@@ -108,14 +106,6 @@ class FeatureSchema:
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-
-def _seed_worker(worker_id: int, base_seed: int) -> None:
-    """Seed Python, NumPy, and Torch RNGs inside a DataLoader worker."""
-    worker_seed = (int(base_seed) + int(worker_id)) % (2**32)
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
-    torch.manual_seed(worker_seed)
-
 # Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
 BUCKET_BOUNDARIES = np.array([
     5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
@@ -163,7 +153,6 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
-        seed: int = 42,
     ) -> None:
         """
         Args:
@@ -181,7 +170,6 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
-            seed: base seed used for deterministic per-worker shuffling.
         """
         super().__init__()
 
@@ -200,8 +188,6 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
-        self.seed = int(seed)
-        self._iter_epoch = 0
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -351,16 +337,9 @@ class PCVRParquetDataset(IterableDataset):
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         worker_info = torch.utils.data.get_worker_info()
         rg_list = self._rg_list
-        worker_id = 0
         if worker_info is not None and worker_info.num_workers > 1:
-            worker_id = worker_info.id
             rg_list = [rg for i, rg in enumerate(rg_list)
                        if i % worker_info.num_workers == worker_info.id]
-
-        epoch = self._iter_epoch
-        self._iter_epoch += 1
-        shuffle_generator = torch.Generator()
-        shuffle_generator.manual_seed(self.seed + worker_id + epoch * 100_003)
 
         buffer: List[Dict[str, Any]] = []
         for file_path, rg_idx, _ in rg_list:
@@ -370,21 +349,19 @@ class PCVRParquetDataset(IterableDataset):
                 if self.shuffle and self.buffer_batches > 1:
                     buffer.append(batch_dict)
                     if len(buffer) >= self.buffer_batches:
-                        yield from self._flush_buffer(buffer, shuffle_generator)
+                        yield from self._flush_buffer(buffer)
                         buffer = []
                 else:
                     yield batch_dict
 
         if buffer:
-            yield from self._flush_buffer(buffer, shuffle_generator)
+            yield from self._flush_buffer(buffer)
 
         del buffer
         gc.collect()
 
     def _flush_buffer(
-        self,
-        buffer: List[Dict[str, Any]],
-        shuffle_generator: torch.Generator,
+        self, buffer: List[Dict[str, Any]]
     ) -> Iterator[Dict[str, Any]]:
         """Concatenate the buffered batches, shuffle at the row level, then
         re-slice and yield batch-sized chunks.
@@ -397,10 +374,7 @@ class PCVRParquetDataset(IterableDataset):
             else:
                 non_tensor_keys[k] = buffer[0][k]
         total_rows = merged['label'].shape[0]
-        rand_idx = (
-            torch.randperm(total_rows, generator=shuffle_generator)
-            if self.shuffle else torch.arange(total_rows)
-        )
+        rand_idx = torch.randperm(total_rows) if self.shuffle else torch.arange(total_rows)
         for i in range(0, total_rows, self.batch_size):
             end = min(i + self.batch_size, total_rows)
             batch: Dict[str, Any] = {k: v[rand_idx[i:end]] for k, v in merged.items()}
@@ -755,20 +729,13 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
-        seed=seed,
     )
 
     use_cuda = torch.cuda.is_available()
     _train_kw = {}
-    train_generator = torch.Generator()
-    train_generator.manual_seed(seed)
-    _train_kw['generator'] = train_generator
     if num_workers > 0:
         _train_kw['persistent_workers'] = True
         _train_kw['prefetch_factor'] = 2
-        _train_kw['worker_init_fn'] = partial(_seed_worker, base_seed=seed)
-        if 'in_order' in inspect.signature(DataLoader).parameters:
-            _train_kw['in_order'] = True
 
     train_loader = DataLoader(
         train_dataset, batch_size=None,
