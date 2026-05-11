@@ -19,7 +19,7 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS, NUM_DELTA_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -141,6 +141,31 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--per_domain_time_embeddings', action='store_true', default=False,
+                        help='Use one recency time-bucket embedding table per sequence '
+                             'domain while keeping the global bucket boundaries unchanged.')
+    parser.add_argument('--domain_time_residual_embeddings', action='store_true', default=False,
+                        help='Add zero-initialized per-domain residual time embeddings on '
+                             'top of the shared recency time embedding.')
+    parser.add_argument('--use_time_summary_features', action='store_true', default=False,
+                        help='Add one NS token from per-domain sequence time summary features '
+                             '(last/oldest/span/density/window counts).')
+    parser.add_argument('--use_seq_periodic_time_features', action='store_true', default=False,
+                        help='Concatenate hour-of-day and day-of-week embeddings to each '
+                             'sequence token before the per-domain sequence projection.')
+    parser.add_argument('--use_seq_hour_of_day_feature', action='store_true', default=False,
+                        help='Concatenate hour-of-day embeddings to each sequence token.')
+    parser.add_argument('--use_seq_day_of_week_feature', action='store_true', default=False,
+                        help='Concatenate day-of-week embeddings to each sequence token.')
+    parser.add_argument('--per_domain_seq_periodic_time_features', action='store_true', default=False,
+                        help='Use per-domain hour-of-day and day-of-week embeddings for '
+                             'sequence periodic time features.')
+    parser.add_argument('--use_delta_buckets', action='store_true', default=False,
+                        help='Enable per-domain delta-t bucket embedding (W2.7). '
+                             'Models adjacent-token time gaps within sequences. '
+                             'Bucket count is determined by dataset.NUM_DELTA_BUCKETS.')
+    parser.add_argument('--no_delta_buckets', dest='use_delta_buckets', action='store_false',
+                        help='Disable the delta-t bucket embedding')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -247,6 +272,10 @@ def parse_args() -> argparse.Namespace:
     args.ckpt_dir = os.environ.get('TRAIN_CKPT_PATH', args.ckpt_dir)
     args.log_dir = os.environ.get('TRAIN_LOG_PATH', args.log_dir)
     args.tf_events_dir = os.environ.get('TRAIN_TF_EVENTS_PATH')
+    if args.per_domain_time_embeddings and args.domain_time_residual_embeddings:
+        parser.error(
+            "--per_domain_time_embeddings and --domain_time_residual_embeddings "
+            "are mutually exclusive")
 
     return args
 
@@ -347,6 +376,14 @@ def main() -> None:
         "seq_longer_gather_side": args.longer_gather_side,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "per_domain_time_embeddings": args.per_domain_time_embeddings,
+        "domain_time_residual_embeddings": args.domain_time_residual_embeddings,
+        "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
+        "use_time_summary_features": args.use_time_summary_features,
+        "use_seq_hour_of_day_feature": args.use_seq_hour_of_day_feature,
+        "use_seq_day_of_week_feature": args.use_seq_day_of_week_feature,
+        "use_seq_periodic_time_features": args.use_seq_periodic_time_features,
+        "per_domain_seq_periodic_time_features": args.per_domain_seq_periodic_time_features,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
@@ -360,6 +397,47 @@ def main() -> None:
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
+    if model.num_time_buckets > 0 and model.per_domain_time_embeddings:
+        n_domains = len(model.seq_domains)
+        logging.info(
+            f"W2.7.1 per-domain recency time embeddings enabled: "
+            f"{n_domains} x {NUM_TIME_BUCKETS} x {args.d_model}, "
+            f"+{(n_domains - 1) * NUM_TIME_BUCKETS * args.d_model} params vs shared"
+        )
+    if model.num_time_buckets > 0 and model.domain_time_residual_embeddings:
+        n_domains = len(model.seq_domains)
+        logging.info(
+            f"W2.7.2 domain residual recency time embeddings enabled: "
+            f"shared + zero-init residual ({n_domains} x {NUM_TIME_BUCKETS} x "
+            f"{args.d_model}), +{n_domains * NUM_TIME_BUCKETS * args.d_model} params"
+        )
+    if model.use_time_summary_features:
+        logging.info(
+            f"W2.8 time summary NS token enabled: "
+            f"{len(model.seq_domains) * 8} dims -> 1 x {args.d_model}"
+        )
+    if model.use_seq_periodic_time_features:
+        periodic_scope = (
+            "per-domain"
+            if model.per_domain_seq_periodic_time_features
+            else "shared"
+        )
+        periodic_parts = []
+        if model.use_seq_hour_of_day_feature:
+            periodic_parts.append("hour-of-day")
+        if model.use_seq_day_of_week_feature:
+            periodic_parts.append("day-of-week")
+        logging.info(
+            f"W2.9 seq periodic time features enabled ({periodic_scope}): concat "
+            f"{' + '.join(periodic_parts)} embeddings before seq projection"
+        )
+    if model.num_delta_buckets > 0:
+        n_domains = len(model.seq_domains)
+        logging.info(
+            f"W2.7 delta_buckets enabled: NUM_DELTA_BUCKETS={NUM_DELTA_BUCKETS}, "
+            f"per-domain ({n_domains} x {NUM_DELTA_BUCKETS} x {args.d_model}), "
+            f"+{n_domains * NUM_DELTA_BUCKETS * args.d_model} params"
+        )
     if args.use_compile:
         if hasattr(torch, 'compile'):
             try:

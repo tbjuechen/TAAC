@@ -131,6 +131,20 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Delta-t bucket boundaries (W2.7): log2 spacing from 1s to ~34 years.
+# 31 boundaries -> bucket ids in [1..32]; padding=0; total 33 slots.
+# delta_t[i] = seq_ts[i] - seq_ts[i+1]: gap between adjacent tokens
+# (reverse-order seq, pos 0 = most recent). Encodes user behavior pacing
+# (misclick / deep-browse / cross-session return).
+DELTA_BOUNDARIES = np.array([
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
+    4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288,
+    1048576, 2097152, 4194304, 8388608, 16777216, 33554432,
+    67108864, 134217728, 268435456, 536870912, 1073741824,
+], dtype=np.int64)
+NUM_DELTA_BUCKETS = len(DELTA_BOUNDARIES) + 2  # +1 padding(0), +1 upper-bound = 33
+PERIODIC_TIME_UTC_OFFSET_SECONDS = 8 * 3600
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -220,12 +234,20 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
+        self._buf_seq_db = {}
+        self._buf_seq_hour = {}
+        self._buf_seq_dow = {}
         self._buf_seq_lens = {}
+        self._time_summary_dim = len(self.seq_domains) * 8
+        self._buf_time_summary = np.zeros((B, self._time_summary_dim), dtype=np.float32)
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
             n_feats = len(self.sideinfo_fids[domain])
             self._buf_seq[domain] = np.zeros((B, n_feats, max_len), dtype=np.int64)
             self._buf_seq_tb[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_db[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_hour[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_dow[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -582,7 +604,10 @@ class PCVRParquetDataset(IterableDataset):
         }
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
-        for domain in self.seq_domains:
+        time_summary = self._buf_time_summary[:B]
+        time_summary[:] = 0
+        summary_log_age_denom = np.log1p(730.0 * 86400.0)
+        for domain_idx, domain in enumerate(self.seq_domains):
             max_len = self._seq_maxlen[domain]
             side_plan, ts_ci = self._seq_plan[domain]
 
@@ -630,6 +655,12 @@ class PCVRParquetDataset(IterableDataset):
             # Time bucketing.
             time_bucket = self._buf_seq_tb[domain][:B]
             time_bucket[:] = 0
+            delta_bucket = self._buf_seq_db[domain][:B]
+            delta_bucket[:] = 0
+            hour_bucket = self._buf_seq_hour[domain][:B]
+            hour_bucket[:] = 0
+            dow_bucket = self._buf_seq_dow[domain][:B]
+            dow_bucket[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -664,8 +695,63 @@ class PCVRParquetDataset(IterableDataset):
                 buckets[ts_padded == 0] = 0
                 time_bucket[:] = buckets
 
-            result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+                delta_t = np.zeros((B, max_len), dtype=np.int64)
+                delta_t[:, :-1] = ts_padded[:, :-1] - ts_padded[:, 1:]
+                delta_t = np.maximum(delta_t, 0)
+                raw_delta_buckets = np.clip(
+                    np.searchsorted(DELTA_BOUNDARIES, delta_t.ravel()),
+                    0, len(DELTA_BOUNDARIES),
+                )
+                delta_buckets = raw_delta_buckets.reshape(B, max_len) + 1
+                pair_valid = (ts_padded[:, :-1] > 0) & (ts_padded[:, 1:] > 0)
+                delta_buckets[:, :-1][~pair_valid] = 0
+                delta_buckets[:, -1] = 0
+                delta_bucket[:] = delta_buckets
 
+                shifted_ts = ts_padded + PERIODIC_TIME_UTC_OFFSET_SECONDS
+                hour_ids = ((shifted_ts % 86400) // 3600) + 1
+                dow_ids = ((shifted_ts // 86400 + 3) % 7) + 1
+                hour_ids[ts_padded == 0] = 0
+                dow_ids[ts_padded == 0] = 0
+                hour_bucket[:] = hour_ids
+                dow_bucket[:] = dow_ids
+
+                valid_ts = ts_padded > 0
+                ts_lengths = valid_ts.sum(axis=1)
+                if ts_lengths.any():
+                    last_age = np.where(valid_ts[:, 0], time_diff[:, 0], 0)
+                    oldest_idx = np.maximum(ts_lengths - 1, 0)
+                    oldest_age = time_diff[np.arange(B), oldest_idx]
+                    oldest_age = np.where(ts_lengths > 0, oldest_age, 0)
+                    span = np.where(
+                        ts_lengths > 0,
+                        np.maximum(ts_padded[:, 0] - ts_padded[np.arange(B), oldest_idx], 0),
+                        0,
+                    )
+                    span_days = span.astype(np.float32) / 86400.0
+                    density = ts_lengths.astype(np.float32) / np.log1p(span_days + 1.0)
+                    count_denom = np.log1p(float(max_len))
+                    counts_1h = ((time_diff <= 3600) & valid_ts).sum(axis=1)
+                    counts_1d = ((time_diff <= 86400) & valid_ts).sum(axis=1)
+                    counts_7d = ((time_diff <= 604800) & valid_ts).sum(axis=1)
+                    counts_30d = ((time_diff <= 2592000) & valid_ts).sum(axis=1)
+
+                    base = domain_idx * 8
+                    time_summary[:, base + 0] = np.log1p(last_age) / summary_log_age_denom
+                    time_summary[:, base + 1] = np.log1p(oldest_age) / summary_log_age_denom
+                    time_summary[:, base + 2] = np.log1p(span) / summary_log_age_denom
+                    time_summary[:, base + 3] = np.log1p(density) / np.log1p(float(max_len))
+                    time_summary[:, base + 4] = np.log1p(counts_1h) / count_denom
+                    time_summary[:, base + 5] = np.log1p(counts_1d) / count_denom
+                    time_summary[:, base + 6] = np.log1p(counts_7d) / count_denom
+                    time_summary[:, base + 7] = np.log1p(counts_30d) / count_denom
+
+            result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
+            result[f'{domain}_delta_bucket'] = torch.from_numpy(delta_bucket.copy())
+            result[f'{domain}_hour_bucket'] = torch.from_numpy(hour_bucket.copy())
+            result[f'{domain}_dow_bucket'] = torch.from_numpy(dow_bucket.copy())
+
+        result['time_summary_feats'] = torch.from_numpy(time_summary.copy())
         return result
 
 

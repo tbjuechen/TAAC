@@ -26,7 +26,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    PCVRParquetDataset,
+    NUM_TIME_BUCKETS,
+    NUM_DELTA_BUCKETS,
+)
 from model import PCVRHyFormer, ModelInput
 
 
@@ -47,6 +52,10 @@ logging.basicConfig(
 # ``dataset.BUCKET_BOUNDARIES`` and is NOT an independent hyperparameter.
 # When the feature is enabled we therefore use the constant exposed by the
 # dataset module; ``0`` means disabled.
+#
+# ``num_delta_buckets`` follows the same pattern: training stores the boolean
+# ``use_delta_buckets`` CLI flag in ``train_config.json``, while the actual
+# bucket count comes from ``dataset.NUM_DELTA_BUCKETS``.
 _FALLBACK_MODEL_CFG = {
     'd_model': 64,
     'emb_dim': 64,
@@ -60,6 +69,14 @@ _FALLBACK_MODEL_CFG = {
     'seq_causal': False,
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
+    'per_domain_time_embeddings': False,
+    'domain_time_residual_embeddings': False,
+    'num_delta_buckets': 0,
+    'use_time_summary_features': False,
+    'use_seq_hour_of_day_feature': False,
+    'use_seq_day_of_week_feature': False,
+    'use_seq_periodic_time_features': False,
+    'per_domain_seq_periodic_time_features': False,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
@@ -128,13 +145,14 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
     """Extract model hyperparameters from ``train_config``; missing keys fall
     back to ``_FALLBACK_MODEL_CFG``.
 
-    Special handling for ``num_time_buckets``: it is not exposed on the CLI
-    as an independent hyperparameter; the bucket count is uniquely determined
-    by the length of ``dataset.BUCKET_BOUNDARIES``. Resolution order:
+    Special handling for bucket features: ``num_time_buckets`` and
+    ``num_delta_buckets`` are not exposed on the CLI as independent
+    hyperparameters; the bucket counts are determined by constants in
+    ``dataset.py``. Resolution order:
 
-      1) ``train_config`` contains ``num_time_buckets`` directly (legacy ckpt)
+      1) ``train_config`` contains ``num_*_buckets`` directly (legacy ckpt)
          -> use that value;
-      2) ``train_config`` contains ``use_time_buckets`` (new-style training)
+      2) ``train_config`` contains ``use_*_buckets`` (new-style training)
          -> derive as ``NUM_TIME_BUCKETS`` or ``0``;
       3) neither is present -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
     """
@@ -149,6 +167,17 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
                 cfg[key] = _FALLBACK_MODEL_CFG[key]
                 logging.warning(
                     f"train_config missing both 'num_time_buckets' and 'use_time_buckets', "
+                    f"using fallback = {cfg[key]}")
+            continue
+        if key == 'num_delta_buckets':
+            if 'num_delta_buckets' in train_config:
+                cfg[key] = train_config['num_delta_buckets']
+            elif 'use_delta_buckets' in train_config:
+                cfg[key] = NUM_DELTA_BUCKETS if train_config['use_delta_buckets'] else 0
+            else:
+                cfg[key] = _FALLBACK_MODEL_CFG[key]
+                logging.warning(
+                    f"train_config missing both 'num_delta_buckets' and 'use_delta_buckets', "
                     f"using fallback = {cfg[key]}")
             continue
 
@@ -290,6 +319,9 @@ def _batch_to_model_input(
     seq_data: Dict[str, torch.Tensor] = {}
     seq_lens: Dict[str, torch.Tensor] = {}
     seq_time_buckets: Dict[str, torch.Tensor] = {}
+    seq_delta_buckets: Dict[str, torch.Tensor] = {}
+    seq_hour_buckets: Dict[str, torch.Tensor] = {}
+    seq_dow_buckets: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -297,15 +329,36 @@ def _batch_to_model_input(
         seq_time_buckets[domain] = device_batch.get(
             f'{domain}_time_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_delta_buckets[domain] = device_batch.get(
+            f'{domain}_delta_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_hour_buckets[domain] = device_batch.get(
+            f'{domain}_hour_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_dow_buckets[domain] = device_batch.get(
+            f'{domain}_dow_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
 
     return ModelInput(
         user_int_feats=device_batch['user_int_feats'],
         item_int_feats=device_batch['item_int_feats'],
         user_dense_feats=device_batch['user_dense_feats'],
         item_dense_feats=device_batch['item_dense_feats'],
+        time_summary_feats=device_batch.get(
+            'time_summary_feats',
+            torch.zeros(
+                device_batch['user_int_feats'].shape[0],
+                0,
+                dtype=torch.float32,
+                device=device,
+            ),
+        ),
         seq_data=seq_data,
         seq_lens=seq_lens,
         seq_time_buckets=seq_time_buckets,
+        seq_delta_buckets=seq_delta_buckets,
+        seq_hour_buckets=seq_hour_buckets,
+        seq_dow_buckets=seq_dow_buckets,
     )
 
 

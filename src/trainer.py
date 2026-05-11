@@ -472,6 +472,9 @@ class PCVRHyFormerRankingTrainer:
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
+        seq_delta_buckets: Dict[str, torch.Tensor] = {}
+        seq_hour_buckets: Dict[str, torch.Tensor] = {}
+        seq_dow_buckets: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -480,14 +483,35 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
+            seq_delta_buckets[domain] = device_batch.get(
+                f'{domain}_delta_bucket',
+                torch.zeros(B, L, dtype=torch.long, device=self.device))
+            seq_hour_buckets[domain] = device_batch.get(
+                f'{domain}_hour_bucket',
+                torch.zeros(B, L, dtype=torch.long, device=self.device))
+            seq_dow_buckets[domain] = device_batch.get(
+                f'{domain}_dow_bucket',
+                torch.zeros(B, L, dtype=torch.long, device=self.device))
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
             user_dense_feats=device_batch['user_dense_feats'],
             item_dense_feats=device_batch['item_dense_feats'],
+            time_summary_feats=device_batch.get(
+                'time_summary_feats',
+                torch.zeros(
+                    device_batch['user_int_feats'].shape[0],
+                    0,
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+            ),
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            seq_delta_buckets=seq_delta_buckets,
+            seq_hour_buckets=seq_hour_buckets,
+            seq_dow_buckets=seq_dow_buckets,
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
