@@ -19,7 +19,12 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    get_pcvr_data,
+    NUM_LABEL_DELAY_BUCKETS,
+    NUM_TIME_BUCKETS,
+)
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -161,6 +166,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
+    parser.add_argument('--use_label_delay_aux', action='store_true', default=False,
+                        help='Enable positive-only label_time delay auxiliary task. '
+                             'The auxiliary head is used during training only; '
+                             'inference still emits the CVR logit.')
+    parser.add_argument('--label_delay_aux_weight', type=float, default=0.05,
+                        help='Loss weight for the label_time delay auxiliary CE. '
+                             'Only positive samples with label_time are supervised.')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -333,6 +345,7 @@ def main() -> None:
         "seq_causal": args.seq_causal,
         "seq_longer_gather_side": args.longer_gather_side,
         "action_num": args.action_num,
+        "num_label_delay_buckets": NUM_LABEL_DELAY_BUCKETS if args.use_label_delay_aux else 0,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
@@ -348,8 +361,16 @@ def main() -> None:
     if args.use_compile:
         if hasattr(torch, 'compile'):
             try:
-                logging.info(f"Compiling model.forward with torch.compile(mode={args.compile_mode})")
-                model.forward = torch.compile(model.forward, mode=args.compile_mode)
+                compile_target = 'forward_with_aux' if args.use_label_delay_aux else 'forward'
+                logging.info(
+                    f"Compiling model.{compile_target} with "
+                    f"torch.compile(mode={args.compile_mode})"
+                )
+                if args.use_label_delay_aux:
+                    model.forward_with_aux = torch.compile(
+                        model.forward_with_aux, mode=args.compile_mode)
+                else:
+                    model.forward = torch.compile(model.forward, mode=args.compile_mode)
             except Exception:
                 logging.exception("torch.compile failed; falling back to eager model")
         else:
@@ -390,6 +411,10 @@ def main() -> None:
             f"cosine_min_lr_ratio={args.cosine_min_lr_ratio}"
         )
 
+    train_config = vars(args).copy()
+    train_config["num_label_delay_buckets"] = model_args["num_label_delay_buckets"]
+    train_config["num_time_buckets"] = model_args["num_time_buckets"]
+
     trainer = PCVRHyFormerRankingTrainer(
         model=model,
         train_loader=train_loader,
@@ -402,6 +427,8 @@ def main() -> None:
         loss_type=args.loss_type,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        use_label_delay_aux=args.use_label_delay_aux,
+        label_delay_aux_weight=args.label_delay_aux_weight,
         sparse_lr=args.sparse_lr,
         sparse_weight_decay=args.sparse_weight_decay,
         dense_weight_decay=args.dense_weight_decay,
@@ -412,7 +439,7 @@ def main() -> None:
         schema_path=schema_path,
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
-        train_config=vars(args),
+        train_config=train_config,
         use_amp=args.use_amp,
         warmup_steps=args.warmup_steps,
         use_cosine_decay=args.use_cosine_decay,

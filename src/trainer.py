@@ -49,6 +49,8 @@ class PCVRHyFormerRankingTrainer:
         loss_type: str = 'bce',
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
+        use_label_delay_aux: bool = False,
+        label_delay_aux_weight: float = 0.05,
         sparse_lr: float = 0.05,
         sparse_weight_decay: float = 0.0,
         dense_weight_decay: float = 0.01,
@@ -107,6 +109,8 @@ class PCVRHyFormerRankingTrainer:
         self.loss_type: str = loss_type
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
+        self.use_label_delay_aux: bool = use_label_delay_aux
+        self.label_delay_aux_weight: float = label_delay_aux_weight
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
         self.reinit_cardinality_threshold: int = reinit_cardinality_threshold
         self.sparse_lr: float = sparse_lr
@@ -175,6 +179,8 @@ class PCVRHyFormerRankingTrainer:
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        logging.info("Label-delay auxiliary task enabled=%s, weight=%s",
+                     self.use_label_delay_aux, self.label_delay_aux_weight)
         logging.info("AMP enabled=%s, dtype=bf16, grad_scaler=%s",
                      self.use_amp, self.scaler.is_enabled())
 
@@ -503,13 +509,32 @@ class PCVRHyFormerRankingTrainer:
         with torch.amp.autocast(
             'cuda', enabled=self.use_amp, dtype=torch.bfloat16
         ):
-            logits = self.model(model_input)  # (B, 1)
+            if self.use_label_delay_aux and hasattr(self.model, 'forward_with_aux'):
+                logits, delay_logits = self.model.forward_with_aux(model_input)
+            else:
+                logits = self.model(model_input)  # (B, 1)
+                delay_logits = None
             logits = logits.squeeze(-1)  # (B,)
 
             if self.loss_type == 'focal':
                 loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
             else:
                 loss = F.binary_cross_entropy_with_logits(logits, label)
+
+            if (
+                self.use_label_delay_aux
+                and delay_logits is not None
+                and self.label_delay_aux_weight > 0
+                and 'label_delay_bucket' in device_batch
+                and 'label_delay_mask' in device_batch
+            ):
+                aux_mask = (label > 0.5) & (device_batch['label_delay_mask'] > 0)
+                if aux_mask.any():
+                    aux_loss = F.cross_entropy(
+                        delay_logits[aux_mask],
+                        device_batch['label_delay_bucket'][aux_mask].long(),
+                    )
+                    loss = loss + self.label_delay_aux_weight * aux_loss
 
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.dense_optimizer)

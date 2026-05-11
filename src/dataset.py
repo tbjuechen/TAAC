@@ -131,6 +131,14 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Label-delay bucket boundaries for the optional positive-only auxiliary task.
+# The first cut follows demo EDA (`label_time - timestamp`: p50≈192s,
+# p90≈487s, p99≈647s) while keeping coarser long-tail buckets for online data.
+LABEL_DELAY_BUCKET_BOUNDARIES = np.array([
+    30, 60, 120, 300, 600, 1800, 3600,
+], dtype=np.int64)
+NUM_LABEL_DELAY_BUCKETS = len(LABEL_DELAY_BUCKET_BOUNDARIES) + 1
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -508,6 +516,18 @@ class PCVRParquetDataset(IterableDataset):
 
         # ---- meta ----
         timestamps = batch.column(self._col_idx['timestamp']).to_numpy().astype(np.int64)
+        if 'label_time' in self._col_idx:
+            label_times = batch.column(self._col_idx['label_time']).fill_null(0) \
+                .to_numpy(zero_copy_only=False).astype(np.int64)
+            label_delay = np.maximum(label_times - timestamps, 0)
+            label_delay_bucket = np.searchsorted(
+                LABEL_DELAY_BUCKET_BOUNDARIES,
+                label_delay,
+            ).astype(np.int64)
+            label_delay_mask = (label_times > 0).astype(np.int64)
+        else:
+            label_delay_bucket = np.zeros(B, dtype=np.int64)
+            label_delay_mask = np.zeros(B, dtype=np.int64)
         if self.is_training:
             labels = (batch.column(self._col_idx['label_type']).fill_null(0)
                       .to_numpy(zero_copy_only=False).astype(np.int64) == 2).astype(np.int64)
@@ -576,6 +596,8 @@ class PCVRParquetDataset(IterableDataset):
             'item_int_feats': torch.from_numpy(item_int.copy()),
             'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
             'label': torch.from_numpy(labels),
+            'label_delay_bucket': torch.from_numpy(label_delay_bucket),
+            'label_delay_mask': torch.from_numpy(label_delay_mask),
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
             '_seq_domains': self.seq_domains,

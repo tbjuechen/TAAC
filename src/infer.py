@@ -26,7 +26,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from dataset import FeatureSchema, PCVRParquetDataset, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    PCVRParquetDataset,
+    NUM_LABEL_DELAY_BUCKETS,
+    NUM_TIME_BUCKETS,
+)
 from model import PCVRHyFormer, ModelInput
 
 
@@ -59,6 +64,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_top_k': 50,
     'seq_causal': False,
     'action_num': 1,
+    'num_label_delay_buckets': 0,
     'num_time_buckets': NUM_TIME_BUCKETS,
     'rank_mixer_mode': 'full',
     'use_rope': False,
@@ -126,18 +132,40 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
     """Extract model hyperparameters from ``train_config``; missing keys fall
     back to ``_FALLBACK_MODEL_CFG``.
 
-    Special handling for ``num_time_buckets``: it is not exposed on the CLI
-    as an independent hyperparameter; the bucket count is uniquely determined
-    by the length of ``dataset.BUCKET_BOUNDARIES``. Resolution order:
+    Special handling for derived bucket counts:
+
+    ``num_time_buckets`` is not exposed on the CLI as an independent
+    hyperparameter; the bucket count is uniquely determined by the length of
+    ``dataset.BUCKET_BOUNDARIES``. Resolution order:
 
       1) ``train_config`` contains ``num_time_buckets`` directly (legacy ckpt)
          -> use that value;
       2) ``train_config`` contains ``use_time_buckets`` (new-style training)
          -> derive as ``NUM_TIME_BUCKETS`` or ``0``;
       3) neither is present -> fall back to ``_FALLBACK_MODEL_CFG[...]``.
+
+    ``num_label_delay_buckets`` follows the same pattern from
+    ``use_label_delay_aux`` so checkpoints with an auxiliary training head can
+    still be loaded strictly at inference time.
     """
     cfg: Dict[str, Any] = {}
     for key in _MODEL_CFG_KEYS:
+        if key == 'num_label_delay_buckets':
+            if 'num_label_delay_buckets' in train_config:
+                cfg[key] = train_config['num_label_delay_buckets']
+            elif 'use_label_delay_aux' in train_config:
+                cfg[key] = (
+                    NUM_LABEL_DELAY_BUCKETS
+                    if train_config['use_label_delay_aux']
+                    else 0
+                )
+            else:
+                cfg[key] = _FALLBACK_MODEL_CFG[key]
+                logging.warning(
+                    f"train_config missing both 'num_label_delay_buckets' "
+                    f"and 'use_label_delay_aux', using fallback = {cfg[key]}")
+            continue
+
         if key == 'num_time_buckets':
             if 'num_time_buckets' in train_config:
                 cfg[key] = train_config['num_time_buckets']
@@ -381,13 +409,15 @@ def main() -> None:
     model.eval()
     logging.info("Model loaded successfully")
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=None,
-        num_workers=num_workers,
-        prefetch_factor=2,
-        pin_memory=torch.cuda.is_available(),
-    )
+    loader_kwargs: Dict[str, Any] = {
+        'batch_size': None,
+        'num_workers': num_workers,
+        'pin_memory': torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs['prefetch_factor'] = 2
+
+    test_loader = DataLoader(test_dataset, **loader_kwargs)
 
     all_probs = []
     all_user_ids = []
