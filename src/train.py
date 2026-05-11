@@ -19,7 +19,13 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema,
+    USER_TIME_DOW_FID,
+    USER_TIME_HOD_FID,
+    get_pcvr_data,
+    NUM_TIME_BUCKETS,
+)
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -210,7 +216,6 @@ def parse_args() -> argparse.Namespace:
                              'extra dropout(rate*2) during training to reduce overfitting. '
                              'Features at or below this threshold are treated as side-info '
                              'and receive no extra dropout.')
-
     _default_ns_groups = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), 'ns_groups.json')
     parser.add_argument('--ns_groups_json', type=str, default=_default_ns_groups,
@@ -296,9 +301,14 @@ def main() -> None:
         logging.info(f"Loading NS groups from {args.ns_groups_json}")
         with open(args.ns_groups_json, 'r') as f:
             ns_groups_cfg = json.load(f)
+        user_group_values = list(ns_groups_cfg['user_ns_groups'].values())
+        user_group_values[-1] = user_group_values[-1] + [
+            USER_TIME_DOW_FID,
+            USER_TIME_HOD_FID,
+        ]
         user_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)}
         item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}
-        user_ns_groups = [[user_fid_to_idx[f] for f in fids] for fids in ns_groups_cfg['user_ns_groups'].values()]
+        user_ns_groups = [[user_fid_to_idx[f] for f in fids] for fids in user_group_values]
         item_ns_groups = [[item_fid_to_idx[f] for f in fids] for fids in ns_groups_cfg['item_ns_groups'].values()]
         logging.info(f"User NS groups ({len(user_ns_groups)}): {list(ns_groups_cfg['user_ns_groups'].keys())}")
         logging.info(f"Item NS groups ({len(item_ns_groups)}): {list(ns_groups_cfg['item_ns_groups'].keys())}")

@@ -131,6 +131,14 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# Sample-level user time features. Bucket ids reserve 0 for padding/fallback so
+# they can use nn.Embedding(..., padding_idx=0) just like other sparse features.
+USER_TIME_TZ_OFFSET_SECONDS = 8 * 3600
+USER_TIME_DOW_FID = 900001
+USER_TIME_HOD_FID = 900002
+NUM_USER_TIME_DOW_BUCKETS = 8
+NUM_USER_TIME_HOD_BUCKETS = 25
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -281,6 +289,12 @@ class PCVRParquetDataset(IterableDataset):
         for fid, vs, dim in self._user_int_cols:
             self.user_int_schema.add(fid, dim)
             self.user_int_vocab_sizes.extend([vs] * dim)
+        self.user_time_dow_offset = self.user_int_schema.total_dim
+        self.user_int_schema.add(USER_TIME_DOW_FID, 1)
+        self.user_int_vocab_sizes.append(NUM_USER_TIME_DOW_BUCKETS - 1)
+        self.user_time_hod_offset = self.user_int_schema.total_dim
+        self.user_int_schema.add(USER_TIME_HOD_FID, 1)
+        self.user_int_vocab_sizes.append(NUM_USER_TIME_HOD_BUCKETS - 1)
 
         # ---- item_int ----
         self._item_int_cols: List[List[int]] = raw['item_int']
@@ -508,6 +522,10 @@ class PCVRParquetDataset(IterableDataset):
 
         # ---- meta ----
         timestamps = batch.column(self._col_idx['timestamp']).to_numpy().astype(np.int64)
+        local_timestamps = timestamps + USER_TIME_TZ_OFFSET_SECONDS
+        days_since_epoch = local_timestamps // 86400
+        user_time_dow = ((days_since_epoch + 3) % 7 + 1).astype(np.int64)
+        user_time_hod = ((local_timestamps // 3600) % 24 + 1).astype(np.int64)
         if self.is_training:
             labels = (batch.column(self._col_idx['label_type']).fill_null(0)
                       .to_numpy(zero_copy_only=False).astype(np.int64) == 2).astype(np.int64)
@@ -540,6 +558,8 @@ class PCVRParquetDataset(IterableDataset):
                 else:
                     padded[:] = 0
                 user_int[:, offset:offset + dim] = padded
+        user_int[:, self.user_time_dow_offset] = user_time_dow
+        user_int[:, self.user_time_hod_offset] = user_time_hod
 
         # ---- item_int ----
         item_int = self._buf_item_int[:B]
