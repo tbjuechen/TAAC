@@ -29,8 +29,10 @@ from torch.utils.data import DataLoader
 from dataset import (
     FeatureSchema,
     PCVRParquetDataset,
-    NUM_TIME_BUCKETS,
+    USER_TIME_DOW_FID,
+    USER_TIME_HOD_FID,
     NUM_DELTA_BUCKETS,
+    NUM_TIME_BUCKETS,
 )
 from model import PCVRHyFormer, ModelInput
 
@@ -219,6 +221,11 @@ def build_model(
         logging.info(f"Loading NS groups from {ns_groups_json}")
         with open(ns_groups_json, 'r') as f:
             ns_groups_cfg = json.load(f)
+        user_group_values = list(ns_groups_cfg['user_ns_groups'].values())
+        user_group_values[-1] = user_group_values[-1] + [
+            USER_TIME_DOW_FID,
+            USER_TIME_HOD_FID,
+        ]
         user_fid_to_idx = {
             fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)
         }
@@ -228,7 +235,7 @@ def build_model(
         try:
             user_ns_groups = [
                 [user_fid_to_idx[f] for f in fids]
-                for fids in ns_groups_cfg['user_ns_groups'].values()
+                for fids in user_group_values
             ]
             item_ns_groups = [
                 [item_fid_to_idx[f] for f in fids]
