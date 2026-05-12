@@ -160,6 +160,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--per_domain_seq_periodic_time_features', action='store_true', default=False,
                         help='Use per-domain hour-of-day and day-of-week embeddings for '
                              'sequence periodic time features.')
+    parser.add_argument('--reinit_seq_periodic_time_features', action='store_true', default=False,
+                        help='When sparse embeddings are re-initialized after an epoch, '
+                             'also re-initialize only the sequence periodic time embeddings '
+                             '(hour-of-day/day-of-week). Other time embeddings remain preserved.')
     parser.add_argument('--use_delta_buckets', action='store_true', default=False,
                         help='Enable per-domain delta-t bucket embedding (W2.7). '
                              'Models adjacent-token time gaps within sequences. '
@@ -352,6 +356,7 @@ def main() -> None:
         "use_seq_day_of_week_feature": args.use_seq_day_of_week_feature,
         "use_seq_periodic_time_features": args.use_seq_periodic_time_features,
         "per_domain_seq_periodic_time_features": args.per_domain_seq_periodic_time_features,
+        "reinit_seq_periodic_time_features": args.reinit_seq_periodic_time_features,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
@@ -397,6 +402,11 @@ def main() -> None:
             f"W2.9 seq periodic time features enabled ({periodic_scope}): concat "
             f"{' + '.join(periodic_parts)} embeddings before seq projection"
         )
+        if model.reinit_seq_periodic_time_features:
+            logging.info(
+                "Sequence periodic time embeddings will be re-initialized "
+                "during sparse embedding reinit"
+            )
     if model.num_delta_buckets > 0:
         n_domains = len(model.seq_domains)
         logging.info(

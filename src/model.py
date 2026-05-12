@@ -1249,6 +1249,7 @@ class PCVRHyFormer(nn.Module):
         use_seq_day_of_week_feature: bool = False,
         use_seq_periodic_time_features: bool = False,
         per_domain_seq_periodic_time_features: bool = False,
+        reinit_seq_periodic_time_features: bool = False,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1287,6 +1288,7 @@ class PCVRHyFormer(nn.Module):
             or self.use_seq_day_of_week_feature
         )
         self.per_domain_seq_periodic_time_features = per_domain_seq_periodic_time_features
+        self.reinit_seq_periodic_time_features = reinit_seq_periodic_time_features
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1581,25 +1583,31 @@ class PCVRHyFormer(nn.Module):
 
         if self.num_delta_buckets > 0:
             for emb in self.delta_embeddings.values():
-                nn.init.xavier_normal_(emb.weight.data)
-                emb.weight.data[0, :] = 0
+                self._reinit_embedding(emb)
 
-        if self.use_seq_periodic_time_features:
-            if self.per_domain_seq_periodic_time_features:
-                periodic_embs = []
-                if self.use_seq_hour_of_day_feature:
-                    periodic_embs.extend(self.seq_hour_embeddings.values())
-                if self.use_seq_day_of_week_feature:
-                    periodic_embs.extend(self.seq_dow_embeddings.values())
-            else:
-                periodic_embs = []
-                if self.use_seq_hour_of_day_feature:
-                    periodic_embs.append(self.seq_hour_embedding)
-                if self.use_seq_day_of_week_feature:
-                    periodic_embs.append(self.seq_dow_embedding)
-            for emb in periodic_embs:
-                nn.init.xavier_normal_(emb.weight.data)
-                emb.weight.data[0, :] = 0
+        for emb in self._seq_periodic_time_embedding_modules():
+            self._reinit_embedding(emb)
+
+    def _seq_periodic_time_embedding_modules(self) -> List[nn.Embedding]:
+        if not self.use_seq_periodic_time_features:
+            return []
+        periodic_embs: List[nn.Embedding] = []
+        if self.per_domain_seq_periodic_time_features:
+            if self.use_seq_hour_of_day_feature:
+                periodic_embs.extend(self.seq_hour_embeddings.values())
+            if self.use_seq_day_of_week_feature:
+                periodic_embs.extend(self.seq_dow_embeddings.values())
+        else:
+            if self.use_seq_hour_of_day_feature:
+                periodic_embs.append(self.seq_hour_embedding)
+            if self.use_seq_day_of_week_feature:
+                periodic_embs.append(self.seq_dow_embedding)
+        return periodic_embs
+
+    @staticmethod
+    def _reinit_embedding(emb: nn.Embedding) -> None:
+        nn.init.xavier_normal_(emb.weight.data)
+        emb.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1663,15 +1671,14 @@ class PCVRHyFormer(nn.Module):
         if self.num_delta_buckets > 0:
             skip_count += len(self.delta_embeddings)
         if self.use_seq_periodic_time_features:
-            periodic_feature_count = (
-                int(self.use_seq_hour_of_day_feature)
-                + int(self.use_seq_day_of_week_feature)
-            )
-            skip_count += (
-                len(self.seq_domains) * periodic_feature_count
-                if self.per_domain_seq_periodic_time_features
-                else periodic_feature_count
-            )
+            periodic_embs = self._seq_periodic_time_embedding_modules()
+            if self.reinit_seq_periodic_time_features:
+                for emb in periodic_embs:
+                    self._reinit_embedding(emb)
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                reinit_count += len(periodic_embs)
+            else:
+                skip_count += len(periodic_embs)
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")

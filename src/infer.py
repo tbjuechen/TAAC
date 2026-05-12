@@ -77,6 +77,7 @@ _FALLBACK_MODEL_CFG = {
     'use_seq_day_of_week_feature': False,
     'use_seq_periodic_time_features': False,
     'per_domain_seq_periodic_time_features': False,
+    'reinit_seq_periodic_time_features': False,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
