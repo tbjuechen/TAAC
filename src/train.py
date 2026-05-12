@@ -210,16 +210,16 @@ def parse_args() -> argparse.Namespace:
                              'Embeddings whose vocab_size exceeds this value are reset '
                              'at each epoch end (0 = never reset any Embedding)')
 
-    # LR scheduler for dense AdamW. Warmup is enabled by default; cosine decay
-    # is opt-in so the default schedule is warmup -> constant lr.
-    # Sparse Adagrad is unaffected.
+    # Shared LR scheduler for dense AdamW and sparse Adagrad. Warmup is enabled
+    # by default; cosine decay is opt-in so the default schedule is warmup ->
+    # constant lr.
     parser.add_argument('--warmup_steps', type=int, default=500,
-                        help='Linear warmup steps for dense AdamW '
+                        help='Linear warmup steps for dense AdamW and sparse Adagrad '
                              '(0 = disable warmup).')
     parser.add_argument('--use_cosine_decay', action='store_true',
-                        help='After warmup, enable cosine decay for dense AdamW. '
-                             'Off by default; without this flag, lr stays at --lr '
-                             'after warmup.')
+                        help='After warmup, enable cosine decay for dense AdamW '
+                             'and sparse Adagrad. Off by default; without this '
+                             'flag, lr stays at each optimizer peak lr after warmup.')
     parser.add_argument('--cosine_total_epochs', type=float, default=8.0,
                         help='Cosine decay reaches its floor after this many epochs '
                              '(total_steps = epochs * len(train_loader)). '

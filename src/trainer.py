@@ -120,15 +120,15 @@ class PCVRHyFormerRankingTrainer:
             'cuda', enabled=False
         )
 
-        # LR scheduler for dense AdamW. Warmup can run alone; cosine decay is
-        # gated separately so the default schedule is warmup -> constant lr.
-        # Active when warmup_steps > 0 or cosine is enabled; otherwise dense
-        # AdamW runs at constant lr.
-        # Applied to dense_optimizer only; sparse Adagrad keeps its constant lr.
+        # LR scheduler. Warmup can run alone; cosine decay is gated separately
+        # so the default schedule is warmup -> constant lr. Dense AdamW owns the
+        # LambdaLR; sparse Adagrad is synced to the same scheduler step so both
+        # optimizer groups share one clock.
         self.warmup_steps: int = warmup_steps
         self.use_cosine_decay: bool = use_cosine_decay
         self.cosine_total_steps: int = cosine_total_steps
         self.cosine_min_lr_ratio: float = cosine_min_lr_ratio
+        self._lr_lambda: Optional[Any] = None
         self.lr_scheduler: Optional[torch.optim.lr_scheduler.LambdaLR]
         if warmup_steps > 0 or use_cosine_decay:
             if use_cosine_decay and cosine_total_steps <= warmup_steps:
@@ -150,33 +150,48 @@ class PCVRHyFormerRankingTrainer:
                 progress = (step - W) / float(T - W)
                 return r + (1.0 - r) * 0.5 * (1.0 + math.cos(math.pi * progress))
 
+            self._lr_lambda = lr_lambda
             self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.dense_optimizer, lr_lambda=lr_lambda
             )
+            self._sync_sparse_lr_to_schedule()
             if use_cosine_decay and warmup_steps > 0:
                 logging.info(
                     f"LR scheduler: linear warmup {W} steps -> cosine decay to "
-                    f"step {T} (min_lr_ratio={r}); applied to dense AdamW only"
+                    f"step {T} (min_lr_ratio={r}); applied to dense AdamW "
+                    f"and sparse Adagrad"
                 )
             elif use_cosine_decay:
                 logging.info(
                     f"LR scheduler: cosine decay to step {T} "
-                    f"(min_lr_ratio={r}); applied to dense AdamW only"
+                    f"(min_lr_ratio={r}); applied to dense AdamW and sparse Adagrad"
                 )
             else:
                 logging.info(
                     f"LR scheduler: linear warmup {W} steps -> constant lr; "
-                    f"applied to dense AdamW only"
+                    f"applied to dense AdamW and sparse Adagrad"
                 )
         else:
             self.lr_scheduler = None
-            logging.info("LR scheduler: disabled (warmup_steps=0); dense AdamW uses constant lr")
+            logging.info("LR scheduler: disabled (warmup_steps=0); optimizers use constant lr")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
         logging.info("AMP enabled=%s, dtype=bf16, grad_scaler=%s",
                      self.use_amp, self.scaler.is_enabled())
+
+    def _sync_sparse_lr_to_schedule(self) -> None:
+        """Apply the dense scheduler's current lr factor to sparse Adagrad."""
+        if (
+            self.sparse_optimizer is None
+            or self._lr_lambda is None
+            or self.lr_scheduler is None
+        ):
+            return
+        factor = self._lr_lambda(self.lr_scheduler.last_epoch)
+        for group in self.sparse_optimizer.param_groups:
+            group['lr'] = self.sparse_lr * factor
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -386,6 +401,12 @@ class PCVRHyFormerRankingTrainer:
                         self.dense_optimizer.param_groups[0]['lr'],
                         total_step,
                     )
+                    if self.sparse_optimizer is not None:
+                        self.writer.add_scalar(
+                            'LR/sparse',
+                            self.sparse_optimizer.param_groups[0]['lr'],
+                            total_step,
+                        )
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
@@ -457,6 +478,7 @@ class PCVRHyFormerRankingTrainer:
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
                 )
+                self._sync_sparse_lr_to_schedule()
                 # Restore optimizer state for low-cardinality embeddings only.
                 restored = 0
                 for p in sparse_params:
@@ -550,6 +572,7 @@ class PCVRHyFormerRankingTrainer:
 
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
+            self._sync_sparse_lr_to_schedule()
 
         return loss.item()
 
