@@ -16,6 +16,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.9 seq periodic concat:        USE_SEQ_PERIODIC_TIME=1 ./run.sh
 # W2.9 hour-only ablation:         USE_SEQ_HOUR=1 ./run.sh
 # W2.9 dow-only ablation:          USE_SEQ_DOW=1 ./run.sh
+# W2.9 moy-only ablation:          USE_SEQ_MONTH_OF_YEAR=1 ./run.sh
 # W2.9b per-domain periodic:       USE_PER_DOMAIN_PERIODIC_TIME=1 ./run.sh
 # W2.9c reinit periodic time emb:  REINIT_SEQ_PERIODIC_TIME=1 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
@@ -29,6 +30,8 @@ USE_TIME_SUMMARY="${USE_TIME_SUMMARY:-0}"
 USE_SEQ_PERIODIC_TIME="${USE_SEQ_PERIODIC_TIME:-0}"
 USE_SEQ_HOUR="${USE_SEQ_HOUR:-0}"
 USE_SEQ_DOW="${USE_SEQ_DOW:-0}"
+USE_SEQ_MOY="${USE_SEQ_MOY:-0}"
+USE_SEQ_MONTH_OF_YEAR="${USE_SEQ_MONTH_OF_YEAR:-${USE_SEQ_MOY}}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
 REINIT_SEQ_PERIODIC_TIME="${REINIT_SEQ_PERIODIC_TIME:-0}"
 if [ -z "${D_MODEL+x}" ]; then
@@ -48,6 +51,7 @@ EXTRA_FLAGS=""
 [ "${USE_SEQ_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_periodic_time_features"
 [ "${USE_SEQ_HOUR}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_hour_of_day_feature"
 [ "${USE_SEQ_DOW}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_day_of_week_feature"
+[ "${USE_SEQ_MONTH_OF_YEAR}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_month_of_year_feature"
 [ "${USE_PER_DOMAIN_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_seq_periodic_time_features"
 [ "${REINIT_SEQ_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --reinit_seq_periodic_time_features"
 
