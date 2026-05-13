@@ -30,6 +30,7 @@ from dataset import (
     FeatureSchema,
     PCVRParquetDataset,
     USER_ACTIVITY_FIDS,
+    USER_SEQ_LEN_DENSE_FID,
     USER_TIME_DOW_FID,
     USER_TIME_HOD_FID,
     NUM_DELTA_BUCKETS,
@@ -223,11 +224,12 @@ def build_model(
         with open(ns_groups_json, 'r') as f:
             ns_groups_cfg = json.load(f)
         user_group_values = list(ns_groups_cfg['user_ns_groups'].values())
-        user_group_values[-1] = user_group_values[-1] + [
-            USER_TIME_DOW_FID,
-            USER_TIME_HOD_FID,
-            *USER_ACTIVITY_FIDS,
-        ]
+        derived_user_fids = [USER_TIME_DOW_FID, USER_TIME_HOD_FID]
+        schema_user_fids = set(dataset.user_int_schema.feature_ids)
+        derived_user_fids.extend(
+            fid for fid in USER_ACTIVITY_FIDS if fid in schema_user_fids
+        )
+        user_group_values[-1] = user_group_values[-1] + derived_user_fids
         user_fid_to_idx = {
             fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)
         }
@@ -268,6 +270,11 @@ def build_model(
         item_dense_dim=dataset.item_dense_schema.total_dim,
         user_dense_feature_specs=dataset.user_dense_schema.entries,
         item_dense_feature_specs=dataset.item_dense_schema.entries,
+        user_seq_len_dense_fid=(
+            USER_SEQ_LEN_DENSE_FID
+            if USER_SEQ_LEN_DENSE_FID in dataset.user_dense_schema.feature_ids
+            else None
+        ),
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
@@ -410,6 +417,8 @@ def main() -> None:
         is_training=False,
         use_user_activity_features=bool(
             train_config.get('use_user_activity_features', False)),
+        use_user_seq_len_dense_features=bool(
+            train_config.get('use_user_seq_len_dense_features', False)),
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

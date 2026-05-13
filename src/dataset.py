@@ -179,6 +179,8 @@ USER_ACTIVITY_FIDS = [
     USER_ACTIVITY_7D_FID,
     USER_ACTIVITY_30D_FID,
 ]
+USER_SEQ_LEN_DENSE_FID = 900006
+USER_SEQ_LEN_DENSE_DIM = 3
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -203,6 +205,7 @@ class PCVRParquetDataset(IterableDataset):
         clip_vocab: bool = True,
         is_training: bool = True,
         use_user_activity_features: bool = False,
+        use_user_seq_len_dense_features: bool = False,
     ) -> None:
         """
         Args:
@@ -222,9 +225,13 @@ class PCVRParquetDataset(IterableDataset):
                 if False, return an all-zeros label column.
             use_user_activity_features: if True, append three derived sparse
                 user-int features from aggregate sequence interaction counts.
+            use_user_seq_len_dense_features: if True, append a three-value
+                user-dense feature: log1p(seq_a_len), log1p(seq_d_len), and
+                seq_a_len / seq_d_len.
         """
         super().__init__()
         self.use_user_activity_features = use_user_activity_features
+        self.use_user_seq_len_dense_features = use_user_seq_len_dense_features
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -372,6 +379,9 @@ class PCVRParquetDataset(IterableDataset):
         self.user_dense_schema: FeatureSchema = FeatureSchema()
         for fid, dim in self._user_dense_cols:
             self.user_dense_schema.add(fid, dim)
+        if self.use_user_seq_len_dense_features:
+            self.user_seq_len_dense_offset = self.user_dense_schema.total_dim
+            self.user_dense_schema.add(USER_SEQ_LEN_DENSE_FID, USER_SEQ_LEN_DENSE_DIM)
 
         # ---- item_dense (empty) ----
         self.item_dense_schema: FeatureSchema = FeatureSchema()
@@ -513,6 +523,46 @@ class PCVRParquetDataset(IterableDataset):
             self._bucketize_counts(counts_7d, USER_ACTIVITY_7D_BOUNDARIES),
             self._bucketize_counts(counts_30d, USER_ACTIVITY_30D_BOUNDARIES),
         )
+
+    def _compute_seq_lengths(
+        self,
+        batch: "pa.RecordBatch",
+        domain: str,
+        B: int,
+    ) -> "npt.NDArray[np.float32]":
+        """Count valid raw sequence positions for one domain."""
+        side_plan, ts_ci = self._seq_plan[domain]
+        ci = ts_ci
+        if ci is None and side_plan:
+            ci = side_plan[0][0]
+        lengths = np.zeros(B, dtype=np.float32)
+        if ci is None:
+            return lengths
+
+        col = batch.column(ci)
+        offs = col.offsets.to_numpy()
+        vals = col.values.to_numpy()
+        for i in range(B):
+            s = int(offs[i])
+            e = int(offs[i + 1])
+            if e <= s:
+                continue
+            lengths[i] = float((vals[s:e] > 0).sum())
+        return lengths
+
+    def _compute_user_seq_len_dense_features(
+        self,
+        batch: "pa.RecordBatch",
+        B: int,
+    ) -> "npt.NDArray[np.float32]":
+        """Build dense length features from raw seq_a and seq_d lengths."""
+        len_a = self._compute_seq_lengths(batch, 'seq_a', B)
+        len_d = self._compute_seq_lengths(batch, 'seq_d', B)
+        feats = np.zeros((B, USER_SEQ_LEN_DENSE_DIM), dtype=np.float32)
+        feats[:, 0] = np.log1p(len_a)
+        feats[:, 1] = np.log1p(len_d)
+        feats[:, 2] = len_a / np.maximum(len_d, 1.0)
+        return feats
 
     def _record_oob(
         self,
@@ -710,6 +760,10 @@ class PCVRParquetDataset(IterableDataset):
             col = batch.column(ci)
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
+        if self.use_user_seq_len_dense_features:
+            user_dense[:, self.user_seq_len_dense_offset:
+                       self.user_seq_len_dense_offset + USER_SEQ_LEN_DENSE_DIM] = (
+                self._compute_user_seq_len_dense_features(batch, B))
 
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
@@ -887,6 +941,7 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     use_user_activity_features: bool = False,
+    use_user_seq_len_dense_features: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -936,6 +991,7 @@ def get_pcvr_data(
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
         use_user_activity_features=use_user_activity_features,
+        use_user_seq_len_dense_features=use_user_seq_len_dense_features,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -959,6 +1015,7 @@ def get_pcvr_data(
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
         use_user_activity_features=use_user_activity_features,
+        use_user_seq_len_dense_features=use_user_seq_len_dense_features,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

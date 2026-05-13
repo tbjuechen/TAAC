@@ -1399,6 +1399,7 @@ class PCVRHyFormer(nn.Module):
         item_int_feature_ids: Optional[List[int]] = None,
         user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         item_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
+        user_seq_len_dense_fid: Optional[int] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1544,6 +1545,8 @@ class PCVRHyFormer(nn.Module):
         if self.has_user_dense:
             dense_emb_group = [61, 87]
             dense_other_group = [62, 63, 64, 65, 66, 89, 90, 91]
+            if user_seq_len_dense_fid is not None:
+                dense_emb_group.append(user_seq_len_dense_fid)
             dense_fids = {
                 fid for fid, _, _ in (user_dense_feature_specs or [])
             }

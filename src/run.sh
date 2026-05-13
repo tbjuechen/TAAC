@@ -18,6 +18,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.9 dow-only ablation:          USE_SEQ_DOW=1 ./run.sh
 # W2.9b per-domain periodic:       USE_PER_DOMAIN_PERIODIC_TIME=1 ./run.sh
 # User activity sparse features:   USE_USER_ACTIVITY=1 ./run.sh
+# User seq-length dense features:  USE_USER_SEQ_LEN_DENSE=1 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
@@ -31,6 +32,7 @@ USE_SEQ_HOUR="${USE_SEQ_HOUR:-0}"
 USE_SEQ_DOW="${USE_SEQ_DOW:-0}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
 USE_USER_ACTIVITY="${USE_USER_ACTIVITY:-0}"
+USE_USER_SEQ_LEN_DENSE="${USE_USER_SEQ_LEN_DENSE:-0}"
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
         D_MODEL=68
@@ -50,6 +52,7 @@ EXTRA_FLAGS=""
 [ "${USE_SEQ_DOW}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_day_of_week_feature"
 [ "${USE_PER_DOMAIN_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_seq_periodic_time_features"
 [ "${USE_USER_ACTIVITY}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_user_activity_features"
+[ "${USE_USER_SEQ_LEN_DENSE}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_user_seq_len_dense_features"
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
