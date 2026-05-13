@@ -183,6 +183,12 @@ def parse_args() -> argparse.Namespace:
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
                         help='RoPE base frequency (default 10000)')
+    parser.add_argument('--query_pooling', type=str, default='mean',
+                        choices=['mean', 'din_concat'],
+                        help='Sequence summary used before query-token generation: '
+                             'mean = baseline masked mean pool, '
+                             'din_concat = post-encoder mean pool plus item-target '
+                             'sigmoid-DIN pool concatenated into global info')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -405,6 +411,7 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "split_user_int_shared_fids": args.split_user_int_shared_fids,
         "use_dense_group_projector": args.use_dense_group_projector,
+        "query_pooling": args.query_pooling,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
