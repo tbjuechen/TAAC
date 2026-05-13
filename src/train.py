@@ -21,6 +21,7 @@ import torch
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import (
     FeatureSchema,
+    USER_ACTIVITY_FIDS,
     USER_TIME_DOW_FID,
     USER_TIME_HOD_FID,
     get_pcvr_data,
@@ -157,6 +158,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_time_summary_features', action='store_true', default=False,
                         help='Add one NS token from per-domain sequence time summary features '
                              '(last/oldest/span/density/window counts).')
+    parser.add_argument('--use_user_activity_features', action='store_true', default=False,
+                        help='Add three derived user-int sparse features for aggregate '
+                             'four-sequence activity counts: lifetime, 7d, and 30d.')
     parser.add_argument('--use_seq_periodic_time_features', action='store_true', default=False,
                         help='Concatenate hour-of-day and day-of-week embeddings to each '
                              'sequence token before the per-domain sequence projection.')
@@ -333,6 +337,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        use_user_activity_features=args.use_user_activity_features,
     )
 
     # ---- NS groups ----
@@ -344,6 +349,7 @@ def main() -> None:
         user_group_values[-1] = user_group_values[-1] + [
             USER_TIME_DOW_FID,
             USER_TIME_HOD_FID,
+            *USER_ACTIVITY_FIDS,
         ]
         user_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.user_int_schema.entries)}
         item_fid_to_idx = {fid: i for i, (fid, _, _) in enumerate(pcvr_dataset.item_int_schema.entries)}

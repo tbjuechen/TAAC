@@ -152,6 +152,33 @@ USER_TIME_DOW_FID = 900001
 USER_TIME_HOD_FID = 900002
 NUM_USER_TIME_DOW_BUCKETS = 8
 NUM_USER_TIME_HOD_BUCKETS = 25
+USER_ACTIVITY_LIFETIME_FID = 900003
+USER_ACTIVITY_7D_FID = 900004
+USER_ACTIVITY_30D_FID = 900005
+
+# Derived sparse buckets for four-domain user activity counts. Bucket id 0 is
+# reserved for padding; bucket id 1 captures zero counts. The boundaries are
+# inclusive upper bounds chosen from the public sample's aggregate sequence
+# count distribution, with wider tails so full-data users above the sample max
+# collapse into a stable overflow bucket instead of going OOB.
+USER_ACTIVITY_LIFETIME_BOUNDARIES = np.array([
+    0, 128, 256, 512, 768, 1024, 1536, 2048,
+    2560, 3072, 4096, 5120, 6144, 8192,
+], dtype=np.int64)
+USER_ACTIVITY_7D_BOUNDARIES = np.array([
+    0, 8, 16, 32, 64, 128, 192, 256,
+    384, 512, 768, 1024, 1536, 2048,
+], dtype=np.int64)
+USER_ACTIVITY_30D_BOUNDARIES = np.array([
+    0, 64, 128, 256, 512, 768, 1024, 1536,
+    2048, 2560, 3072, 4096, 5120, 8192,
+], dtype=np.int64)
+NUM_USER_ACTIVITY_BUCKETS = len(USER_ACTIVITY_LIFETIME_BOUNDARIES) + 2
+USER_ACTIVITY_FIDS = [
+    USER_ACTIVITY_LIFETIME_FID,
+    USER_ACTIVITY_7D_FID,
+    USER_ACTIVITY_30D_FID,
+]
 
 
 class PCVRParquetDataset(IterableDataset):
@@ -175,6 +202,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        use_user_activity_features: bool = False,
     ) -> None:
         """
         Args:
@@ -192,8 +220,11 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            use_user_activity_features: if True, append three derived sparse
+                user-int features from aggregate sequence interaction counts.
         """
         super().__init__()
+        self.use_user_activity_features = use_user_activity_features
 
         # Accept either a directory or a single file path.
         if os.path.isdir(parquet_path):
@@ -317,6 +348,16 @@ class PCVRParquetDataset(IterableDataset):
         self.user_time_hod_offset = self.user_int_schema.total_dim
         self.user_int_schema.add(USER_TIME_HOD_FID, 1)
         self.user_int_vocab_sizes.append(NUM_USER_TIME_HOD_BUCKETS - 1)
+        if self.use_user_activity_features:
+            self.user_activity_lifetime_offset = self.user_int_schema.total_dim
+            self.user_int_schema.add(USER_ACTIVITY_LIFETIME_FID, 1)
+            self.user_int_vocab_sizes.append(NUM_USER_ACTIVITY_BUCKETS - 1)
+            self.user_activity_7d_offset = self.user_int_schema.total_dim
+            self.user_int_schema.add(USER_ACTIVITY_7D_FID, 1)
+            self.user_int_vocab_sizes.append(NUM_USER_ACTIVITY_BUCKETS - 1)
+            self.user_activity_30d_offset = self.user_int_schema.total_dim
+            self.user_int_schema.add(USER_ACTIVITY_30D_FID, 1)
+            self.user_int_vocab_sizes.append(NUM_USER_ACTIVITY_BUCKETS - 1)
 
         # ---- item_int ----
         self._item_int_cols: List[List[int]] = raw['item_int']
@@ -420,6 +461,58 @@ class PCVRParquetDataset(IterableDataset):
         buffer.clear()
 
     # ---- Helpers ----
+
+    @staticmethod
+    def _bucketize_counts(
+        counts: "npt.NDArray[np.int64]",
+        boundaries: "npt.NDArray[np.int64]",
+    ) -> "npt.NDArray[np.int64]":
+        """Map non-negative count values to sparse bucket ids.
+
+        ``boundaries`` are inclusive upper bounds for bucket ids starting at 1;
+        values above the last boundary map to the final overflow bucket.
+        """
+        return np.searchsorted(boundaries, counts, side='left').astype(np.int64) + 1
+
+    def _compute_user_activity_buckets(
+        self,
+        batch: "pa.RecordBatch",
+        timestamps: "npt.NDArray[np.int64]",
+        B: int,
+    ) -> Tuple["npt.NDArray[np.int64]", "npt.NDArray[np.int64]", "npt.NDArray[np.int64]"]:
+        """Aggregate activity counts from all sequence timestamp columns."""
+        lifetime_counts = np.zeros(B, dtype=np.int64)
+        counts_7d = np.zeros(B, dtype=np.int64)
+        counts_30d = np.zeros(B, dtype=np.int64)
+
+        for domain in self.seq_domains:
+            _, ts_ci = self._seq_plan[domain]
+            if ts_ci is None:
+                continue
+
+            ts_col = batch.column(ts_ci)
+            ts_offs = ts_col.offsets.to_numpy()
+            ts_vals = ts_col.values.to_numpy()
+            for i in range(B):
+                s = int(ts_offs[i])
+                e = int(ts_offs[i + 1])
+                if e <= s:
+                    continue
+                seq_ts = ts_vals[s:e]
+                valid_ts = seq_ts > 0
+                if not valid_ts.any():
+                    continue
+                valid_seq_ts = seq_ts[valid_ts]
+                time_diff = np.maximum(int(timestamps[i]) - valid_seq_ts, 0)
+                lifetime_counts[i] += int(valid_seq_ts.size)
+                counts_7d[i] += int((time_diff <= 604800).sum())
+                counts_30d[i] += int((time_diff <= 2592000).sum())
+
+        return (
+            self._bucketize_counts(lifetime_counts, USER_ACTIVITY_LIFETIME_BOUNDARIES),
+            self._bucketize_counts(counts_7d, USER_ACTIVITY_7D_BOUNDARIES),
+            self._bucketize_counts(counts_30d, USER_ACTIVITY_30D_BOUNDARIES),
+        )
 
     def _record_oob(
         self,
@@ -582,6 +675,12 @@ class PCVRParquetDataset(IterableDataset):
                 user_int[:, offset:offset + dim] = padded
         user_int[:, self.user_time_dow_offset] = user_time_dow
         user_int[:, self.user_time_hod_offset] = user_time_hod
+        if self.use_user_activity_features:
+            activity_lifetime, activity_7d, activity_30d = self._compute_user_activity_buckets(
+                batch, timestamps, B)
+            user_int[:, self.user_activity_lifetime_offset] = activity_lifetime
+            user_int[:, self.user_activity_7d_offset] = activity_7d
+            user_int[:, self.user_activity_30d_offset] = activity_30d
 
         # ---- item_int ----
         item_int = self._buf_item_int[:B]
@@ -787,6 +886,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    use_user_activity_features: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -835,6 +935,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        use_user_activity_features=use_user_activity_features,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -857,6 +958,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        use_user_activity_features=use_user_activity_features,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

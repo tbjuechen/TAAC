@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 from dataset import (
     FeatureSchema,
     PCVRParquetDataset,
+    USER_ACTIVITY_FIDS,
     USER_TIME_DOW_FID,
     USER_TIME_HOD_FID,
     NUM_DELTA_BUCKETS,
@@ -225,6 +226,7 @@ def build_model(
         user_group_values[-1] = user_group_values[-1] + [
             USER_TIME_DOW_FID,
             USER_TIME_HOD_FID,
+            *USER_ACTIVITY_FIDS,
         ]
         user_fid_to_idx = {
             fid: i for i, (fid, _, _) in enumerate(dataset.user_int_schema.entries)
@@ -406,6 +408,8 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        use_user_activity_features=bool(
+            train_config.get('use_user_activity_features', False)),
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
