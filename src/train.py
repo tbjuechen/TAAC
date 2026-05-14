@@ -235,6 +235,9 @@ def parse_args() -> argparse.Namespace:
                         help='Cosine floor expressed as a fraction of peak --lr '
                              '(0.1 means floor lr = 0.1 * --lr). '
                              'Effective only when --use_cosine_decay is set.')
+    parser.add_argument('--ema_decay', type=float, default=0.0,
+                        help='EMA decay for validation/checkpoint weights '
+                             '(0 = disabled; try 0.999 as the first A/B).')
 
     # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
@@ -538,6 +541,7 @@ def main() -> None:
         use_cosine_decay=args.use_cosine_decay,
         cosine_total_steps=cosine_total_steps,
         cosine_min_lr_ratio=args.cosine_min_lr_ratio,
+        ema_decay=args.ema_decay,
     )
 
     trainer.train()
