@@ -187,7 +187,7 @@ def parse_args() -> argparse.Namespace:
                         choices=['mean', 'din_concat'],
                         help='Sequence summary used before query-token generation: '
                              'mean = baseline masked mean pool, '
-                             'din_concat = post-encoder mean pool plus item-target '
+                             'din_concat = baseline mean pool plus item-target '
                              'sigmoid-DIN pool concatenated into global info')
 
     # Loss function.

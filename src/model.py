@@ -1780,23 +1780,6 @@ class PCVRHyFormer(nn.Module):
             num_target_tokens=self.num_item_target_tokens,
         )
 
-        if query_pooling == 'din_concat':
-            self.query_seq_encoders = nn.ModuleList([
-                create_sequence_encoder(
-                    encoder_type=seq_encoder_type,
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    hidden_mult=hidden_mult,
-                    dropout=dropout_rate,
-                    top_k=seq_top_k,
-                    causal=seq_causal,
-                    gather_side=seq_longer_gather_side,
-                )
-                for _ in range(self.num_sequences)
-            ])
-        else:
-            self.query_seq_encoders = nn.ModuleList()
-
         # MultiSeqHyFormerBlock stack
         self.blocks = nn.ModuleList([
             MultiSeqHyFormerBlock(
@@ -2148,31 +2131,6 @@ class PCVRHyFormer(nn.Module):
         )
         return ns_tokens, target_tokens
 
-    def _prepare_query_sequences(
-        self,
-        seq_tokens_list: list,
-        seq_masks_list: list,
-    ) -> Tuple[list, list]:
-        if self.query_pooling != 'din_concat':
-            return seq_tokens_list, seq_masks_list
-
-        query_seqs = []
-        query_masks = []
-        for i, seq_i in enumerate(seq_tokens_list):
-            rope_cos = None
-            rope_sin = None
-            if self.rotary_emb is not None:
-                rope_cos, rope_sin = self.rotary_emb(seq_i.shape[1], seq_i.device)
-            encoded_i, mask_i = self.query_seq_encoders[i](
-                seq_i,
-                seq_masks_list[i],
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-            )
-            query_seqs.append(encoded_i)
-            query_masks.append(mask_i)
-        return query_seqs, query_masks
-
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -2196,12 +2154,10 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        query_seq_tokens_list, query_seq_masks_list = self._prepare_query_sequences(
-            seq_tokens_list, seq_masks_list)
         q_tokens_list = self.query_generator(
             ns_tokens,
-            query_seq_tokens_list,
-            query_seq_masks_list,
+            seq_tokens_list,
+            seq_masks_list,
             target_tokens=target_tokens,
         )
 
@@ -2236,12 +2192,10 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        query_seq_tokens_list, query_seq_masks_list = self._prepare_query_sequences(
-            seq_tokens_list, seq_masks_list)
         q_tokens_list = self.query_generator(
             ns_tokens,
-            query_seq_tokens_list,
-            query_seq_masks_list,
+            seq_tokens_list,
+            seq_masks_list,
             target_tokens=target_tokens,
         )
 
