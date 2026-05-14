@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from utils import sigmoid_focal_loss, EarlyStopping
+from utils import sigmoid_focal_loss, EarlyStopping, ModelEMA
 from model import ModelInput
 
 
@@ -65,6 +65,7 @@ class PCVRHyFormerRankingTrainer:
         use_cosine_decay: bool = False,
         cosine_total_steps: int = 0,
         cosine_min_lr_ratio: float = 0.1,
+        ema_decay: float = 0.0,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -119,6 +120,12 @@ class PCVRHyFormerRankingTrainer:
         self.scaler = torch.amp.GradScaler(
             'cuda', enabled=False
         )
+        self.ema: Optional[ModelEMA] = None
+        if ema_decay > 0.0:
+            self.ema = ModelEMA(model, decay=ema_decay)
+            logging.info(f"EMA enabled: decay={ema_decay}")
+        else:
+            logging.info("EMA disabled")
 
         # LR scheduler for dense AdamW. Warmup can run alone; cosine decay is
         # gated separately so the default schedule is warmup -> constant lr.
@@ -337,10 +344,16 @@ class PCVRHyFormerRankingTrainer:
         # I/O needed when a new best is confirmed.
         self._remove_old_best_dirs()
 
-        self.early_stopping(val_auc, self.model, {
-            "best_val_AUC": val_auc,
-            "best_val_logloss": val_logloss,
-        })
+        if self.ema is not None:
+            self.ema.apply_shadow(self.model)
+        try:
+            self.early_stopping(val_auc, self.model, {
+                "best_val_AUC": val_auc,
+                "best_val_logloss": val_logloss,
+            })
+        finally:
+            if self.ema is not None:
+                self.ema.restore(self.model)
 
         # Write sidecar files only when EarlyStopping actually confirmed a
         # new best and wrote model.pt. If the score tripped our heuristic
@@ -453,6 +466,8 @@ class PCVRHyFormerRankingTrainer:
                             old_state[p.data_ptr()] = self.sparse_optimizer.state[p]
 
                 reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
+                if self.ema is not None:
+                    self.ema.resync(self.model, reinit_ptrs)
                 sparse_params = self.model.get_sparse_params()
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
@@ -551,6 +566,9 @@ class PCVRHyFormerRankingTrainer:
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
 
+        if self.ema is not None:
+            self.ema.update(self.model)
+
         return loss.item()
 
     def evaluate(self, epoch: Optional[int] = None) -> Tuple[float, float]:
@@ -560,51 +578,57 @@ class PCVRHyFormerRankingTrainer:
         out before computing both metrics.
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
-        self.model.eval()
-        if not epoch:
-            epoch = -1
+        if self.ema is not None:
+            self.ema.apply_shadow(self.model)
+        try:
+            self.model.eval()
+            if not epoch:
+                epoch = -1
 
-        pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
+            pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
 
-        all_logits_list = []
-        all_labels_list = []
+            all_logits_list = []
+            all_labels_list = []
 
-        with torch.no_grad():
-            for step, batch in pbar:
-                logits, labels = self._evaluate_step(batch)
-                all_logits_list.append(logits.detach().cpu())
-                all_labels_list.append(labels.detach().cpu())
+            with torch.no_grad():
+                for step, batch in pbar:
+                    logits, labels = self._evaluate_step(batch)
+                    all_logits_list.append(logits.detach().cpu())
+                    all_labels_list.append(labels.detach().cpu())
 
-        all_logits = torch.cat(all_logits_list, dim=0)
-        all_labels = torch.cat(all_labels_list, dim=0).long()
+            all_logits = torch.cat(all_logits_list, dim=0)
+            all_labels = torch.cat(all_labels_list, dim=0).long()
 
-        # Binary AUC via sklearn.
-        probs = torch.sigmoid(all_logits).numpy()
-        labels_np = all_labels.numpy()
+            # Binary AUC via sklearn.
+            probs = torch.sigmoid(all_logits).numpy()
+            labels_np = all_labels.numpy()
 
-        # Filter NaN predictions (may appear if gradients explode).
-        nan_mask = np.isnan(probs)
-        if nan_mask.any():
-            n_nan = int(nan_mask.sum())
-            logging.warning(f"[Evaluate] {n_nan}/{len(probs)} predictions are NaN, filtering them out")
-            valid_mask = ~nan_mask
-            probs = probs[valid_mask]
-            labels_np = labels_np[valid_mask]
+            # Filter NaN predictions (may appear if gradients explode).
+            nan_mask = np.isnan(probs)
+            if nan_mask.any():
+                n_nan = int(nan_mask.sum())
+                logging.warning(f"[Evaluate] {n_nan}/{len(probs)} predictions are NaN, filtering them out")
+                valid_mask = ~nan_mask
+                probs = probs[valid_mask]
+                labels_np = labels_np[valid_mask]
 
-        if len(probs) == 0 or len(np.unique(labels_np)) < 2:
-            auc = 0.0
-        else:
-            auc = float(roc_auc_score(labels_np, probs))
+            if len(probs) == 0 or len(np.unique(labels_np)) < 2:
+                auc = 0.0
+            else:
+                auc = float(roc_auc_score(labels_np, probs))
 
-        # Binary logloss (same NaN filtering).
-        valid_logits = all_logits[~torch.isnan(all_logits)]
-        valid_labels = all_labels[~torch.isnan(all_logits)]
-        if len(valid_logits) > 0:
-            logloss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels.float()).item()
-        else:
-            logloss = float('inf')
+            # Binary logloss (same NaN filtering).
+            valid_logits = all_logits[~torch.isnan(all_logits)]
+            valid_labels = all_labels[~torch.isnan(all_logits)]
+            if len(valid_logits) > 0:
+                logloss = F.binary_cross_entropy_with_logits(valid_logits, valid_labels.float()).item()
+            else:
+                logloss = float('inf')
 
-        return auc, logloss
+            return auc, logloss
+        finally:
+            if self.ema is not None:
+                self.ema.restore(self.model)
 
     def _evaluate_step(
         self, batch: Dict[str, Any]
