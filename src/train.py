@@ -185,14 +185,26 @@ def parse_args() -> argparse.Namespace:
                         help='RoPE base frequency (default 10000)')
 
     # Loss function.
-    parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
-                        help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
+    parser.add_argument('--loss_type', type=str, default='bce',
+                        choices=['bce', 'focal', 'bce_pairwise'],
+                        help='Loss type: bce = BCEWithLogits, '
+                             'focal = Focal Loss, '
+                             'bce_pairwise = BCE + batch-global pairwise loss')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when --loss_type=focal)')
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
+    parser.add_argument('--pairwise_lambda', type=float, default=0.01,
+                        help='Weight for pairwise loss '
+                             '(effective only when --loss_type=bce_pairwise)')
+    parser.add_argument('--pairwise_warmup_steps', type=int, default=0,
+                        help='Linearly warm up pairwise loss weight over N steps '
+                             '(0 = use full weight from the first step)')
+    parser.add_argument('--pairwise_max_pairs', type=int, default=65536,
+                        help='Maximum number of positive-negative pairs sampled '
+                             'per batch for pairwise loss (0 = use all pairs)')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -522,6 +534,9 @@ def main() -> None:
         use_cosine_decay=args.use_cosine_decay,
         cosine_total_steps=cosine_total_steps,
         cosine_min_lr_ratio=args.cosine_min_lr_ratio,
+        pairwise_lambda=args.pairwise_lambda,
+        pairwise_warmup_steps=args.pairwise_warmup_steps,
+        pairwise_max_pairs=args.pairwise_max_pairs,
     )
 
     trainer.train()

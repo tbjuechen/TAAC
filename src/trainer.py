@@ -65,6 +65,9 @@ class PCVRHyFormerRankingTrainer:
         use_cosine_decay: bool = False,
         cosine_total_steps: int = 0,
         cosine_min_lr_ratio: float = 0.1,
+        pairwise_lambda: float = 0.01,
+        pairwise_warmup_steps: int = 0,
+        pairwise_max_pairs: int = 65536,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -119,6 +122,9 @@ class PCVRHyFormerRankingTrainer:
         self.scaler = torch.amp.GradScaler(
             'cuda', enabled=False
         )
+        self.pairwise_lambda: float = pairwise_lambda
+        self.pairwise_warmup_steps: int = pairwise_warmup_steps
+        self.pairwise_max_pairs: int = pairwise_max_pairs
 
         # LR scheduler for dense AdamW. Warmup can run alone; cosine decay is
         # gated separately so the default schedule is warmup -> constant lr.
@@ -174,9 +180,52 @@ class PCVRHyFormerRankingTrainer:
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
+                     f"pairwise_lambda={pairwise_lambda}, "
+                     f"pairwise_warmup_steps={pairwise_warmup_steps}, "
+                     f"pairwise_max_pairs={pairwise_max_pairs}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
         logging.info("AMP enabled=%s, dtype=bf16, grad_scaler=%s",
                      self.use_amp, self.scaler.is_enabled())
+
+    def _pairwise_weight(self, global_step: int) -> float:
+        """Return the current pairwise loss weight after optional warmup."""
+        if self.pairwise_warmup_steps <= 0:
+            return self.pairwise_lambda
+        progress = min(1.0, global_step / float(self.pairwise_warmup_steps))
+        return self.pairwise_lambda * progress
+
+    def _batch_pairwise_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Batch-global positive-vs-negative logistic ranking loss.
+
+        This is an AUC-style auxiliary loss, not user-grouped BPR. It compares
+        positive and negative samples inside the current mini-batch and gives
+        large gradients to reversed or close positive-negative pairs.
+        """
+        pos_logits = logits[labels > 0.5]
+        neg_logits = logits[labels <= 0.5]
+        if pos_logits.numel() == 0 or neg_logits.numel() == 0:
+            return logits.new_zeros(())
+
+        total_pairs = pos_logits.numel() * neg_logits.numel()
+        if self.pairwise_max_pairs > 0 and total_pairs > self.pairwise_max_pairs:
+            pos_idx = torch.randint(
+                pos_logits.numel(),
+                (self.pairwise_max_pairs,),
+                device=logits.device,
+            )
+            neg_idx = torch.randint(
+                neg_logits.numel(),
+                (self.pairwise_max_pairs,),
+                device=logits.device,
+            )
+            diffs = pos_logits[pos_idx] - neg_logits[neg_idx]
+        else:
+            diffs = pos_logits.unsqueeze(1) - neg_logits.unsqueeze(0)
+        return F.softplus(-diffs).mean()
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -373,8 +422,8 @@ class PCVRHyFormerRankingTrainer:
             loss_sum = 0.0
 
             for step, batch in train_pbar:
-                loss = self._train_step(batch)
                 total_step += 1
+                loss = self._train_step(batch, total_step)
                 loss_sum += loss
                 window_sum += loss
                 window_count += 1
@@ -514,7 +563,7 @@ class PCVRHyFormerRankingTrainer:
             seq_dow_buckets=seq_dow_buckets,
         )
 
-    def _train_step(self, batch: Dict[str, Any]) -> float:
+    def _train_step(self, batch: Dict[str, Any], global_step: int) -> float:
         """Run a single training step and return the scalar loss value."""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label'].float()
@@ -528,12 +577,16 @@ class PCVRHyFormerRankingTrainer:
             'cuda', enabled=self.use_amp, dtype=torch.bfloat16
         ):
             logits = self.model(model_input)  # (B, 1)
-            logits = logits.squeeze(-1)  # (B,)
+        logits = logits.squeeze(-1).float()  # (B,)
 
-            if self.loss_type == 'focal':
-                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-            else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
+        if self.loss_type == 'focal':
+            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+        elif self.loss_type == 'bce_pairwise':
+            bce_loss = F.binary_cross_entropy_with_logits(logits, label)
+            pairwise_loss = self._batch_pairwise_loss(logits, label)
+            loss = bce_loss + self._pairwise_weight(global_step) * pairwise_loss
+        else:
+            loss = F.binary_cross_entropy_with_logits(logits, label)
 
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.dense_optimizer)

@@ -17,6 +17,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.9 hour-only ablation:         USE_SEQ_HOUR=1 ./run.sh
 # W2.9 dow-only ablation:          USE_SEQ_DOW=1 ./run.sh
 # W2.9b per-domain periodic:       USE_PER_DOMAIN_PERIODIC_TIME=1 ./run.sh
+# Pairwise AUC aux loss:           USE_PAIRWISE_LOSS=1 PAIRWISE_LAMBDA=0.01 PAIRWISE_WARMUP_STEPS=1000 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
@@ -29,6 +30,10 @@ USE_SEQ_PERIODIC_TIME="${USE_SEQ_PERIODIC_TIME:-1}"
 USE_SEQ_HOUR="${USE_SEQ_HOUR:-0}"
 USE_SEQ_DOW="${USE_SEQ_DOW:-0}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
+USE_PAIRWISE_LOSS="${USE_PAIRWISE_LOSS:-0}"
+PAIRWISE_LAMBDA="${PAIRWISE_LAMBDA:-0.01}"
+PAIRWISE_WARMUP_STEPS="${PAIRWISE_WARMUP_STEPS:-1000}"
+PAIRWISE_MAX_PAIRS="${PAIRWISE_MAX_PAIRS:-65536}"
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
         D_MODEL=68
@@ -47,6 +52,7 @@ EXTRA_FLAGS=""
 [ "${USE_SEQ_HOUR}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_hour_of_day_feature"
 [ "${USE_SEQ_DOW}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_day_of_week_feature"
 [ "${USE_PER_DOMAIN_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_seq_periodic_time_features"
+[ "${USE_PAIRWISE_LOSS}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --loss_type bce_pairwise --pairwise_lambda ${PAIRWISE_LAMBDA} --pairwise_warmup_steps ${PAIRWISE_WARMUP_STEPS} --pairwise_max_pairs ${PAIRWISE_MAX_PAIRS}"
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
