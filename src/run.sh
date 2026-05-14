@@ -17,7 +17,8 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.9 hour-only ablation:         USE_SEQ_HOUR=1 ./run.sh
 # W2.9 dow-only ablation:          USE_SEQ_DOW=1 ./run.sh
 # W2.9b per-domain periodic:       USE_PER_DOMAIN_PERIODIC_TIME=1 ./run.sh
-# EMA validation/checkpoint:       EMA_DECAY=0.999 ./run.sh
+# EMA validation/checkpoint:       EMA_DECAY=1 ./run.sh
+# EMA decay sweep:                 EMA_DECAY=0.9995 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
@@ -31,6 +32,9 @@ USE_SEQ_HOUR="${USE_SEQ_HOUR:-0}"
 USE_SEQ_DOW="${USE_SEQ_DOW:-0}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
 EMA_DECAY="${EMA_DECAY:-0}"
+if [ "${EMA_DECAY}" = "1" ]; then
+    EMA_DECAY=0.999
+fi
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
         D_MODEL=68
