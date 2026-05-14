@@ -20,6 +20,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.9b per-domain periodic:       USE_PER_DOMAIN_PERIODIC_TIME=1 ./run.sh
 # W2.9c reinit periodic time emb:  REINIT_SEQ_PERIODIC_TIME=1 ./run.sh
 # EMA validation/checkpoint:       EMA_DECAY=0.999 ./run.sh
+# User/history token dropout:      USER_TOKEN_DROPOUT_RATE=0.03 SEQ_TOKEN_DROPOUT_RATE=0.03 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
@@ -36,6 +37,8 @@ USE_SEQ_MONTH_OF_YEAR="${USE_SEQ_MONTH_OF_YEAR:-${USE_SEQ_MOY}}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
 REINIT_SEQ_PERIODIC_TIME="${REINIT_SEQ_PERIODIC_TIME:-0}"
 EMA_DECAY="${EMA_DECAY:-0}"
+USER_TOKEN_DROPOUT_RATE="${USER_TOKEN_DROPOUT_RATE:-0}"
+SEQ_TOKEN_DROPOUT_RATE="${SEQ_TOKEN_DROPOUT_RATE:-0}"
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
         D_MODEL=68
@@ -57,6 +60,8 @@ EXTRA_FLAGS=""
 [ "${USE_PER_DOMAIN_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_seq_periodic_time_features"
 [ "${REINIT_SEQ_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --reinit_seq_periodic_time_features"
 [ "${EMA_DECAY}" != "0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --ema_decay ${EMA_DECAY}"
+[ "${USER_TOKEN_DROPOUT_RATE}" != "0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --user_token_dropout_rate ${USER_TOKEN_DROPOUT_RATE}"
+[ "${SEQ_TOKEN_DROPOUT_RATE}" != "0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --seq_token_dropout_rate ${SEQ_TOKEN_DROPOUT_RATE}"
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \

@@ -127,6 +127,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--dropout_rate', type=float, default=0.01,
                         help='Dropout rate for the backbone '
                              '(seq id-embedding dropout is twice this value)')
+    parser.add_argument('--user_token_dropout_rate', type=float, default=0.0,
+                        help='Extra dropout applied only to user-side NS tokens '
+                             'before the shared input dropout')
+    parser.add_argument('--seq_token_dropout_rate', type=float, default=0.0,
+                        help='Extra dropout applied only to sequence tokens '
+                             'before the shared input dropout')
     parser.add_argument('--seq_top_k', type=int, default=50,
                         help='Number of most-recent tokens kept by LongerEncoder '
                              '(only effective when --seq_encoder_type=longer)')
@@ -395,6 +401,8 @@ def main() -> None:
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "seq_longer_gather_side": args.longer_gather_side,
+        "user_token_dropout_rate": args.user_token_dropout_rate,
+        "seq_token_dropout_rate": args.seq_token_dropout_rate,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "per_domain_time_embeddings": args.per_domain_time_embeddings,
@@ -482,7 +490,12 @@ def main() -> None:
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(
+        f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
+        f"rank_mixer_mode={args.rank_mixer_mode}, "
+        f"user_token_dropout_rate={args.user_token_dropout_rate}, "
+        f"seq_token_dropout_rate={args.seq_token_dropout_rate}"
+    )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
