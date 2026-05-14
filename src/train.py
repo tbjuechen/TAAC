@@ -285,8 +285,6 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--per_domain_time_embeddings and --domain_time_residual_embeddings "
             "are mutually exclusive")
-    if args.ema_decay == 1.0:
-        args.ema_decay = 0.999
 
     return args
 
