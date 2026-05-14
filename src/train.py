@@ -176,9 +176,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
-                             'full = token mixing + per-token FFN (requires d_model divisible by T), '
-                             'ffn_only = per-token FFN only, '
+                             'full = token mixing + FFN (requires d_model divisible by T), '
+                             'ffn_only = FFN only, '
                              'none = identity passthrough')
+    parser.add_argument('--rank_mixer_per_token_ffn', action='store_true', default=False,
+                        help='Use independent FFN parameters for each RankMixer token '
+                             '(default: shared FFN parameters across tokens).')
     parser.add_argument('--use_rope', action='store_true', default=False,
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
@@ -396,6 +399,7 @@ def main() -> None:
         "use_seq_periodic_time_features": args.use_seq_periodic_time_features,
         "per_domain_seq_periodic_time_features": args.per_domain_seq_periodic_time_features,
         "rank_mixer_mode": args.rank_mixer_mode,
+        "rank_mixer_per_token_ffn": args.rank_mixer_per_token_ffn,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
@@ -463,7 +467,11 @@ def main() -> None:
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(
+        f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
+        f"rank_mixer_mode={args.rank_mixer_mode}, "
+        f"rank_mixer_per_token_ffn={args.rank_mixer_per_token_ffn}"
+    )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())

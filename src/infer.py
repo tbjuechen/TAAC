@@ -80,6 +80,7 @@ _FALLBACK_MODEL_CFG = {
     'use_seq_periodic_time_features': False,
     'per_domain_seq_periodic_time_features': False,
     'rank_mixer_mode': 'full',
+    'rank_mixer_per_token_ffn': False,
     'use_rope': False,
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,

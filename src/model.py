@@ -321,7 +321,7 @@ class RankMixerBlock(nn.Module):
 
     Performs three steps:
     1. Token Mixing: Parameter-free tensor reshaping.
-    2. Per-token FFN: Shared-parameter feedforward network.
+    2. FFN: shared by default, or token-specific when enabled.
     3. Residual connection: Q_boost = Q + Q_e.
 
     Constraint: d_model must be divisible by n_total in 'full' mode.
@@ -333,12 +333,14 @@ class RankMixerBlock(nn.Module):
         n_total: int,  # T = Nq + Nns
         hidden_mult: int = 4,
         dropout: float = 0.0,
-        mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
+        mode: str = 'full',  # 'full' | 'ffn_only' | 'none'
+        per_token_ffn: bool = False,
     ) -> None:
         super().__init__()
         self.T = n_total
         self.D = d_model
         self.mode = mode
+        self.per_token_ffn = per_token_ffn
 
         if mode == 'none':
             # Pure identity mapping, no submodules created
@@ -351,11 +353,25 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
-        self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
-        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
-        self.dropout = nn.Dropout(dropout)
+        hidden_dim = d_model * hidden_mult
+        if per_token_ffn:
+            self.token_ffns = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(d_model),
+                    nn.Linear(d_model, hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(hidden_dim, d_model),
+                )
+                for _ in range(n_total)
+            ])
+        else:
+            # Shared FFN applied independently to each token.
+            self.norm = nn.LayerNorm(d_model)
+            self.fc1 = nn.Linear(d_model, hidden_dim)
+            self.fc2 = nn.Linear(hidden_dim, d_model)
+            self.dropout = nn.Dropout(dropout)
+
         # Post-LN after residual to stabilize stacked block outputs
         self.post_norm = nn.LayerNorm(d_model)
 
@@ -403,12 +419,21 @@ class RankMixerBlock(nn.Module):
         else:  # 'ffn_only'
             Q_hat = Q
 
-        # Per-token FFN
-        x = self.norm(Q_hat)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.dropout(x)
-        Q_e = self.fc2(x)
+        if self.per_token_ffn:
+            if Q_hat.size(1) != self.T:
+                raise ValueError(
+                    f"RankMixerBlock expected T={self.T} tokens, got {Q_hat.size(1)}."
+                )
+            Q_e = torch.stack([
+                ffn(Q_hat[:, i, :])
+                for i, ffn in enumerate(self.token_ffns)
+            ], dim=1)
+        else:
+            x = self.norm(Q_hat)
+            x = self.fc1(x)
+            x = F.gelu(x)
+            x = self.dropout(x)
+            Q_e = self.fc2(x)
 
         # Residual from original Q
         Q_boost = Q + Q_e
@@ -886,7 +911,8 @@ class MultiSeqHyFormerBlock(nn.Module):
         top_k: int = 50,
         causal: bool = False,
         longer_gather_side: str = 'head',
-        rank_mixer_mode: str = 'full'
+        rank_mixer_mode: str = 'full',
+        rank_mixer_per_token_ffn: bool = False,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -926,7 +952,8 @@ class MultiSeqHyFormerBlock(nn.Module):
             n_total=n_total,
             hidden_mult=hidden_mult,
             dropout=dropout,
-            mode=rank_mixer_mode
+            mode=rank_mixer_mode,
+            per_token_ffn=rank_mixer_per_token_ffn,
         )
 
     def forward(
@@ -1422,6 +1449,7 @@ class PCVRHyFormer(nn.Module):
         use_seq_periodic_time_features: bool = False,
         per_domain_seq_periodic_time_features: bool = False,
         rank_mixer_mode: str = 'full',
+        rank_mixer_per_token_ffn: bool = False,
         use_rope: bool = False,
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
@@ -1462,6 +1490,7 @@ class PCVRHyFormer(nn.Module):
         )
         self.per_domain_seq_periodic_time_features = per_domain_seq_periodic_time_features
         self.rank_mixer_mode = rank_mixer_mode
+        self.rank_mixer_per_token_ffn = rank_mixer_per_token_ffn
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
@@ -1727,6 +1756,7 @@ class PCVRHyFormer(nn.Module):
                 causal=seq_causal,
                 longer_gather_side=seq_longer_gather_side,
                 rank_mixer_mode=rank_mixer_mode,
+                rank_mixer_per_token_ffn=rank_mixer_per_token_ffn,
             )
             for _ in range(num_hyformer_blocks)
         ])
