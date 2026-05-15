@@ -263,12 +263,12 @@ def parse_args() -> argparse.Namespace:
                              '(0 = automatically use the number of item groups)')
     parser.add_argument('--split_user_int_shared_fids', action='store_true',
                         help='In rankmixer mode, extract user-int fids '
-                             '62/63/64/65/66/89/90/91 into one dedicated MLP '
-                             'token and split the remaining user-int features '
-                             'across user_ns_tokens-1 RankMixer tokens.')
+                             '62/63/64/65/66 and 89/90/91 into two dedicated MLP '
+                             'tokens and split the remaining user-int features '
+                             'across the remaining RankMixer tokens.')
     parser.add_argument('--use_dense_group_projector', action='store_true',
-                        help='Project TAAC user dense features into two tokens: '
-                             'fid 61/87 and fid 62/63/64/65/66/89/90/91. '
+                        help='Project TAAC user dense features into three tokens: '
+                             'fid 61/87, fid 62/63/64/65/66, and fid 89/90/91. '
                              'When disabled, use the baseline single dense token.')
 
     args = parser.parse_args()

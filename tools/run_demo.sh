@@ -24,7 +24,7 @@ export TRAIN_TF_EVENTS_PATH="${PROJECT_ROOT}/runs/tensorboard"
     --buffer_batches 1 \
     --valid_ratio 0.2 \
     --seq_max_lens seq_a:16,seq_b:16,seq_c:16,seq_d:16 \
-    --d_model 16 \
+    --d_model 72 \
     --emb_dim 8 \
     --num_queries 2 \
     --num_hyformer_blocks 1 \
@@ -34,7 +34,7 @@ export TRAIN_TF_EVENTS_PATH="${PROJECT_ROOT}/runs/tensorboard"
     --dropout_rate 0.01 \
     --rank_mixer_mode full \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 4 \
+    --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --split_user_int_shared_fids \
     --use_dense_group_projector \

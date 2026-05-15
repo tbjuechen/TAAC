@@ -31,9 +31,9 @@ USE_SEQ_DOW="${USE_SEQ_DOW:-0}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
-        D_MODEL=68
+        D_MODEL=76
     else
-        D_MODEL=64
+        D_MODEL=72
     fi
 fi
 # ============================================================
@@ -51,7 +51,7 @@ EXTRA_FLAGS=""
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 4 \
+    --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --split_user_int_shared_fids \
     --use_dense_group_projector \
@@ -72,16 +72,15 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----
 # Uses feature grouping from ns_groups.json (7 user groups + 4 item groups).
-# With d_model=64 and num_ns=13 (7 user_int + 2 user_dense + 4 item_int),
-# rank_mixer_mode=full has no valid num_queries because T=4*num_queries+13
-# does not divide 64 for positive num_queries. Use ffn_only/none or adjust
-# d_model before enabling this block.
+# With d_model=72 and num_ns=14 (7 user_int + 3 user_dense + 4 item_int),
+# num_queries=1 gives T=18, which is compatible with rank_mixer_mode=full.
 # To switch, comment out the block above and uncomment the block below.
 #
 # python3 -u "${SCRIPT_DIR}/train.py" \
 #     --ns_tokenizer_type group \
 #     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
 #     --num_queries 1 \
+#     --d_model "${D_MODEL}" \
 #     --emb_skip_threshold 1000000 \
 #     --num_workers 8 \
 #     --use_amp \

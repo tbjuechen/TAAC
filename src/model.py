@@ -1210,13 +1210,13 @@ class RankMixerNSTokenizer(nn.Module):
 
 
 class SplitUserIntNSTokenizer(nn.Module):
-    """User-int tokenizer with one selected-fid token plus RankMixer tokens."""
+    """User-int tokenizer with selected-fid tokens plus RankMixer tokens."""
 
     def __init__(
         self,
         feature_specs: List[Tuple[int, int, int]],
         feature_ids: List[int],
-        special_fids: List[int],
+        special_fids: Union[List[int], List[List[int]]],
         groups: List[List[int]],
         emb_dim: int,
         d_model: int,
@@ -1226,14 +1226,25 @@ class SplitUserIntNSTokenizer(nn.Module):
         super().__init__()
         self.feature_specs = feature_specs
         self.feature_ids = feature_ids
-        self.special_fids = special_fids
+        if special_fids and isinstance(special_fids[0], int):
+            special_fid_groups = [special_fids]
+        else:
+            special_fid_groups = special_fids
+        self.special_fid_groups = special_fid_groups
         self.emb_dim = emb_dim
         self.num_regular_tokens = num_regular_tokens
         self.emb_skip_threshold = emb_skip_threshold
 
         fid_to_idx = {fid: idx for idx, fid in enumerate(feature_ids)}
-        self.special_indices = [fid_to_idx[fid] for fid in special_fids]
-        special_index_set = set(self.special_indices)
+        self.special_index_groups = [
+            [fid_to_idx[fid] for fid in group]
+            for group in special_fid_groups
+        ]
+        special_index_set = {
+            fid_idx
+            for group in self.special_index_groups
+            for fid_idx in group
+        }
         self.regular_groups = [
             [fid_idx for fid_idx in group if fid_idx not in special_index_set]
             for group in groups
@@ -1257,13 +1268,15 @@ class SplitUserIntNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
-        special_dim = len(self.special_indices) * emb_dim
-        self.special_proj = nn.Sequential(
-            nn.Linear(special_dim, d_model * 2),
-            nn.SiLU(),
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model),
-        )
+        self.special_projs = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(len(group) * emb_dim, d_model * 2),
+                nn.SiLU(),
+                nn.Linear(d_model * 2, d_model),
+                nn.LayerNorm(d_model),
+            )
+            for group in self.special_index_groups
+        ])
 
         total_regular_fids = sum(len(g) for g in self.regular_groups)
         total_regular_dim = total_regular_fids * emb_dim
@@ -1279,8 +1292,9 @@ class SplitUserIntNSTokenizer(nn.Module):
         ])
 
         logging.info(
-            f"SplitUserIntNSTokenizer: special_fids={special_fids}, "
-            f"regular_fids={total_regular_fids}, special_dim={special_dim}, "
+            f"SplitUserIntNSTokenizer: special_fid_groups={special_fid_groups}, "
+            f"regular_fids={total_regular_fids}, "
+            f"special_dims={[len(group) * emb_dim for group in self.special_index_groups]}, "
             f"regular_chunk_dim={self.chunk_dim}, regular_tokens={num_regular_tokens}, "
             f"pad={self._pad_size}"
         )
@@ -1302,13 +1316,15 @@ class SplitUserIntNSTokenizer(nn.Module):
         return (emb_all * mask).sum(dim=1) / count
 
     def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
-        special_embs = [
-            self._embed_feature(int_feats, fid_idx)
-            for fid_idx in self.special_indices
-        ]
-        special_token = F.silu(
-            self.special_proj(torch.cat(special_embs, dim=-1))
-        ).unsqueeze(1)
+        special_tokens = []
+        for group, proj in zip(self.special_index_groups, self.special_projs):
+            special_embs = [
+                self._embed_feature(int_feats, fid_idx)
+                for fid_idx in group
+            ]
+            special_tokens.append(
+                F.silu(proj(torch.cat(special_embs, dim=-1))).unsqueeze(1)
+            )
 
         regular_embs = []
         for group in self.regular_groups:
@@ -1323,7 +1339,7 @@ class SplitUserIntNSTokenizer(nn.Module):
         for chunk, proj in zip(cat_emb.split(self.chunk_dim, dim=-1), self.token_projs):
             regular_tokens.append(F.silu(proj(chunk)).unsqueeze(1))
 
-        return torch.cat([special_token] + regular_tokens, dim=1)
+        return torch.cat(special_tokens + regular_tokens, dim=1)
 
 
 class DenseGroupProjector(nn.Module):
@@ -1495,25 +1511,36 @@ class PCVRHyFormer(nn.Module):
                 user_ns_tokens = len(user_ns_groups)
             if item_ns_tokens <= 0:
                 item_ns_tokens = len(item_ns_groups)
-            split_user_int_fids = [62, 63, 64, 65, 66, 89, 90, 91]
+            split_user_int_fid_groups = [
+                [62, 63, 64, 65, 66],
+                [89, 90, 91],
+            ]
+            split_user_int_fids = [
+                fid for group in split_user_int_fid_groups for fid in group
+            ]
             user_int_fid_set = set(user_int_feature_ids or [])
-            if (split_user_int_shared_fids and user_ns_tokens > 1
+            num_special_user_int_tokens = len(split_user_int_fid_groups)
+            if (split_user_int_shared_fids
+                    and user_ns_tokens > num_special_user_int_tokens
                     and set(split_user_int_fids).issubset(user_int_fid_set)):
                 self.user_ns_tokenizer = SplitUserIntNSTokenizer(
                     feature_specs=user_int_feature_specs,
                     feature_ids=user_int_feature_ids or [],
-                    special_fids=split_user_int_fids,
+                    special_fids=split_user_int_fid_groups,
                     groups=user_ns_groups,
                     emb_dim=emb_dim,
                     d_model=d_model,
-                    num_regular_tokens=user_ns_tokens - 1,
+                    num_regular_tokens=(
+                        user_ns_tokens - num_special_user_int_tokens
+                    ),
                     emb_skip_threshold=emb_skip_threshold,
                 )
             else:
                 if split_user_int_shared_fids:
                     logging.warning(
                         "split_user_int_shared_fids is enabled but the expected "
-                        "TAAC user-int fids are unavailable or user_ns_tokens <= 1; "
+                        "TAAC user-int fids are unavailable or user_ns_tokens "
+                        f"<= {num_special_user_int_tokens}; "
                         "falling back to baseline RankMixer user-int tokenizer."
                     )
                 self.user_ns_tokenizer = RankMixerNSTokenizer(
@@ -1543,15 +1570,23 @@ class PCVRHyFormer(nn.Module):
         self.user_dense_num_tokens = 0
         if self.has_user_dense:
             dense_emb_group = [61, 87]
-            dense_other_group = [62, 63, 64, 65, 66, 89, 90, 91]
+            dense_6266_group = [62, 63, 64, 65, 66]
+            dense_8991_group = [89, 90, 91]
+            dense_groups = [
+                dense_emb_group,
+                dense_6266_group,
+                dense_8991_group,
+            ]
             dense_fids = {
                 fid for fid, _, _ in (user_dense_feature_specs or [])
             }
             if (use_dense_group_projector
-                    and set(dense_emb_group + dense_other_group).issubset(dense_fids)):
+                    and set(
+                        fid for group in dense_groups for fid in group
+                    ).issubset(dense_fids)):
                 self.user_dense_proj = DenseGroupProjector(
                     feature_specs=user_dense_feature_specs or [],
-                    groups=[dense_emb_group, dense_other_group],
+                    groups=dense_groups,
                     d_model=d_model,
                 )
             else:
