@@ -14,6 +14,9 @@ Example:
         --max-rows 200000 \
         --out-md output/time_bucket_eda.md \
         --out-json output/time_bucket_eda.json
+
+For platform runs where output files are hard to retrieve, the script prints
+one compact JSON line prefixed with ``TIME_BUCKET_EDA_JSON=``.
 """
 
 from __future__ import annotations
@@ -539,6 +542,8 @@ def main() -> int:
                         help="maximum rows to sample; 0 means all rows")
     parser.add_argument("--out-md", default="output/time_bucket_eda.md")
     parser.add_argument("--out-json", default="output/time_bucket_eda.json")
+    parser.add_argument("--no-print-json", action="store_true",
+                        help="do not print the one-line JSON payload to stdout")
     args = parser.parse_args()
     if args.max_rows == 0:
         args.max_rows = None
@@ -552,6 +557,9 @@ def main() -> int:
     out_md.parent.mkdir(parents=True, exist_ok=True)
     out_md.write_text(render_markdown(result), encoding="utf-8")
 
+    if not args.no_print_json:
+        compact_json = json.dumps(result, separators=(",", ":"), ensure_ascii=True)
+        print(f"TIME_BUCKET_EDA_JSON={compact_json}")
     print(f"wrote {out_md}")
     print(f"wrote {out_json}")
     return 0
