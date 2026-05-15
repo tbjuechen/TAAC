@@ -321,7 +321,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not parquet_files:
         raise SystemExit(f"no parquet files found under {data_dir}")
     first_pf = pq.ParquetFile(parquet_files[0])
-    first_schema_names = first_pf.schema.names
+    first_schema_names = first_pf.schema_arrow.names
 
     seq_cfg = schema["seq"]
     domains = sorted(seq_cfg.keys())
@@ -396,7 +396,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     for parquet_path in parquet_files:
         pf = pq.ParquetFile(parquet_path)
-        schema_names = set(pf.schema.names)
+        schema_names = set(pf.schema_arrow.names)
         requested_cols = [c for c in columns if c in schema_names]
         for col in ts_cols.values():
             if col not in schema_names:
