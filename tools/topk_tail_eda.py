@@ -160,6 +160,10 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated coverage cutoffs")
     parser.add_argument("--out-json", default="output/topk_tail_eda.json")
     parser.add_argument("--out-md", default="output/topk_tail_eda.md")
+    parser.add_argument("--print-md", action="store_true",
+                        help="Print the full Markdown report to stdout for platforms where output files are inaccessible.")
+    parser.add_argument("--print-json", action="store_true",
+                        help="Print the full JSON result to stdout after the Markdown/summary output.")
     return parser.parse_args()
 
 
@@ -782,6 +786,13 @@ def final_summary_line(result: dict[str, Any], out_json: Path, out_md: Path) -> 
     return "TOPK_TAIL_EDA_DONE " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
+def print_block(marker: str, text: str) -> None:
+    print(f"{marker}_BEGIN", flush=True)
+    for line in text.splitlines():
+        print(line, flush=True)
+    print(f"{marker}_END", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     result = run(args)
@@ -792,10 +803,18 @@ def main() -> None:
     out_md.parent.mkdir(parents=True, exist_ok=True)
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
-    out_md.write_text(render_markdown(result), encoding="utf-8")
+    md_report = render_markdown(result)
+    out_md.write_text(md_report, encoding="utf-8")
     log_progress(f"wrote_json path={out_json}")
     log_progress(f"wrote_md path={out_md}")
     print(final_summary_line(result, out_json, out_md), flush=True)
+    if args.print_md:
+        print_block("TOPK_TAIL_EDA_MARKDOWN", md_report)
+    if args.print_json:
+        print_block(
+            "TOPK_TAIL_EDA_JSON",
+            json.dumps(result, indent=2, ensure_ascii=False),
+        )
 
 
 if __name__ == "__main__":
