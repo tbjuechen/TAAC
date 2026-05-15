@@ -55,6 +55,12 @@ BOUNDARY_QUANTILES = np.linspace(
     len(RECENCY_BOUNDARIES) / (len(RECENCY_BOUNDARIES) + 1),
     len(RECENCY_BOUNDARIES),
 )
+KNOWN_TS_FIDS = {
+    "seq_a": 39,
+    "seq_b": 67,
+    "seq_c": 27,
+    "seq_d": 26,
+}
 
 
 def _list_parquet_files(data_dir: Path) -> list[Path]:
@@ -88,6 +94,26 @@ def _parse_seq_max_lens(s: str | None) -> dict[str, int]:
         key, value = pair.split(":", 1)
         result[key.strip()] = int(value.strip())
     return result
+
+
+def _resolve_ts_fid(domain: str, cfg: dict[str, Any]) -> int | None:
+    """Resolve timestamp fid even when platform schema leaves ts_fid null."""
+    if cfg.get("ts_fid") is not None:
+        return int(cfg["ts_fid"])
+
+    feature_vocab = {int(fid): int(vs) for fid, vs in cfg.get("features", [])}
+    known = KNOWN_TS_FIDS.get(domain)
+    if known in feature_vocab:
+        return known
+
+    timestamp_like = [
+        fid for fid, vs in feature_vocab.items()
+        if vs >= 1_000_000_000
+    ]
+    if len(timestamp_like) == 1:
+        return timestamp_like[0]
+
+    return None
 
 
 def _bucket_counts(values: np.ndarray, boundaries: np.ndarray, clip_upper: bool) -> list[int]:
@@ -256,10 +282,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         domain: seq_max_lens.get(domain, 256)
         for domain in domains
     }
+    ts_fids = {
+        domain: _resolve_ts_fid(domain, seq_cfg[domain])
+        for domain in domains
+    }
     ts_cols = {
-        d: f"{seq_cfg[d]['prefix']}_{seq_cfg[d]['ts_fid']}"
+        d: f"{seq_cfg[d]['prefix']}_{ts_fids[d]}"
         for d in domains
-        if seq_cfg[d].get("ts_fid") is not None
+        if ts_fids[d] is not None
+    }
+    inferred_ts = {
+        d: ts_fids[d]
+        for d in domains
+        if seq_cfg[d].get("ts_fid") is None and ts_fids[d] is not None
     }
     columns = ["timestamp", "label_type", *ts_cols.values()]
     rg_total = 0
@@ -270,6 +305,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "TIME_BUCKET_EDA_PROGRESS "
             f"stage=start files={len(parquet_files)} row_groups={rg_total} "
             f"max_rows={args.max_rows or 0} seq_max_lens={args.seq_max_lens}",
+            flush=True,
+        )
+        if inferred_ts:
+            print(
+                "TIME_BUCKET_EDA_PROGRESS "
+                f"stage=ts_fid_inferred inferred_ts_fids={inferred_ts}",
+                flush=True,
+            )
+        print(
+            "TIME_BUCKET_EDA_PROGRESS "
+            f"stage=ts_columns ts_cols={ts_cols}",
             flush=True,
         )
 
@@ -285,14 +331,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     rows_seen = 0
     pos_rows = 0
     rg_seen = 0
+    missing_ts_cols: set[str] = set()
 
     for parquet_path in parquet_files:
         pf = pq.ParquetFile(parquet_path)
+        schema_names = set(pf.schema.names)
+        requested_cols = [c for c in columns if c in schema_names]
+        for col in ts_cols.values():
+            if col not in schema_names:
+                missing_ts_cols.add(col)
         for rg_idx in range(pf.num_row_groups):
             if args.max_rows and rows_seen >= args.max_rows:
                 break
             rg_seen += 1
-            table = pf.read_row_group(rg_idx, columns=[c for c in columns if c in pf.schema.names])
+            table = pf.read_row_group(rg_idx, columns=requested_cols)
             df = table.to_pandas()
             if args.max_rows:
                 df = df.iloc[: max(0, args.max_rows - rows_seen)]
@@ -378,6 +430,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "data_dir": str(data_dir),
         "schema_path": str(schema_path),
         "seq_max_lens": seq_max_lens,
+        "ts_fids": ts_fids,
+        "missing_ts_columns": sorted(missing_ts_cols),
         "rows_seen": rows_seen,
         "pos_rate": pos_rows / rows_seen if rows_seen else 0.0,
         "recency": {},
