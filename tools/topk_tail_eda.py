@@ -208,6 +208,38 @@ def build_row_group_tasks(parquet_files: list[Path], max_row_groups: int) -> lis
     return tasks
 
 
+def top_level_columns(parquet_path: Path) -> set[str]:
+    """Return top-level Parquet column names.
+
+    ``ParquetFile.schema.names`` exposes nested leaf names for list columns
+    (often repeated as ``element``). ``schema_arrow.names`` is the top-level
+    schema used by ``read_row_group(columns=[...])``.
+    """
+    return set(pq.ParquetFile(parquet_path).schema_arrow.names)
+
+
+def validate_target_columns(parquet_files: list[Path], targets: dict[str, Target]) -> None:
+    if not parquet_files:
+        return
+    columns = top_level_columns(parquet_files[0])
+    required = {"label_type", *(target.feature_col for target in targets.values())}
+    missing = sorted(required - columns)
+    if not missing:
+        return
+
+    seq_like = sorted(
+        name for name in columns
+        if name.startswith("domain_") or name.startswith("seq_")
+    )
+    preview = ", ".join(seq_like[:40])
+    raise SystemExit(
+        "missing required parquet columns: "
+        + ", ".join(missing)
+        + "\nTop-level sequence-like columns preview: "
+        + (preview or "<none>")
+    )
+
+
 def split_tasks(tasks: list[tuple[str, int]], workers: int) -> list[list[tuple[str, int]]]:
     if workers <= 1:
         return [tasks]
@@ -283,7 +315,7 @@ def pass1_worker(
 
     for parquet_path, rg_idx in tasks:
         pf = pq.ParquetFile(parquet_path)
-        available = set(pf.schema.names)
+        available = set(pf.schema_arrow.names)
         read_cols = [c for c in columns if c in available]
         table = pf.read_row_group(rg_idx, columns=read_cols)
         labels = table["label_type"].to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
@@ -365,7 +397,7 @@ def pass2_worker(
 
     for parquet_path, rg_idx in tasks:
         pf = pq.ParquetFile(parquet_path)
-        available = set(pf.schema.names)
+        available = set(pf.schema_arrow.names)
         read_cols = [c for c in columns if c in available]
         table = pf.read_row_group(rg_idx, columns=read_cols)
         labels = table["label_type"].to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
@@ -613,6 +645,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     parquet_files = list_parquet_files(data_dir)
     if not parquet_files:
         raise SystemExit(f"no parquet files found under {data_dir}")
+    validate_target_columns(parquet_files, targets)
 
     tasks = build_row_group_tasks(parquet_files, args.max_row_groups)
     if not tasks:
