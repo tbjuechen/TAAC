@@ -262,6 +262,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if seq_cfg[d].get("ts_fid") is not None
     }
     columns = ["timestamp", "label_type", *ts_cols.values()]
+    rg_total = 0
+    for parquet_path in parquet_files:
+        rg_total += pq.ParquetFile(parquet_path).num_row_groups
+    if not args.quiet_progress:
+        print(
+            "TIME_BUCKET_EDA_PROGRESS "
+            f"stage=start files={len(parquet_files)} row_groups={rg_total} "
+            f"max_rows={args.max_rows or 0} seq_max_lens={args.seq_max_lens}",
+            flush=True,
+        )
 
     recency_values: dict[str, list[np.ndarray]] = {d: [] for d in domains}
     retained_recency_values: dict[str, list[np.ndarray]] = {d: [] for d in domains}
@@ -274,12 +284,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     dropped_token_counts: dict[str, int] = {d: 0 for d in domains}
     rows_seen = 0
     pos_rows = 0
+    rg_seen = 0
 
     for parquet_path in parquet_files:
         pf = pq.ParquetFile(parquet_path)
         for rg_idx in range(pf.num_row_groups):
             if args.max_rows and rows_seen >= args.max_rows:
                 break
+            rg_seen += 1
             table = pf.read_row_group(rg_idx, columns=[c for c in columns if c in pf.schema.names])
             df = table.to_pandas()
             if args.max_rows:
@@ -327,8 +339,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     delta_values[domain].append(np.concatenate(delta_parts))
 
             rows_seen += len(df)
+            if not args.quiet_progress:
+                print(
+                    "TIME_BUCKET_EDA_PROGRESS "
+                    f"stage=row_group_done row_group={rg_seen}/{rg_total} "
+                    f"file={parquet_path.name} rg_idx={rg_idx} rows_seen={rows_seen} "
+                    f"pos_rows={pos_rows}",
+                    flush=True,
+                )
         if args.max_rows and rows_seen >= args.max_rows:
             break
+
+    if not args.quiet_progress:
+        print(
+            "TIME_BUCKET_EDA_PROGRESS "
+            f"stage=aggregate rows_seen={rows_seen} row_groups_seen={rg_seen}",
+            flush=True,
+        )
 
     recency_arrays = {
         d: np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
@@ -544,6 +571,8 @@ def main() -> int:
     parser.add_argument("--out-json", default="output/time_bucket_eda.json")
     parser.add_argument("--no-print-json", action="store_true",
                         help="do not print the one-line JSON payload to stdout")
+    parser.add_argument("--quiet-progress", action="store_true",
+                        help="suppress row-group progress lines")
     args = parser.parse_args()
     if args.max_rows == 0:
         args.max_rows = None
