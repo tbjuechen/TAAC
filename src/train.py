@@ -395,7 +395,6 @@ def main() -> None:
         "seq_longer_gather_side": args.longer_gather_side,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
-        "time_bucket_boundaries": args.time_bucket_boundaries,
         "per_domain_time_embeddings": args.per_domain_time_embeddings,
         "domain_time_residual_embeddings": args.domain_time_residual_embeddings,
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
