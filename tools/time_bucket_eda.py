@@ -116,6 +116,52 @@ def _resolve_ts_fid(domain: str, cfg: dict[str, Any]) -> int | None:
     return None
 
 
+def _resolve_ts_column(
+    domain: str,
+    cfg: dict[str, Any],
+    ts_fid: int | None,
+    schema_names: list[str],
+) -> str | None:
+    """Resolve the physical parquet column for a sequence timestamp fid.
+
+    Some platform schemas have stale or null ``prefix`` / ``ts_fid`` metadata.
+    The fid suffix is still stable, so fall back to suffix-based matching when
+    the schema-provided ``<prefix>_<fid>`` name is absent.
+    """
+    if ts_fid is None:
+        return None
+
+    names = set(schema_names)
+    prefix = cfg.get("prefix")
+    candidates = []
+    if prefix:
+        candidates.append(f"{prefix}_{ts_fid}")
+    candidates.extend([
+        f"{domain}_{ts_fid}",
+        f"seq_{domain}_{ts_fid}",
+    ])
+    for candidate in candidates:
+        if candidate in names:
+            return candidate
+
+    suffix_matches = [
+        name for name in schema_names
+        if name.endswith(f"_{ts_fid}")
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+
+    domain_tail = domain.split("_")[-1]
+    domain_matches = [
+        name for name in suffix_matches
+        if domain_tail in name
+    ]
+    if len(domain_matches) == 1:
+        return domain_matches[0]
+
+    return None
+
+
 def _bucket_counts(values: np.ndarray, boundaries: np.ndarray, clip_upper: bool) -> list[int]:
     if values.size == 0:
         return [0] * (len(boundaries) + (1 if clip_upper else 2))
@@ -274,6 +320,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     parquet_files = _list_parquet_files(data_dir)
     if not parquet_files:
         raise SystemExit(f"no parquet files found under {data_dir}")
+    first_pf = pq.ParquetFile(parquet_files[0])
+    first_schema_names = first_pf.schema.names
 
     seq_cfg = schema["seq"]
     domains = sorted(seq_cfg.keys())
@@ -287,10 +335,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for domain in domains
     }
     ts_cols = {
-        d: f"{seq_cfg[d]['prefix']}_{ts_fids[d]}"
+        d: _resolve_ts_column(d, seq_cfg[d], ts_fids[d], first_schema_names)
         for d in domains
-        if ts_fids[d] is not None
     }
+    ts_cols = {d: col for d, col in ts_cols.items() if col is not None}
     inferred_ts = {
         d: ts_fids[d]
         for d in domains
@@ -298,8 +346,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     columns = ["timestamp", "label_type", *ts_cols.values()]
     rg_total = 0
-    for parquet_path in parquet_files:
-        rg_total += pq.ParquetFile(parquet_path).num_row_groups
+    for idx, parquet_path in enumerate(parquet_files):
+        pf = first_pf if idx == 0 else pq.ParquetFile(parquet_path)
+        rg_total += pf.num_row_groups
     if not args.quiet_progress:
         print(
             "TIME_BUCKET_EDA_PROGRESS "
@@ -318,6 +367,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"stage=ts_columns ts_cols={ts_cols}",
             flush=True,
         )
+        unresolved = [d for d in domains if d not in ts_cols]
+        if unresolved:
+            seq_like_cols = [
+                name for name in first_schema_names
+                if "seq" in name
+            ][:40]
+            print(
+                "TIME_BUCKET_EDA_PROGRESS "
+                f"stage=ts_columns_unresolved domains={unresolved} "
+                f"seq_like_columns_sample={seq_like_cols}",
+                flush=True,
+            )
 
     recency_values: dict[str, list[np.ndarray]] = {d: [] for d in domains}
     retained_recency_values: dict[str, list[np.ndarray]] = {d: [] for d in domains}
