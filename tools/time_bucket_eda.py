@@ -473,21 +473,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if args.max_rows and rows_seen >= args.max_rows:
                 break
             rg_seen += 1
-            table = pf.read_row_group(rg_idx, columns=requested_cols)
-            df = table.to_pandas()
+            table = pf.read_row_group(
+                rg_idx,
+                columns=requested_cols,
+                use_threads=not args.no_arrow_threads,
+            )
             if args.max_rows:
-                df = df.iloc[: max(0, args.max_rows - rows_seen)]
-            if df.empty:
+                table = table.slice(0, max(0, args.max_rows - rows_seen))
+            if table.num_rows == 0:
                 continue
-            timestamps = df["timestamp"].to_numpy(dtype=np.int64)
-            labels = df["label_type"].to_numpy()
+            timestamps = table.column("timestamp").combine_chunks().to_numpy(
+                zero_copy_only=False).astype(np.int64, copy=False)
+            labels = table.column("label_type").combine_chunks().to_numpy(
+                zero_copy_only=False)
             pos_rows += int((labels == 2).sum())
+            table_cols = set(table.column_names)
 
             for domain, col in ts_cols.items():
-                if col not in df:
+                if col not in table_cols:
                     continue
-                for row_ts, seq_ts_raw in zip(timestamps, df[col].to_numpy()):
-                    seq_ts = _as_int_array(seq_ts_raw)
+                seq_col = table.column(col).combine_chunks()
+                offsets = seq_col.offsets.to_numpy(zero_copy_only=False)
+                values = seq_col.values.to_numpy(zero_copy_only=False).astype(
+                    np.int64, copy=False)
+
+                rec_parts: list[np.ndarray] = []
+                retained_parts: list[np.ndarray] = []
+                dropped_parts: list[np.ndarray] = []
+                delta_parts: list[np.ndarray] = []
+
+                for row_idx, row_ts in enumerate(timestamps):
+                    s = int(offsets[row_idx])
+                    e = int(offsets[row_idx + 1])
+                    if e <= s:
+                        continue
+                    seq_ts = values[s:e]
                     seq_ts = seq_ts[seq_ts > 0]
                     if seq_ts.size == 0:
                         continue
@@ -495,34 +515,56 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     cap = seq_max_lens[domain]
                     retained_rec = rec[:cap]
                     dropped_rec = rec[cap:]
-                    recency_values[domain], recency_seen_counts[domain] = _merge_sample(
-                        recency_values[domain], recency_seen_counts[domain],
-                        rec, args.sample_per_domain, rng)
+                    rec_parts.append(rec)
                     pos0_recency[domain].append(int(rec[0]))
                     retained_token_counts[domain] += int(retained_rec.size)
                     dropped_token_counts[domain] += int(dropped_rec.size)
                     if retained_rec.size:
-                        retained_recency_values[domain], retained_seen_counts[domain] = _merge_sample(
-                            retained_recency_values[domain], retained_seen_counts[domain],
-                            retained_rec, args.sample_per_domain, rng)
+                        retained_parts.append(retained_rec)
                         mid_idx = min(retained_rec.size - 1, cap // 2)
                         pos_mid_recency[domain].append(int(retained_rec[mid_idx]))
                         pos_last_retained_recency[domain].append(int(retained_rec[-1]))
                     if dropped_rec.size:
-                        dropped_recency_values[domain], dropped_seen_counts[domain] = _merge_sample(
-                            dropped_recency_values[domain], dropped_seen_counts[domain],
-                            dropped_rec, args.sample_per_domain, rng)
+                        dropped_parts.append(dropped_rec)
                     retained_ts = seq_ts[:cap]
                     if retained_ts.size > 1:
                         delta = np.maximum(retained_ts[:-1] - retained_ts[1:], 0)
                         delta = delta[delta > 0]
                         if delta.size:
-                            delta_values[domain], delta_seen_counts[domain] = _merge_sample(
-                                delta_values[domain], delta_seen_counts[domain],
-                                delta, args.sample_per_domain, rng)
+                            delta_parts.append(delta)
 
-            rows_seen += len(df)
-            if not args.quiet_progress:
+                if rec_parts:
+                    rec_rg = np.concatenate(rec_parts)
+                    recency_values[domain], recency_seen_counts[domain] = _merge_sample(
+                        recency_values[domain], recency_seen_counts[domain],
+                        rec_rg, args.sample_per_domain, rng)
+                if retained_parts:
+                    retained_rg = np.concatenate(retained_parts)
+                    retained_recency_values[domain], retained_seen_counts[domain] = _merge_sample(
+                        retained_recency_values[domain], retained_seen_counts[domain],
+                        retained_rg, args.sample_per_domain, rng)
+                if dropped_parts:
+                    dropped_rg = np.concatenate(dropped_parts)
+                    dropped_recency_values[domain], dropped_seen_counts[domain] = _merge_sample(
+                        dropped_recency_values[domain], dropped_seen_counts[domain],
+                        dropped_rg, args.sample_per_domain, rng)
+                if delta_parts:
+                    delta_rg = np.concatenate(delta_parts)
+                    delta_values[domain], delta_seen_counts[domain] = _merge_sample(
+                        delta_values[domain], delta_seen_counts[domain],
+                        delta_rg, args.sample_per_domain, rng)
+
+            rows_seen += table.num_rows
+            should_log_progress = (
+                not args.quiet_progress
+                and (
+                    args.progress_every <= 1
+                    or rg_seen == 1
+                    or rg_seen == rg_total
+                    or rg_seen % args.progress_every == 0
+                )
+            )
+            if should_log_progress:
                 print(
                     "TIME_BUCKET_EDA_PROGRESS "
                     f"stage=row_group_done row_group={rg_seen}/{rg_total} "
@@ -749,6 +791,10 @@ def main() -> int:
                         help="max sampled token values kept per domain/view for quantiles")
     parser.add_argument("--sample-seed", type=int, default=42,
                         help="random seed for bounded token sampling")
+    parser.add_argument("--progress-every", type=int, default=10,
+                        help="print progress every N row groups; use 1 for every row group")
+    parser.add_argument("--no-arrow-threads", action="store_true",
+                        help="disable pyarrow threaded row-group reads")
     parser.add_argument("--out-md", default="output/time_bucket_eda.md")
     parser.add_argument("--out-json", default="output/time_bucket_eda.json")
     parser.add_argument("--no-print-json", action="store_true",
