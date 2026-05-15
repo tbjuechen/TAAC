@@ -146,8 +146,10 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated targets, e.g. seq_b:69,seq_c:29")
     parser.add_argument("--workers", type=int, default=8,
                         help="Parallel workers. Default is 8-thread mode.")
-    parser.add_argument("--executor", choices=("thread", "process"), default="thread",
-                        help="thread matches the requested 8-thread mode; process can be faster when allowed")
+    parser.add_argument("--executor", choices=("process", "thread"), default="process",
+                        help="process gives real parallelism for Python-heavy token counting")
+    parser.add_argument("--row-group-batch-size", type=int, default=10,
+                        help="Number of row groups per submitted task. Smaller values print progress more often.")
     parser.add_argument("--candidate-capacity", type=int, default=300000,
                         help="Bounded candidate ids kept per target in pass 1")
     parser.add_argument("--local-prune-factor", type=float, default=1.5,
@@ -240,13 +242,9 @@ def validate_target_columns(parquet_files: list[Path], targets: dict[str, Target
     )
 
 
-def split_tasks(tasks: list[tuple[str, int]], workers: int) -> list[list[tuple[str, int]]]:
-    if workers <= 1:
-        return [tasks]
-    chunks = [[] for _ in range(workers)]
-    for idx, task in enumerate(tasks):
-        chunks[idx % workers].append(task)
-    return [chunk for chunk in chunks if chunk]
+def split_tasks(tasks: list[tuple[str, int]], batch_size: int) -> list[list[tuple[str, int]]]:
+    batch_size = max(1, batch_size)
+    return [tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size)]
 
 
 def list_array_offsets_values(array: pa.ChunkedArray | pa.Array) -> tuple[np.ndarray, np.ndarray]:
@@ -650,11 +648,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     tasks = build_row_group_tasks(parquet_files, args.max_row_groups)
     if not tasks:
         raise SystemExit("no row groups found")
-    chunks = split_tasks(tasks, max(1, args.workers))
+    chunks = split_tasks(tasks, args.row_group_batch_size)
     worker_count = min(args.workers, len(chunks))
     log_progress(
         "start "
         f"files={len(parquet_files)} row_groups={len(tasks)} "
+        f"tasks={len(chunks)} row_group_batch_size={args.row_group_batch_size} "
         f"targets={len(targets)} workers={worker_count} executor={args.executor} "
         f"candidate_capacity={args.candidate_capacity}"
     )
@@ -698,7 +697,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             done += 1
             log_progress(
-                f"pass1_candidate_scan progress workers_done={done}/{len(futs)} "
+                f"pass1_candidate_scan progress tasks_done={done}/{len(futs)} "
                 f"elapsed_sec={time.perf_counter() - pass1_start:.1f}"
             )
 
@@ -729,7 +728,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 merged_exact[key].merge(st)
             done += 1
             log_progress(
-                f"pass2_exact_recount progress workers_done={done}/{len(futs)} "
+                f"pass2_exact_recount progress tasks_done={done}/{len(futs)} "
                 f"elapsed_sec={time.perf_counter() - pass2_start:.1f}"
             )
     log_progress(f"pass2_exact_recount done elapsed_sec={time.perf_counter() - pass2_start:.1f}")
@@ -746,6 +745,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "schema_path": str(args.schema_path),
         "targets_requested": list(targets),
         "row_groups_scanned": len(tasks),
+        "tasks": len(chunks),
+        "row_group_batch_size": args.row_group_batch_size,
         "workers": args.workers,
         "executor": args.executor,
         "candidate_capacity": args.candidate_capacity,
