@@ -164,6 +164,10 @@ def parse_args() -> argparse.Namespace:
                         help="Print the full Markdown report to stdout for platforms where output files are inaccessible.")
     parser.add_argument("--print-json", action="store_true",
                         help="Print the full JSON result to stdout after the Markdown/summary output.")
+    parser.add_argument("--print-md-one-line", action="store_true", default=True,
+                        help="Print the full Markdown report as one JSON-escaped line. Enabled by default.")
+    parser.add_argument("--no-print-md-one-line", dest="print_md_one_line", action="store_false",
+                        help="Disable the one-line Markdown report output.")
     return parser.parse_args()
 
 
@@ -793,6 +797,13 @@ def print_block(marker: str, text: str) -> None:
     print(f"{marker}_END", flush=True)
 
 
+def print_one_line_file(marker: str, text: str) -> None:
+    print(
+        marker + " " + json.dumps(text, ensure_ascii=False, separators=(",", ":")),
+        flush=True,
+    )
+
+
 def main() -> None:
     args = parse_args()
     result = run(args)
@@ -808,6 +819,8 @@ def main() -> None:
     log_progress(f"wrote_json path={out_json}")
     log_progress(f"wrote_md path={out_md}")
     print(final_summary_line(result, out_json, out_md), flush=True)
+    if args.print_md_one_line:
+        print_one_line_file("TOPK_TAIL_EDA_MARKDOWN_FILE", md_report)
     if args.print_md:
         print_block("TOPK_TAIL_EDA_MARKDOWN", md_report)
     if args.print_json:
