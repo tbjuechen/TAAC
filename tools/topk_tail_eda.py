@@ -28,6 +28,7 @@ import heapq
 import json
 import math
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
@@ -599,7 +600,13 @@ def render_markdown(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def log_progress(message: str) -> None:
+    """Emit one platform-friendly progress line."""
+    print(f"[topk-tail-eda] {message}", flush=True)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    started_at = time.perf_counter()
     data_dir = Path(args.data_dir)
     schema = load_schema(Path(args.schema_path))
     targets = build_targets(schema, args.targets.split(","))
@@ -611,6 +618,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not tasks:
         raise SystemExit("no row groups found")
     chunks = split_tasks(tasks, max(1, args.workers))
+    worker_count = min(args.workers, len(chunks))
+    log_progress(
+        "start "
+        f"files={len(parquet_files)} row_groups={len(tasks)} "
+        f"targets={len(targets)} workers={worker_count} executor={args.executor} "
+        f"candidate_capacity={args.candidate_capacity}"
+    )
     target_payload = {
         key: {
             "domain": target.domain,
@@ -625,7 +639,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     merged_basic = {key: BasicStats() for key in targets}
     merged_candidates = {key: collections.Counter() for key in targets}
-    with executor_cls(max_workers=min(args.workers, len(chunks))) as pool:
+    pass1_start = time.perf_counter()
+    log_progress("pass1_candidate_scan begin")
+    with executor_cls(max_workers=worker_count) as pool:
         futs = [
             pool.submit(
                 pass1_worker,
@@ -636,6 +652,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             )
             for chunk in chunks
         ]
+        done = 0
         for fut in futures.as_completed(futs):
             payload = fut.result()
             for key, st in payload["stats"].items():
@@ -646,22 +663,43 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     counter,
                     args.candidate_capacity,
                 )
+            done += 1
+            log_progress(
+                f"pass1_candidate_scan progress workers_done={done}/{len(futs)} "
+                f"elapsed_sec={time.perf_counter() - pass1_start:.1f}"
+            )
 
     candidate_payload = {
         key: [int(value) for value, _ in counter.most_common(args.candidate_capacity)]
         for key, counter in merged_candidates.items()
     }
+    candidate_counts = ", ".join(
+        f"{key}={len(values)}" for key, values in sorted(candidate_payload.items())
+    )
+    log_progress(
+        f"pass1_candidate_scan done elapsed_sec={time.perf_counter() - pass1_start:.1f} "
+        f"candidates[{candidate_counts}]"
+    )
 
     merged_exact = {key: ExactStats() for key in targets}
-    with executor_cls(max_workers=min(args.workers, len(chunks))) as pool:
+    pass2_start = time.perf_counter()
+    log_progress("pass2_exact_recount begin")
+    with executor_cls(max_workers=worker_count) as pool:
         futs = [
             pool.submit(pass2_worker, chunk, target_payload, candidate_payload)
             for chunk in chunks
         ]
+        done = 0
         for fut in futures.as_completed(futs):
             payload = fut.result()
             for key, st in payload.items():
                 merged_exact[key].merge(st)
+            done += 1
+            log_progress(
+                f"pass2_exact_recount progress workers_done={done}/{len(futs)} "
+                f"elapsed_sec={time.perf_counter() - pass2_start:.1f}"
+            )
+    log_progress(f"pass2_exact_recount done elapsed_sec={time.perf_counter() - pass2_start:.1f}")
 
     topks = [int(v) for v in args.topks.split(",") if v.strip()]
     topks = sorted(set(topks))
@@ -669,6 +707,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         summarize_target(targets[key], merged_basic[key], merged_exact[key], topks)
         for key in sorted(targets)
     ]
+    log_progress(f"summarize done total_elapsed_sec={time.perf_counter() - started_at:.1f}")
     return {
         "data_dir": str(data_dir),
         "schema_path": str(args.schema_path),
@@ -678,8 +717,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "executor": args.executor,
         "candidate_capacity": args.candidate_capacity,
         "topks": topks,
+        "elapsed_sec": time.perf_counter() - started_at,
         "targets": summaries,
     }
+
+
+def final_summary_line(result: dict[str, Any], out_json: Path, out_md: Path) -> str:
+    ranked = sorted(
+        result["targets"],
+        key=lambda row: row["rescue_score"],
+        reverse=True,
+    )
+    top = [
+        {
+            "target": f"{row['domain']}:{row['fid']}",
+            "recommended_k": row["recommended_k"],
+            "coverage": round(row["recommended_coverage"], 6),
+            "head_tail_lift": round(row["recommended_head_tail_lift"], 6),
+            "score": round(row["rescue_score"], 6),
+        }
+        for row in ranked[:5]
+    ]
+    payload = {
+        "row_groups": result["row_groups_scanned"],
+        "elapsed_sec": round(result.get("elapsed_sec", 0.0), 1),
+        "top": top,
+        "json": str(out_json),
+        "md": str(out_md),
+    }
+    return "TOPK_TAIL_EDA_DONE " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def main() -> None:
@@ -693,8 +759,9 @@ def main() -> None:
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     out_md.write_text(render_markdown(result), encoding="utf-8")
-    print(f"Wrote {out_json}")
-    print(f"Wrote {out_md}")
+    log_progress(f"wrote_json path={out_json}")
+    log_progress(f"wrote_md path={out_md}")
+    print(final_summary_line(result, out_json, out_md), flush=True)
 
 
 if __name__ == "__main__":
