@@ -397,6 +397,7 @@ def main() -> None:
     # ---- Data loading: reuse batch_size / num_workers from training config ----
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
+    time_bucket_boundaries = train_config.get('time_bucket_boundaries', 'original')
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -406,6 +407,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        time_bucket_boundaries=time_bucket_boundaries,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

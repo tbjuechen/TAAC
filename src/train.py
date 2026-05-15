@@ -21,6 +21,7 @@ import torch
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import (
     FeatureSchema,
+    TIME_BUCKET_BOUNDARY_PRESETS,
     USER_TIME_DOW_FID,
     USER_TIME_HOD_FID,
     get_pcvr_data,
@@ -148,6 +149,12 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--time_bucket_boundaries', type=str, default='original',
+                        choices=sorted(TIME_BUCKET_BOUNDARY_PRESETS),
+                        help='Recency bucket boundary preset. original reproduces '
+                             'the historical grid; hybrid_v1 keeps the same bucket '
+                             'count but reallocates resolution from seconds/minutes '
+                             'to day/month ranges.')
     parser.add_argument('--per_domain_time_embeddings', action='store_true', default=False,
                         help='Use one recency time-bucket embedding table per sequence '
                              'domain while keeping the global bucket boundaries unchanged.')
@@ -333,6 +340,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        time_bucket_boundaries=args.time_bucket_boundaries,
     )
 
     # ---- NS groups ----
@@ -387,6 +395,7 @@ def main() -> None:
         "seq_longer_gather_side": args.longer_gather_side,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "time_bucket_boundaries": args.time_bucket_boundaries,
         "per_domain_time_embeddings": args.per_domain_time_embeddings,
         "domain_time_residual_embeddings": args.domain_time_residual_embeddings,
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
