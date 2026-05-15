@@ -233,6 +233,65 @@ def _summarize_values(values: np.ndarray, boundaries: np.ndarray, clip_upper: bo
     }
 
 
+def _summarize_sample(
+    values: np.ndarray,
+    total_count: int,
+    boundaries: np.ndarray,
+    clip_upper: bool,
+) -> dict[str, Any]:
+    summary = _summarize_values(values, boundaries, clip_upper)
+    summary["sampled_count"] = summary["count"]
+    summary["count"] = int(total_count)
+    return summary
+
+
+def _merge_sample(
+    sample: np.ndarray,
+    seen_count: int,
+    values: np.ndarray,
+    max_size: int,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, int]:
+    """Maintain a bounded approximate uniform sample over streamed arrays."""
+    values = values.astype(np.int64, copy=False)
+    n_values = int(values.size)
+    if n_values == 0 or max_size <= 0:
+        return sample, seen_count + n_values
+
+    new_seen = seen_count + n_values
+    if sample.size + n_values <= max_size:
+        if sample.size == 0:
+            return values.copy(), new_seen
+        return np.concatenate([sample, values]), new_seen
+
+    if seen_count == 0:
+        if n_values <= max_size:
+            return values.copy(), new_seen
+        idx = rng.choice(n_values, size=max_size, replace=False)
+        return values[idx], new_seen
+
+    keep_new = int(round(max_size * (n_values / new_seen)))
+    keep_new = max(0, min(keep_new, n_values, max_size))
+    keep_old = max_size - keep_new
+    keep_old = min(keep_old, sample.size)
+
+    old_part = sample
+    if keep_old < sample.size:
+        old_idx = rng.choice(sample.size, size=keep_old, replace=False)
+        old_part = sample[old_idx]
+
+    if keep_new > 0:
+        new_idx = rng.choice(n_values, size=keep_new, replace=False)
+        merged = np.concatenate([old_part, values[new_idx]])
+    else:
+        merged = old_part.copy()
+
+    if merged.size > max_size:
+        idx = rng.choice(merged.size, size=max_size, replace=False)
+        merged = merged[idx]
+    return merged, new_seen
+
+
 def _round_boundary(seconds: float) -> int:
     """Round bucket boundaries to readable seconds while preserving scale."""
     if seconds < 60:
@@ -345,6 +404,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if seq_cfg[d].get("ts_fid") is None and ts_fids[d] is not None
     }
     columns = ["timestamp", "label_type", *ts_cols.values()]
+    rng = np.random.default_rng(args.sample_seed)
     rg_total = 0
     for idx, parquet_path in enumerate(parquet_files):
         pf = first_pf if idx == 0 else pq.ParquetFile(parquet_path)
@@ -380,10 +440,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 flush=True,
             )
 
-    recency_values: dict[str, list[np.ndarray]] = {d: [] for d in domains}
-    retained_recency_values: dict[str, list[np.ndarray]] = {d: [] for d in domains}
-    dropped_recency_values: dict[str, list[np.ndarray]] = {d: [] for d in domains}
-    delta_values: dict[str, list[np.ndarray]] = {d: [] for d in domains}
+    recency_values: dict[str, np.ndarray] = {
+        d: np.empty(0, dtype=np.int64) for d in domains}
+    retained_recency_values: dict[str, np.ndarray] = {
+        d: np.empty(0, dtype=np.int64) for d in domains}
+    dropped_recency_values: dict[str, np.ndarray] = {
+        d: np.empty(0, dtype=np.int64) for d in domains}
+    delta_values: dict[str, np.ndarray] = {
+        d: np.empty(0, dtype=np.int64) for d in domains}
+    recency_seen_counts: dict[str, int] = {d: 0 for d in domains}
+    retained_seen_counts: dict[str, int] = {d: 0 for d in domains}
+    dropped_seen_counts: dict[str, int] = {d: 0 for d in domains}
+    delta_seen_counts: dict[str, int] = {d: 0 for d in domains}
     pos0_recency: dict[str, list[int]] = {d: [] for d in domains}
     pos_mid_recency: dict[str, list[int]] = {d: [] for d in domains}
     pos_last_retained_recency: dict[str, list[int]] = {d: [] for d in domains}
@@ -418,8 +486,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             for domain, col in ts_cols.items():
                 if col not in df:
                     continue
-                rec_parts: list[np.ndarray] = []
-                delta_parts: list[np.ndarray] = []
                 for row_ts, seq_ts_raw in zip(timestamps, df[col].to_numpy()):
                     seq_ts = _as_int_array(seq_ts_raw)
                     seq_ts = seq_ts[seq_ts > 0]
@@ -429,27 +495,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     cap = seq_max_lens[domain]
                     retained_rec = rec[:cap]
                     dropped_rec = rec[cap:]
-                    rec_parts.append(rec)
+                    recency_values[domain], recency_seen_counts[domain] = _merge_sample(
+                        recency_values[domain], recency_seen_counts[domain],
+                        rec, args.sample_per_domain, rng)
                     pos0_recency[domain].append(int(rec[0]))
                     retained_token_counts[domain] += int(retained_rec.size)
                     dropped_token_counts[domain] += int(dropped_rec.size)
                     if retained_rec.size:
-                        retained_recency_values[domain].append(retained_rec)
+                        retained_recency_values[domain], retained_seen_counts[domain] = _merge_sample(
+                            retained_recency_values[domain], retained_seen_counts[domain],
+                            retained_rec, args.sample_per_domain, rng)
                         mid_idx = min(retained_rec.size - 1, cap // 2)
                         pos_mid_recency[domain].append(int(retained_rec[mid_idx]))
                         pos_last_retained_recency[domain].append(int(retained_rec[-1]))
                     if dropped_rec.size:
-                        dropped_recency_values[domain].append(dropped_rec)
+                        dropped_recency_values[domain], dropped_seen_counts[domain] = _merge_sample(
+                            dropped_recency_values[domain], dropped_seen_counts[domain],
+                            dropped_rec, args.sample_per_domain, rng)
                     retained_ts = seq_ts[:cap]
                     if retained_ts.size > 1:
                         delta = np.maximum(retained_ts[:-1] - retained_ts[1:], 0)
                         delta = delta[delta > 0]
                         if delta.size:
-                            delta_parts.append(delta)
-                if rec_parts:
-                    recency_values[domain].append(np.concatenate(rec_parts))
-                if delta_parts:
-                    delta_values[domain].append(np.concatenate(delta_parts))
+                            delta_values[domain], delta_seen_counts[domain] = _merge_sample(
+                                delta_values[domain], delta_seen_counts[domain],
+                                delta, args.sample_per_domain, rng)
 
             rows_seen += len(df)
             if not args.quiet_progress:
@@ -470,22 +540,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             flush=True,
         )
 
-    recency_arrays = {
-        d: np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-        for d, parts in recency_values.items()
-    }
-    retained_recency_arrays = {
-        d: np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-        for d, parts in retained_recency_values.items()
-    }
-    dropped_recency_arrays = {
-        d: np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-        for d, parts in dropped_recency_values.items()
-    }
-    delta_arrays = {
-        d: np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
-        for d, parts in delta_values.items()
-    }
+    recency_arrays = recency_values
+    retained_recency_arrays = retained_recency_values
+    dropped_recency_arrays = dropped_recency_values
+    delta_arrays = delta_values
 
     result: dict[str, Any] = {
         "data_dir": str(data_dir),
@@ -493,6 +551,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "seq_max_lens": seq_max_lens,
         "ts_fids": ts_fids,
         "missing_ts_columns": sorted(missing_ts_cols),
+        "sample_per_domain": args.sample_per_domain,
         "rows_seen": rows_seen,
         "pos_rate": pos_rows / rows_seen if rows_seen else 0.0,
         "recency": {},
@@ -508,14 +567,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     rec_bucket_arrays: dict[str, np.ndarray] = {}
     retained_rec_bucket_arrays: dict[str, np.ndarray] = {}
     for domain in domains:
-        rec_summary = _summarize_values(
-            recency_arrays[domain], RECENCY_BOUNDARIES, clip_upper=True)
-        retained_summary = _summarize_values(
-            retained_recency_arrays[domain], RECENCY_BOUNDARIES, clip_upper=True)
-        dropped_summary = _summarize_values(
-            dropped_recency_arrays[domain], RECENCY_BOUNDARIES, clip_upper=True)
-        delta_summary = _summarize_values(
-            delta_arrays[domain], DELTA_BOUNDARIES, clip_upper=False)
+        rec_summary = _summarize_sample(
+            recency_arrays[domain], recency_seen_counts[domain],
+            RECENCY_BOUNDARIES, clip_upper=True)
+        retained_summary = _summarize_sample(
+            retained_recency_arrays[domain], retained_seen_counts[domain],
+            RECENCY_BOUNDARIES, clip_upper=True)
+        dropped_summary = _summarize_sample(
+            dropped_recency_arrays[domain], dropped_seen_counts[domain],
+            RECENCY_BOUNDARIES, clip_upper=True)
+        delta_summary = _summarize_sample(
+            delta_arrays[domain], delta_seen_counts[domain],
+            DELTA_BOUNDARIES, clip_upper=False)
         retained = retained_token_counts[domain]
         dropped = dropped_token_counts[domain]
         retained_summary["token_keep_rate"] = (
@@ -682,6 +745,10 @@ def main() -> int:
                         help="per-domain truncation caps matching train.py")
     parser.add_argument("--max-rows", type=int, default=200_000,
                         help="maximum rows to sample; 0 means all rows")
+    parser.add_argument("--sample-per-domain", type=int, default=200_000,
+                        help="max sampled token values kept per domain/view for quantiles")
+    parser.add_argument("--sample-seed", type=int, default=42,
+                        help="random seed for bounded token sampling")
     parser.add_argument("--out-md", default="output/time_bucket_eda.md")
     parser.add_argument("--out-json", default="output/time_bucket_eda.json")
     parser.add_argument("--no-print-json", action="store_true",
