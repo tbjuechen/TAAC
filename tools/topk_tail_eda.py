@@ -53,6 +53,7 @@ DEFAULT_TARGETS = (
 )
 
 DEFAULT_TOPKS = (1000, 10000, 50000, 100000, 200000)
+DEFAULT_COUNT_THRESHOLDS = (50, 75, 100, 150, 200, 250, 300, 400, 500, 750, 1000, 1500, 2000)
 POS_BUCKETS = (
     ("pos0_10", 0, 10),
     ("pos10_50", 10, 50),
@@ -158,12 +159,21 @@ def parse_args() -> argparse.Namespace:
                         help="Debug cap. 0 means scan all row groups.")
     parser.add_argument("--topks", default=",".join(str(k) for k in DEFAULT_TOPKS),
                         help="Comma-separated coverage cutoffs")
+    parser.add_argument("--count-thresholds",
+                        default=",".join(str(k) for k in DEFAULT_COUNT_THRESHOLDS),
+                        help="Comma-separated min-count thresholds for count-aware rescue EDA")
     parser.add_argument("--out-json", default="output/topk_tail_eda.json")
     parser.add_argument("--out-md", default="output/topk_tail_eda.md")
     parser.add_argument("--export-topk-map", default="",
                         help="Optional path for a TopK id map JSON used by TopK+default rescue.")
     parser.add_argument("--export-map-targets", default="",
                         help="Comma-separated export specs, e.g. seq_c:34:10000,seq_a:38:100000")
+    parser.add_argument("--export-count-map", default="",
+                        help="Optional path for a train-ready TopK rescue map selected by --export-count-threshold.")
+    parser.add_argument("--export-count-map-dir", default="",
+                        help="Optional directory to write one train-ready map per --count-thresholds value.")
+    parser.add_argument("--export-count-threshold", type=int, default=300,
+                        help="Min count used when exporting --export-count-map.")
     parser.add_argument("--print-topk-map-one-line", action="store_true",
                         help="Print exported TopK map JSON as one JSON-escaped line.")
     parser.add_argument("--print-md", action="store_true",
@@ -461,6 +471,7 @@ def summarize_target(
     basic: BasicStats,
     exact: ExactStats,
     topks: list[int],
+    count_thresholds: list[int],
 ) -> dict[str, Any]:
     sorted_counts = exact.head_counts.most_common()
     total = basic.nonzero_tokens
@@ -491,6 +502,56 @@ def summarize_target(
                 "low_count_share_lt50": pct(int((counts_arr < 50).sum()), counts_arr.size),
                 "low_count_share_lt100": pct(int((counts_arr < 100).sum()), counts_arr.size),
             }
+
+    cumulative_by_threshold: dict[int, int] = {}
+    cumulative_count_by_threshold: dict[int, int] = {}
+    cumulative_pos_by_threshold: dict[int, int] = {}
+    cumulative_pos0_50_by_threshold: dict[int, int] = {}
+    running = 0
+    running_pos = 0
+    running_pos0_50 = 0
+    rank = 0
+    next_thresholds = sorted(count_thresholds, reverse=True)
+    pending = list(next_thresholds)
+    for rank, (value, count) in enumerate(sorted_counts, start=1):
+        running += count
+        running_pos += exact.head_pos_counts.get(value, 0)
+        for bucket_name in ("pos0_10", "pos10_50"):
+            running_pos0_50 += exact.head_pos_bucket_counts[bucket_name].get(value, 0)
+        while pending and count < pending[0]:
+            threshold = pending.pop(0)
+            prev_rank = rank - 1
+            cumulative_by_threshold[threshold] = prev_rank
+            cumulative_count_by_threshold[threshold] = running - count
+            cumulative_pos_by_threshold[threshold] = running_pos - exact.head_pos_counts.get(value, 0)
+            pos0_without_current = running_pos0_50
+            for bucket_name in ("pos0_10", "pos10_50"):
+                pos0_without_current -= exact.head_pos_bucket_counts[bucket_name].get(value, 0)
+            cumulative_pos0_50_by_threshold[threshold] = pos0_without_current
+    for threshold in pending:
+        cumulative_by_threshold[threshold] = len(sorted_counts)
+        cumulative_count_by_threshold[threshold] = cumulative
+        cumulative_pos_by_threshold[threshold] = cumulative_pos
+        cumulative_pos0_50_by_threshold[threshold] = cumulative_pos0_50
+
+    count_threshold_summary: dict[str, Any] = {}
+    for threshold in sorted(count_thresholds):
+        k = int(cumulative_by_threshold.get(threshold, 0))
+        cnt = int(cumulative_count_by_threshold.get(threshold, 0))
+        pos_cnt = int(cumulative_pos_by_threshold.get(threshold, 0))
+        pos0_50_cnt = int(cumulative_pos0_50_by_threshold.get(threshold, 0))
+        cutoff_count = int(sorted_counts[k - 1][1]) if k else 0
+        count_threshold_summary[f"count_ge_{threshold}"] = {
+            "min_count": int(threshold),
+            "k": k,
+            "count": cnt,
+            "coverage": pct(cnt, total),
+            "default_share": 1.0 - pct(cnt, total),
+            "pos_rate": pct(pos_cnt, cnt),
+            "pos0_50_coverage": pct(pos0_50_cnt, total),
+            "cutoff_count": cutoff_count,
+            "embedding_rows": int(k + 2) if k else 0,
+        }
 
     # Fill requested TopK values that exceed candidate size with final cumulative.
     pos0_50_final = 0
@@ -563,6 +624,7 @@ def summarize_target(
         "tail_share": pct(exact.tail_count, total),
         "tail_pos_rate": tail_rate,
         "topk": topk_summary,
+        "count_thresholds": count_threshold_summary,
         "recommended_k": recommended_k,
         "recommended_coverage": rec["coverage"],
         "recommended_head_pos_rate": rec["pos_rate"],
@@ -650,6 +712,55 @@ def build_topk_map(
     }
 
 
+def build_count_threshold_map(
+    targets: dict[str, Target],
+    exact_stats: dict[str, ExactStats],
+    min_count: int,
+    candidate_capacity: int,
+) -> dict[str, Any]:
+    exported: dict[str, Any] = {}
+    warnings: list[str] = []
+    for key, target in sorted(targets.items()):
+        top_items = [
+            (value, count)
+            for value, count in exact_stats[key].head_counts.most_common()
+            if count >= min_count
+        ]
+        if len(top_items) >= candidate_capacity:
+            warnings.append(
+                f"{key}: k={len(top_items)} reaches candidate_capacity={candidate_capacity}; "
+                "increase --candidate-capacity for a reliable min-count export"
+            )
+        ids = [int(value) for value, _ in top_items]
+        if not ids:
+            warnings.append(f"{key}: no ids reached min_count={min_count}; target omitted")
+            continue
+        exported[key] = {
+            "domain": target.domain,
+            "fid": target.fid,
+            "vocab_size": target.vocab_size,
+            "selection": "min_count",
+            "min_count": int(min_count),
+            "k": len(ids),
+            "actual_k": len(ids),
+            "padding_id": 0,
+            "default_id": len(ids) + 1,
+            "ids": ids,
+        }
+    return {
+        "version": 1,
+        "format": "taac_seq_topk_default_map",
+        "description": (
+            "For each target, remap raw ids in ids[] to 1..actual_k by count rank; "
+            "raw id 0 stays padding_id=0; positive ids not in ids[] map to default_id."
+        ),
+        "selection": "min_count",
+        "min_count": int(min_count),
+        "targets": exported,
+        "warnings": warnings,
+    }
+
+
 def render_markdown(result: dict[str, Any]) -> str:
     lines = [
         "# TopK Tail EDA",
@@ -720,6 +831,18 @@ def render_markdown(result: dict[str, Any]) -> str:
                 f"{top['count_p50']:,} | {top['low_count_share_lt10']:.2%} | "
                 f"{top['low_count_share_lt50']:.2%} | "
                 f"{top['low_count_share_lt100']:.2%} |"
+            )
+        lines.extend([
+            "",
+            "| min_count | k | coverage | default_share | pos_rate | pos0_50_coverage | cutoff_count | embedding_rows |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ])
+        for name, info in row["count_thresholds"].items():
+            lines.append(
+                f"| {info['min_count']} | {info['k']:,} | "
+                f"{info['coverage']:.2%} | {info['default_share']:.2%} | "
+                f"{info['pos_rate']:.3%} | {info['pos0_50_coverage']:.2%} | "
+                f"{info['cutoff_count']:,} | {info['embedding_rows']:,} |"
             )
         lines.extend([
             "",
@@ -840,8 +963,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     topks = [int(v) for v in args.topks.split(",") if v.strip()]
     topks = sorted(set(topks))
+    count_thresholds = [int(v) for v in args.count_thresholds.split(",") if v.strip()]
+    count_thresholds = sorted(set(count_thresholds))
     summaries = [
-        summarize_target(targets[key], merged_basic[key], merged_exact[key], topks)
+        summarize_target(
+            targets[key],
+            merged_basic[key],
+            merged_exact[key],
+            topks,
+            count_thresholds,
+        )
         for key in sorted(targets)
     ]
     topk_map = None
@@ -857,6 +988,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "topk_map built "
             f"targets={len(topk_map['targets'])} warnings={len(topk_map['warnings'])}"
         )
+    count_map = None
+    if args.export_count_map:
+        count_map = build_count_threshold_map(
+            targets=targets,
+            exact_stats=merged_exact,
+            min_count=args.export_count_threshold,
+            candidate_capacity=args.candidate_capacity,
+        )
+        log_progress(
+            "count_map built "
+            f"min_count={args.export_count_threshold} "
+            f"targets={len(count_map['targets'])} warnings={len(count_map['warnings'])}"
+        )
+    count_maps = None
+    if args.export_count_map_dir:
+        count_maps = {}
+        for threshold in count_thresholds:
+            count_maps[str(threshold)] = build_count_threshold_map(
+                targets=targets,
+                exact_stats=merged_exact,
+                min_count=threshold,
+                candidate_capacity=args.candidate_capacity,
+            )
+        log_progress(
+            "count_maps built "
+            f"thresholds={len(count_maps)}"
+        )
     log_progress(f"summarize done total_elapsed_sec={time.perf_counter() - started_at:.1f}")
     result = {
         "data_dir": str(data_dir),
@@ -869,11 +1027,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "executor": args.executor,
         "candidate_capacity": args.candidate_capacity,
         "topks": topks,
+        "count_thresholds_requested": count_thresholds,
+        "export_count_threshold": args.export_count_threshold,
         "elapsed_sec": time.perf_counter() - started_at,
         "targets": summaries,
     }
     if topk_map is not None:
         result["topk_map"] = topk_map
+    if count_map is not None:
+        result["count_map"] = count_map
+    if count_maps is not None:
+        result["count_maps"] = count_maps
     return result
 
 
@@ -902,7 +1066,41 @@ def final_summary_line(result: dict[str, Any], out_json: Path, out_md: Path) -> 
     }
     if "topk_map_path" in result:
         payload["topk_map"] = result["topk_map_path"]
+    if "count_map_path" in result:
+        payload["count_map"] = result["count_map_path"]
+    if "count_map_paths" in result:
+        payload["count_maps"] = result["count_map_paths"]
     return "TOPK_TAIL_EDA_DONE " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def count_conclusion_payload(result: dict[str, Any]) -> dict[str, Any]:
+    threshold = int(result.get("export_count_threshold", 300))
+    rows = []
+    targets_for_train = []
+    for row in sorted(result["targets"], key=lambda r: (r["domain"], r["fid"])):
+        info = row["count_thresholds"].get(f"count_ge_{threshold}", {})
+        target = f"{row['domain']}:{row['fid']}"
+        item = {
+            "target": target,
+            "min_count": threshold,
+            "k": int(info.get("k", 0)),
+            "coverage": round(float(info.get("coverage", 0.0)), 6),
+            "default_share": round(float(info.get("default_share", 0.0)), 6),
+            "embedding_rows": int(info.get("embedding_rows", 0)),
+        }
+        rows.append(item)
+        if item["k"] > 0:
+            targets_for_train.append(f"{target}:{item['k']}")
+    payload = {
+        "min_count": threshold,
+        "targets": rows,
+        "targets_for_train": ",".join(targets_for_train),
+    }
+    if "count_map_path" in result:
+        payload["count_map"] = result["count_map_path"]
+    if "count_map_paths" in result:
+        payload["count_maps"] = result["count_map_paths"]
+    return payload
 
 
 def print_block(marker: str, text: str) -> None:
@@ -933,6 +1131,8 @@ def main() -> None:
     out_json = Path(args.out_json)
     out_md = Path(args.out_md)
     out_topk_map = Path(args.export_topk_map) if args.export_topk_map else None
+    out_count_map = Path(args.export_count_map) if args.export_count_map else None
+    out_count_map_dir = Path(args.export_count_map_dir) if args.export_count_map_dir else None
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_md.parent.mkdir(parents=True, exist_ok=True)
     if out_topk_map is not None:
@@ -945,6 +1145,33 @@ def main() -> None:
         log_progress(f"wrote_topk_map path={out_topk_map}")
         for warning in result["topk_map"].get("warnings", []):
             log_progress(f"topk_map_warning {warning}")
+    if out_count_map is not None:
+        out_count_map.parent.mkdir(parents=True, exist_ok=True)
+        if "count_map" not in result:
+            raise SystemExit("--export-count-map failed to build a count map")
+        with out_count_map.open("w", encoding="utf-8") as f:
+            json.dump(result["count_map"], f, indent=2, ensure_ascii=False)
+        result["count_map_path"] = str(out_count_map)
+        log_progress(f"wrote_count_map path={out_count_map}")
+        for warning in result["count_map"].get("warnings", []):
+            log_progress(f"count_map_warning {warning}")
+    if out_count_map_dir is not None:
+        out_count_map_dir.mkdir(parents=True, exist_ok=True)
+        map_paths = {}
+        if "count_maps" not in result:
+            raise SystemExit("--export-count-map-dir failed to build count maps")
+        for threshold, count_map in sorted(
+            result["count_maps"].items(),
+            key=lambda item: int(item[0]),
+        ):
+            path = out_count_map_dir / f"topk_rescue_count{threshold}.json"
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(count_map, f, indent=2, ensure_ascii=False)
+            map_paths[str(threshold)] = str(path)
+            log_progress(f"wrote_count_map threshold={threshold} path={path}")
+            for warning in count_map.get("warnings", []):
+                log_progress(f"count_map_warning threshold={threshold} {warning}")
+        result["count_map_paths"] = map_paths
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     md_report = render_markdown(result)
@@ -952,6 +1179,7 @@ def main() -> None:
     log_progress(f"wrote_json path={out_json}")
     log_progress(f"wrote_md path={out_md}")
     print(final_summary_line(result, out_json, out_md), flush=True)
+    print_one_line_json("TOPK_TAIL_EDA_COUNT_CONCLUSION", count_conclusion_payload(result))
     if args.print_md_one_line:
         print_one_line_file("TOPK_TAIL_EDA_MARKDOWN_FILE", md_report)
     if args.print_md:
