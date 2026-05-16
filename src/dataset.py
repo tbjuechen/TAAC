@@ -102,6 +102,77 @@ class FeatureSchema:
         lines.append("])")
         return "\n".join(lines)
 
+
+class SeqTopKRescueRemapper:
+    """Remap selected sequence fids from raw ids to compact topK ids.
+
+    Mapping per configured fid:
+      - raw 0 stays 0 (padding)
+      - raw id in ids[] maps to rank 1..K
+      - other positive raw ids map to default_id (K+1)
+
+    The implementation uses sorted numpy arrays plus searchsorted so it avoids
+    allocating dense LUTs for huge raw vocabularies.
+    """
+
+    def __init__(self, map_path: str) -> None:
+        with open(map_path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        targets = raw.get('targets')
+        if not isinstance(targets, dict) or not targets:
+            raise ValueError(
+                f"topk rescue map {map_path!r} must contain a non-empty "
+                "'targets' object")
+
+        self.map_path = map_path
+        self.targets: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        for key, cfg in targets.items():
+            domain = str(cfg.get('domain') or key.split(':')[0])
+            fid = int(cfg.get('fid') or key.split(':')[1])
+            ids = np.asarray(cfg.get('ids', []), dtype=np.int64)
+            if ids.size == 0:
+                raise ValueError(f"topk rescue target {key!r} has empty ids[]")
+            ranks = np.arange(1, ids.size + 1, dtype=np.int64)
+            order = np.argsort(ids)
+            default_id = int(cfg.get('default_id', ids.size + 1))
+            if default_id != ids.size + 1:
+                raise ValueError(
+                    f"topk rescue target {key!r}: default_id={default_id} "
+                    f"but expected actual_k+1={ids.size + 1}")
+            self.targets[(domain, fid)] = {
+                'key': key,
+                'sorted_ids': ids[order],
+                'sorted_ranks': ranks[order],
+                'default_id': default_id,
+                'actual_k': int(cfg.get('actual_k', ids.size)),
+            }
+
+    def remapped_vocab_size(self, domain: str, fid: int) -> Optional[int]:
+        cfg = self.targets.get((domain, int(fid)))
+        if cfg is None:
+            return None
+        return int(cfg['default_id'])
+
+    def remap_array(self, domain: str, fid: int, arr: "npt.NDArray[np.int64]") -> bool:
+        cfg = self.targets.get((domain, int(fid)))
+        if cfg is None:
+            return False
+
+        positive = arr > 0
+        if not positive.any():
+            return True
+
+        raw_vals = arr[positive]
+        sorted_ids = cfg['sorted_ids']
+        pos = np.searchsorted(sorted_ids, raw_vals)
+        found = (pos < sorted_ids.size) & (sorted_ids[pos.clip(max=sorted_ids.size - 1)] == raw_vals)
+
+        mapped = np.full(raw_vals.shape, int(cfg['default_id']), dtype=np.int64)
+        if found.any():
+            mapped[found] = cfg['sorted_ranks'][pos[found]]
+        arr[positive] = mapped
+        return True
+
 # Use filesystem-based tensor sharing (instead of /dev/shm) to avoid running
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
@@ -175,6 +246,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        topk_rescue_map_path: Optional[str] = None,
     ) -> None:
         """
         Args:
@@ -192,6 +264,8 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            topk_rescue_map_path: optional map JSON that remaps selected
+                sequence fids to compact topK+default vocabularies.
         """
         super().__init__()
 
@@ -210,6 +284,10 @@ class PCVRParquetDataset(IterableDataset):
         self.buffer_batches = buffer_batches
         self.clip_vocab = clip_vocab
         self.is_training = is_training
+        self.topk_rescue_remapper = (
+            SeqTopKRescueRemapper(topk_rescue_map_path)
+            if topk_rescue_map_path else None
+        )
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -298,6 +376,11 @@ class PCVRParquetDataset(IterableDataset):
             f"PCVRParquetDataset: {self.num_rows} rows from "
             f"{len(self._parquet_files)} file(s), batch_size={batch_size}, "
             f"buffer_batches={buffer_batches}, shuffle={shuffle}")
+        if self.topk_rescue_remapper is not None:
+            logging.info(
+                "Seq topK rescue enabled: "
+                f"{len(self.topk_rescue_remapper.targets)} targets from "
+                f"{self.topk_rescue_remapper.map_path}")
 
     def _load_schema(self, schema_path: str, seq_max_lens: Dict[str, int]) -> None:
         """Populate per-group schema information from ``schema_path``."""
@@ -345,6 +428,7 @@ class PCVRParquetDataset(IterableDataset):
         self.sideinfo_fids: Dict[str, List[int]] = {}
         self._seq_prefix: Dict[str, str] = {}
         self._seq_maxlen: Dict[str, int] = {}
+        seen_rescue_targets = set()
 
         for domain in self.seq_domains:
             cfg = self._seq_cfg[domain]
@@ -354,16 +438,37 @@ class PCVRParquetDataset(IterableDataset):
 
             all_fids = [fid for fid, vs in cfg['features']]
             self.seq_feature_ids[domain] = all_fids
-            self.seq_vocab_sizes[domain] = {fid: vs for fid, vs in cfg['features']}
+            vocab_by_fid = {fid: vs for fid, vs in cfg['features']}
+            if self.topk_rescue_remapper is not None:
+                for fid in list(vocab_by_fid):
+                    rescued_vs = self.topk_rescue_remapper.remapped_vocab_size(domain, fid)
+                    if rescued_vs is not None:
+                        logging.info(
+                            f"topk_rescue vocab override {domain}:{fid}: "
+                            f"{vocab_by_fid[fid]} -> {rescued_vs}")
+                        vocab_by_fid[fid] = rescued_vs
+            self.seq_vocab_sizes[domain] = vocab_by_fid
 
             sideinfo = [fid for fid in all_fids if fid != ts_fid]
             self.sideinfo_fids[domain] = sideinfo
+            if self.topk_rescue_remapper is not None:
+                for fid in sideinfo:
+                    if (domain, fid) in self.topk_rescue_remapper.targets:
+                        seen_rescue_targets.add((domain, fid))
             self.seq_domain_vocab_sizes[domain] = [
                 self.seq_vocab_sizes[domain][fid] for fid in sideinfo
             ]
 
             # max_len: from seq_max_lens arg; unspecified domains fall back to 256.
             self._seq_maxlen[domain] = seq_max_lens.get(domain, 256)
+
+        if self.topk_rescue_remapper is not None:
+            missing = sorted(set(self.topk_rescue_remapper.targets) - seen_rescue_targets)
+            if missing:
+                missing_s = ", ".join(f"{domain}:{fid}" for domain, fid in missing)
+                raise ValueError(
+                    f"topk rescue map contains targets not found in sequence "
+                    f"sideinfo schema: {missing_s}")
 
     def __len__(self) -> int:
         # Ceiling per Row Group; this is an upper bound on the true batch count.
@@ -659,6 +764,10 @@ class PCVRParquetDataset(IterableDataset):
             # Values <= 0 -> 0.
             out[out <= 0] = 0
 
+            if self.topk_rescue_remapper is not None:
+                for c, fid in enumerate(self.sideinfo_fids[domain]):
+                    self.topk_rescue_remapper.remap_array(domain, fid, out[:, c, :])
+
             # Check out-of-bound values per feature's vocab_size.
             # vs==0 means no vocab info; force the whole slice to 0 so that
             # the model's 1-slot Embedding is never indexed out of range.
@@ -787,6 +896,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    topk_rescue_map_path: Optional[str] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -835,6 +945,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        topk_rescue_map_path=topk_rescue_map_path,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -857,6 +968,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        topk_rescue_map_path=topk_rescue_map_path,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

@@ -58,6 +58,7 @@ class PCVRHyFormerRankingTrainer:
         writer: Optional[Any] = None,
         schema_path: Optional[str] = None,
         ns_groups_path: Optional[str] = None,
+        topk_rescue_map_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
         use_amp: bool = False,
@@ -78,6 +79,7 @@ class PCVRHyFormerRankingTrainer:
         # makes the checkpoint self-contained for evaluation environments that
         # do not ship ns_groups.json separately.
         self.ns_groups_path: Optional[str] = ns_groups_path
+        self.topk_rescue_map_path: Optional[str] = topk_rescue_map_path
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
@@ -203,6 +205,9 @@ class PCVRHyFormerRankingTrainer:
           tokenizer. Making a per-ckpt copy lets evaluation environments
           consume the checkpoint without having to ship the original
           project-level ``ns_groups.json``.
+        - ``topk_rescue_map.json`` (copied from ``self.topk_rescue_map_path``
+          when set and the file exists): compact seq id remapping used by both
+          train and inference.
         - ``train_config.json`` (serialized from ``self.train_config``):
           full set of training-time hyperparameters. When ``ns_groups.json``
           is copied into ``ckpt_dir``, the ``ns_groups_json`` field is
@@ -219,17 +224,26 @@ class PCVRHyFormerRankingTrainer:
             shutil.copy2(self.ns_groups_path, ckpt_dir)
             ns_groups_copied = True
 
+        topk_rescue_map_copied = False
+        if self.topk_rescue_map_path and os.path.exists(self.topk_rescue_map_path):
+            shutil.copy2(self.topk_rescue_map_path, ckpt_dir)
+            topk_rescue_map_copied = True
+
         if self.train_config:
             import json
             cfg_to_dump = self.train_config
-            if ns_groups_copied:
+            if ns_groups_copied or topk_rescue_map_copied:
                 # Override the stored path to a filename relative to ckpt_dir;
                 # infer.py already falls back to `<ckpt_dir>/<basename>` when
                 # the recorded path is not absolute, which keeps the ckpt
                 # portable across hosts.
                 cfg_to_dump = dict(self.train_config)
+            if ns_groups_copied:
                 cfg_to_dump['ns_groups_json'] = os.path.basename(
                     self.ns_groups_path)
+            if topk_rescue_map_copied:
+                cfg_to_dump['topk_rescue_map'] = os.path.basename(
+                    self.topk_rescue_map_path)
             with open(os.path.join(ckpt_dir, 'train_config.json'), 'w') as f:
                 json.dump(cfg_to_dump, f, indent=2)
 

@@ -17,6 +17,8 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.9 hour-only ablation:         USE_SEQ_HOUR=1 ./run.sh
 # W2.9 dow-only ablation:          USE_SEQ_DOW=1 ./run.sh
 # W2.9b per-domain periodic:       USE_PER_DOMAIN_PERIODIC_TIME=1 ./run.sh
+# TopK rescue (emb_skip=100w + compact topK/default for seq_c:34/29):
+#   USE_TOPK_RESCUE=1 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
@@ -29,6 +31,14 @@ USE_SEQ_PERIODIC_TIME="${USE_SEQ_PERIODIC_TIME:-1}"
 USE_SEQ_HOUR="${USE_SEQ_HOUR:-0}"
 USE_SEQ_DOW="${USE_SEQ_DOW:-0}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
+USE_TOPK_RESCUE="${USE_TOPK_RESCUE:-0}"
+TOPK_RESCUE_TARGETS="${TOPK_RESCUE_TARGETS:-}"
+TOPK_RESCUE_EDA_JSON="${TOPK_RESCUE_EDA_JSON:-}"
+TOPK_RESCUE_MAP="${TOPK_RESCUE_MAP:-}"
+TOPK_RESCUE_AUTO_EXPORT="${TOPK_RESCUE_AUTO_EXPORT:-1}"
+TOPK_RESCUE_SOURCE_MAP="${TOPK_RESCUE_SOURCE_MAP:-}"
+TOPK_RESCUE_FULL_EDA_JSON="${TOPK_RESCUE_FULL_EDA_JSON:-}"
+TOPK_RESCUE_FULL_EDA_MD="${TOPK_RESCUE_FULL_EDA_MD:-}"
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
         D_MODEL=68
@@ -37,6 +47,10 @@ if [ -z "${D_MODEL+x}" ]; then
     fi
 fi
 # ============================================================
+
+if [ "${USE_TOPK_RESCUE}" = "1" ] && [ -z "${TOPK_RESCUE_TARGETS}" ]; then
+    TOPK_RESCUE_TARGETS="seq_c:34:10000,seq_c:29:200000"
+fi
 
 EXTRA_FLAGS=""
 [ "${USE_DELTA_BUCKETS}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_delta_buckets"
@@ -47,6 +61,75 @@ EXTRA_FLAGS=""
 [ "${USE_SEQ_HOUR}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_hour_of_day_feature"
 [ "${USE_SEQ_DOW}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_day_of_week_feature"
 [ "${USE_PER_DOMAIN_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_seq_periodic_time_features"
+
+if [ -n "${TOPK_RESCUE_TARGETS}" ]; then
+    if [ -z "${TOPK_RESCUE_EDA_JSON}" ] || [ -z "${TOPK_RESCUE_MAP}" ]; then
+        if [ -z "${USER_CACHE_PATH:-}" ]; then
+            echo "[run.sh] TOPK_RESCUE_TARGETS set but USER_CACHE_PATH is unavailable; set TOPK_RESCUE_EDA_JSON and TOPK_RESCUE_MAP explicitly"
+            exit 1
+        fi
+        TOPK_RESCUE_EDA_JSON="${TOPK_RESCUE_EDA_JSON:-${USER_CACHE_PATH}/taac_topk_eda/topk_tail_eda.json}"
+        TOPK_RESCUE_MAP="${TOPK_RESCUE_MAP:-${USER_CACHE_PATH}/taac_topk_eda/topk_rescue_map.json}"
+    fi
+    if [ ! -f "${TOPK_RESCUE_EDA_JSON}" ]; then
+        echo "[run.sh] TOPK_RESCUE_EDA_JSON not found: ${TOPK_RESCUE_EDA_JSON}"
+        exit 1
+    fi
+    mkdir -p "$(dirname "${TOPK_RESCUE_MAP}")"
+    echo "[run.sh] building topk rescue map targets=${TOPK_RESCUE_TARGETS}"
+    echo "[run.sh] topk rescue source=${TOPK_RESCUE_EDA_JSON}"
+    if ! python3 -u "${SCRIPT_DIR}/build_topk_rescue_map.py" \
+        --eda-json "${TOPK_RESCUE_EDA_JSON}" \
+        --targets "${TOPK_RESCUE_TARGETS}" \
+        --out-json "${TOPK_RESCUE_MAP}"; then
+        if [ "${TOPK_RESCUE_AUTO_EXPORT}" != "1" ]; then
+            echo "[run.sh] topk rescue source has no full ids and TOPK_RESCUE_AUTO_EXPORT!=1"
+            exit 1
+        fi
+        if [ -z "${TRAIN_DATA_PATH:-}" ]; then
+            echo "[run.sh] cannot auto-export topk rescue map because TRAIN_DATA_PATH is unset"
+            exit 1
+        fi
+
+        if [ -f "${SCRIPT_DIR}/topk_tail_eda.py" ]; then
+            TOPK_TAIL_EDA_SCRIPT="${SCRIPT_DIR}/topk_tail_eda.py"
+        elif [ -f "${SCRIPT_DIR}/tools/topk_tail_eda.py" ]; then
+            TOPK_TAIL_EDA_SCRIPT="${SCRIPT_DIR}/tools/topk_tail_eda.py"
+        elif [ -f "${SCRIPT_DIR}/../tools/topk_tail_eda.py" ]; then
+            TOPK_TAIL_EDA_SCRIPT="${SCRIPT_DIR}/../tools/topk_tail_eda.py"
+        else
+            echo "[run.sh] cannot auto-export: topk_tail_eda.py not found next to run.sh or under tools/"
+            exit 1
+        fi
+
+        TOPK_RESCUE_SCAN_TARGETS="$(python3 -c 'import sys; print(",".join(":".join(x.split(":")[:2]) for x in sys.argv[1].split(",") if x.strip()))' "${TOPK_RESCUE_TARGETS}")"
+        TOPK_RESCUE_SOURCE_MAP="${TOPK_RESCUE_SOURCE_MAP:-$(dirname "${TOPK_RESCUE_MAP}")/topk_source_map.json}"
+        TOPK_RESCUE_FULL_EDA_JSON="${TOPK_RESCUE_FULL_EDA_JSON:-$(dirname "${TOPK_RESCUE_MAP}")/topk_tail_eda_with_map.json}"
+        TOPK_RESCUE_FULL_EDA_MD="${TOPK_RESCUE_FULL_EDA_MD:-$(dirname "${TOPK_RESCUE_MAP}")/topk_tail_eda_with_map.md}"
+
+        echo "[run.sh] auto-exporting full topk ids targets=${TOPK_RESCUE_SCAN_TARGETS}"
+        python3 -u "${TOPK_TAIL_EDA_SCRIPT}" \
+            --data-dir "${TRAIN_DATA_PATH}" \
+            --schema-path "${TRAIN_DATA_PATH}/schema.json" \
+            --targets "${TOPK_RESCUE_SCAN_TARGETS}" \
+            --workers 8 \
+            --executor process \
+            --row-group-batch-size 10 \
+            --candidate-capacity 300000 \
+            --export-map-targets "${TOPK_RESCUE_TARGETS}" \
+            --export-topk-map "${TOPK_RESCUE_SOURCE_MAP}" \
+            --out-json "${TOPK_RESCUE_FULL_EDA_JSON}" \
+            --out-md "${TOPK_RESCUE_FULL_EDA_MD}" \
+            --no-print-md-one-line || exit 1
+
+        echo "[run.sh] rebuilding topk rescue map from exported full ids: ${TOPK_RESCUE_SOURCE_MAP}"
+        python3 -u "${SCRIPT_DIR}/build_topk_rescue_map.py" \
+            --eda-json "${TOPK_RESCUE_SOURCE_MAP}" \
+            --targets "${TOPK_RESCUE_TARGETS}" \
+            --out-json "${TOPK_RESCUE_MAP}" || exit 1
+    fi
+    EXTRA_FLAGS="${EXTRA_FLAGS} --topk_rescue_map ${TOPK_RESCUE_MAP}"
+fi
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \

@@ -103,6 +103,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_max_lens', type=str,
                         default='seq_a:256,seq_b:256,seq_c:512,seq_d:512',
                         help='Per-domain sequence truncation, format: seq_d:256,seq_c:128')
+    parser.add_argument('--topk_rescue_map', type=str, default='',
+                        help='Optional seq topK rescue map JSON. Selected sequence fids '
+                             'are remapped to compact topK+default vocabularies before '
+                             'model construction, allowing emb_skip_threshold to skip the '
+                             'raw huge vocab while still learning the rescued ids.')
 
     # Model hyperparameters.
     parser.add_argument('--d_model', type=int, default=64,
@@ -323,6 +328,12 @@ def main() -> None:
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
     logging.info("Using Parquet data format (IterableDataset)")
+    topk_rescue_map_path = args.topk_rescue_map or None
+    if topk_rescue_map_path:
+        if not os.path.exists(topk_rescue_map_path):
+            raise FileNotFoundError(
+                f"topk rescue map not found at {topk_rescue_map_path}")
+        logging.info(f"Using seq topK rescue map: {topk_rescue_map_path}")
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
         data_dir=args.data_dir,
         schema_path=schema_path,
@@ -333,6 +344,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        topk_rescue_map_path=topk_rescue_map_path,
     )
 
     # ---- NS groups ----
@@ -515,6 +527,7 @@ def main() -> None:
         writer=writer,
         schema_path=schema_path,
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
+        topk_rescue_map_path=topk_rescue_map_path,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
         use_amp=args.use_amp,

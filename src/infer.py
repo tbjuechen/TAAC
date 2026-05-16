@@ -394,6 +394,18 @@ def main() -> None:
     seq_max_lens = _parse_seq_max_lens(sml_str)
     logging.info(f"seq_max_lens: {seq_max_lens}")
 
+    topk_rescue_map = train_config.get('topk_rescue_map', '')
+    if topk_rescue_map:
+        local_candidate = os.path.join(model_dir, os.path.basename(topk_rescue_map))
+        if os.path.exists(local_candidate):
+            topk_rescue_map = local_candidate
+        if not os.path.exists(topk_rescue_map):
+            raise FileNotFoundError(
+                f"topk_rescue_map={topk_rescue_map!r} from train_config does not exist")
+        logging.info(f"Using seq topK rescue map: {topk_rescue_map}")
+    else:
+        topk_rescue_map = None
+
     # ---- Data loading: reuse batch_size / num_workers from training config ----
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
@@ -406,6 +418,7 @@ def main() -> None:
         shuffle=False,
         buffer_batches=0,
         is_training=False,
+        topk_rescue_map_path=topk_rescue_map,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
