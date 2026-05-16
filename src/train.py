@@ -270,6 +270,17 @@ def parse_args() -> argparse.Namespace:
                         help='Project TAAC user dense features into two tokens: '
                              'fid 61/87 and fid 62/63/64/65/66/89/90/91. '
                              'When disabled, use the baseline single dense token.')
+    parser.add_argument('--use_intra_token_dcn', action='store_true',
+                        help='Add a gated DCN residual inside every NS token projector.')
+    parser.add_argument('--intra_token_dcn_layers', type=int, default=1,
+                        help='Number of DCN layers for the intra-token residual path.')
+    parser.add_argument('--intra_token_dcn_low_rank', type=int, default=32,
+                        help='Low-rank factorization rank for intra-token DCN '
+                             '(0 = full-rank; values >= input_dim fall back to full-rank).')
+    parser.add_argument('--intra_token_dcn_dropout', type=float, default=0.0,
+                        help='Dropout applied to the intra-token DCN cross vector.')
+    parser.add_argument('--intra_token_dcn_gate_init', type=float, default=-4.0,
+                        help='Initial logit for the gated intra-token residual.')
 
     args = parser.parse_args()
 
@@ -405,6 +416,11 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "split_user_int_shared_fids": args.split_user_int_shared_fids,
         "use_dense_group_projector": args.use_dense_group_projector,
+        "use_intra_token_dcn": args.use_intra_token_dcn,
+        "intra_token_dcn_layers": args.intra_token_dcn_layers,
+        "intra_token_dcn_low_rank": args.intra_token_dcn_low_rank,
+        "intra_token_dcn_dropout": args.intra_token_dcn_dropout,
+        "intra_token_dcn_gate_init": args.intra_token_dcn_gate_init,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

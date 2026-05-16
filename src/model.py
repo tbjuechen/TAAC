@@ -416,6 +416,101 @@ class RankMixerBlock(nn.Module):
         return Q_boost
 
 
+class IntraTokenDCNResidualProjector(nn.Module):
+    """Adds a gated DCN residual inside one token projector."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        d_model: int,
+        base_projector: nn.Module,
+        num_layers: int = 1,
+        low_rank: int = 32,
+        dropout: float = 0.0,
+        gate_init: float = -4.0,
+    ) -> None:
+        super().__init__()
+        self.base_projector = base_projector
+        self.dropout = nn.Dropout(dropout)
+        self.gate_logit = nn.Parameter(torch.tensor(float(gate_init)))
+
+        self.cross_biases = nn.ParameterList([
+            nn.Parameter(torch.zeros(input_dim))
+            for _ in range(num_layers)
+        ])
+        self.cross_u = nn.ParameterList()
+        self.cross_v = nn.ParameterList()
+        self.cross_w = nn.ParameterList()
+        if low_rank > 0 and low_rank < input_dim:
+            for _ in range(num_layers):
+                self.cross_u.append(nn.Parameter(torch.empty(input_dim, low_rank)))
+                self.cross_v.append(nn.Parameter(torch.empty(low_rank, input_dim)))
+                self.cross_w.append(nn.Parameter(torch.empty(0)))
+        else:
+            for _ in range(num_layers):
+                self.cross_u.append(nn.Parameter(torch.empty(0)))
+                self.cross_v.append(nn.Parameter(torch.empty(0)))
+                self.cross_w.append(nn.Parameter(torch.empty(input_dim, input_dim)))
+
+        self.cross_projector = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self._init_cross_params()
+
+    def _init_cross_params(self) -> None:
+        for u, v, w in zip(self.cross_u, self.cross_v, self.cross_w):
+            if u.numel() > 0:
+                nn.init.xavier_normal_(u)
+                nn.init.xavier_normal_(v)
+            else:
+                nn.init.xavier_normal_(w)
+
+    def _cross_linear(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        u = self.cross_u[layer_idx]
+        if u.numel() > 0:
+            return x.matmul(u).matmul(self.cross_v[layer_idx])
+        return x.matmul(self.cross_w[layer_idx])
+
+    def forward(self, raw: torch.Tensor) -> torch.Tensor:
+        base = self.base_projector(raw)
+        x0 = raw
+        x = raw
+        for i, bias in enumerate(self.cross_biases):
+            xw = self._cross_linear(x, i) + bias
+            x = x + x0 * self.dropout(xw)
+        residual = self.cross_projector(x)
+        gate = torch.sigmoid(self.gate_logit).to(dtype=base.dtype)
+        return base + gate * residual
+
+
+def make_token_projector(
+    input_dim: int,
+    d_model: int,
+    base_projector: Optional[nn.Module] = None,
+    use_intra_token_dcn: bool = False,
+    intra_token_dcn_layers: int = 1,
+    intra_token_dcn_low_rank: int = 32,
+    intra_token_dcn_dropout: float = 0.0,
+    intra_token_dcn_gate_init: float = -4.0,
+) -> nn.Module:
+    base = base_projector or nn.Sequential(
+        nn.Linear(input_dim, d_model),
+        nn.LayerNorm(d_model),
+    )
+    if not use_intra_token_dcn:
+        return base
+    return IntraTokenDCNResidualProjector(
+        input_dim=input_dim,
+        d_model=d_model,
+        base_projector=base,
+        num_layers=intra_token_dcn_layers,
+        low_rank=intra_token_dcn_low_rank,
+        dropout=intra_token_dcn_dropout,
+        gate_init=intra_token_dcn_gate_init,
+    )
+
+
 class MultiSeqQueryGenerator(nn.Module):
     """Multi-sequence query generation module.
 
@@ -1015,7 +1110,12 @@ class GroupNSTokenizer(nn.Module):
 
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
-                 emb_skip_threshold: int = 0) -> None:
+                 emb_skip_threshold: int = 0,
+                 use_intra_token_dcn: bool = False,
+                 intra_token_dcn_layers: int = 1,
+                 intra_token_dcn_low_rank: int = 32,
+                 intra_token_dcn_dropout: float = 0.0,
+                 intra_token_dcn_gate_init: float = -4.0) -> None:
         super().__init__()
         self.feature_specs = feature_specs
         self.groups = groups
@@ -1044,9 +1144,14 @@ class GroupNSTokenizer(nn.Module):
 
         # Per-group projection: num_fids_in_group * emb_dim -> d_model (with LayerNorm)
         self.group_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(len(group) * emb_dim, d_model),
-                nn.LayerNorm(d_model),
+            make_token_projector(
+                len(group) * emb_dim,
+                d_model,
+                use_intra_token_dcn=use_intra_token_dcn,
+                intra_token_dcn_layers=intra_token_dcn_layers,
+                intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                intra_token_dcn_dropout=intra_token_dcn_dropout,
+                intra_token_dcn_gate_init=intra_token_dcn_gate_init,
             )
             for group in groups
         ])
@@ -1103,6 +1208,11 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        use_intra_token_dcn: bool = False,
+        intra_token_dcn_layers: int = 1,
+        intra_token_dcn_low_rank: int = 32,
+        intra_token_dcn_dropout: float = 0.0,
+        intra_token_dcn_gate_init: float = -4.0,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1152,9 +1262,14 @@ class RankMixerNSTokenizer(nn.Module):
 
         # Per-chunk projection: chunk_dim -> d_model with LayerNorm
         self.token_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.chunk_dim, d_model),
-                nn.LayerNorm(d_model),
+            make_token_projector(
+                self.chunk_dim,
+                d_model,
+                use_intra_token_dcn=use_intra_token_dcn,
+                intra_token_dcn_layers=intra_token_dcn_layers,
+                intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                intra_token_dcn_dropout=intra_token_dcn_dropout,
+                intra_token_dcn_gate_init=intra_token_dcn_gate_init,
             )
             for _ in range(num_ns_tokens)
         ])
@@ -1222,6 +1337,11 @@ class SplitUserIntNSTokenizer(nn.Module):
         d_model: int,
         num_regular_tokens: int,
         emb_skip_threshold: int = 0,
+        use_intra_token_dcn: bool = False,
+        intra_token_dcn_layers: int = 1,
+        intra_token_dcn_low_rank: int = 32,
+        intra_token_dcn_dropout: float = 0.0,
+        intra_token_dcn_gate_init: float = -4.0,
     ) -> None:
         super().__init__()
         self.feature_specs = feature_specs
@@ -1258,11 +1378,20 @@ class SplitUserIntNSTokenizer(nn.Module):
                 self._emb_index.append(-1)
 
         special_dim = len(self.special_indices) * emb_dim
-        self.special_proj = nn.Sequential(
-            nn.Linear(special_dim, d_model * 2),
-            nn.SiLU(),
-            nn.Linear(d_model * 2, d_model),
-            nn.LayerNorm(d_model),
+        self.special_proj = make_token_projector(
+            special_dim,
+            d_model,
+            base_projector=nn.Sequential(
+                nn.Linear(special_dim, d_model * 2),
+                nn.SiLU(),
+                nn.Linear(d_model * 2, d_model),
+                nn.LayerNorm(d_model),
+            ),
+            use_intra_token_dcn=use_intra_token_dcn,
+            intra_token_dcn_layers=intra_token_dcn_layers,
+            intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+            intra_token_dcn_dropout=intra_token_dcn_dropout,
+            intra_token_dcn_gate_init=intra_token_dcn_gate_init,
         )
 
         total_regular_fids = sum(len(g) for g in self.regular_groups)
@@ -1271,9 +1400,14 @@ class SplitUserIntNSTokenizer(nn.Module):
         self.padded_total_dim = self.chunk_dim * num_regular_tokens
         self._pad_size = self.padded_total_dim - total_regular_dim
         self.token_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(self.chunk_dim, d_model),
-                nn.LayerNorm(d_model),
+            make_token_projector(
+                self.chunk_dim,
+                d_model,
+                use_intra_token_dcn=use_intra_token_dcn,
+                intra_token_dcn_layers=intra_token_dcn_layers,
+                intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                intra_token_dcn_dropout=intra_token_dcn_dropout,
+                intra_token_dcn_gate_init=intra_token_dcn_gate_init,
             )
             for _ in range(num_regular_tokens)
         ])
@@ -1334,6 +1468,11 @@ class DenseGroupProjector(nn.Module):
         feature_specs: List[Tuple[int, int, int]],
         groups: List[List[int]],
         d_model: int,
+        use_intra_token_dcn: bool = False,
+        intra_token_dcn_layers: int = 1,
+        intra_token_dcn_low_rank: int = 32,
+        intra_token_dcn_dropout: float = 0.0,
+        intra_token_dcn_gate_init: float = -4.0,
     ) -> None:
         super().__init__()
         self.feature_specs = feature_specs
@@ -1346,9 +1485,14 @@ class DenseGroupProjector(nn.Module):
             self._group_slices.append(slices)
 
         self.group_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(sum(length for _, length in slices), d_model),
-                nn.LayerNorm(d_model),
+            make_token_projector(
+                sum(length for _, length in slices),
+                d_model,
+                use_intra_token_dcn=use_intra_token_dcn,
+                intra_token_dcn_layers=intra_token_dcn_layers,
+                intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                intra_token_dcn_dropout=intra_token_dcn_dropout,
+                intra_token_dcn_gate_init=intra_token_dcn_gate_init,
             )
             for slices in self._group_slices
         ])
@@ -1432,6 +1576,11 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         split_user_int_shared_fids: bool = False,
         use_dense_group_projector: bool = False,
+        use_intra_token_dcn: bool = False,
+        intra_token_dcn_layers: int = 1,
+        intra_token_dcn_low_rank: int = 32,
+        intra_token_dcn_dropout: float = 0.0,
+        intra_token_dcn_gate_init: float = -4.0,
     ) -> None:
         super().__init__()
 
@@ -1466,6 +1615,15 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_intra_token_dcn = use_intra_token_dcn
+        if use_intra_token_dcn:
+            logging.info(
+                "Intra-token DCN residual enabled for NS token projectors: "
+                f"layers={intra_token_dcn_layers}, "
+                f"low_rank={intra_token_dcn_low_rank}, "
+                f"dropout={intra_token_dcn_dropout}, "
+                f"gate_init={intra_token_dcn_gate_init}"
+            )
 
         # ================== NS Tokens Construction ==================
 
@@ -1477,6 +1635,11 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                use_intra_token_dcn=use_intra_token_dcn,
+                intra_token_dcn_layers=intra_token_dcn_layers,
+                intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                intra_token_dcn_dropout=intra_token_dcn_dropout,
+                intra_token_dcn_gate_init=intra_token_dcn_gate_init,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1486,6 +1649,11 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                use_intra_token_dcn=use_intra_token_dcn,
+                intra_token_dcn_layers=intra_token_dcn_layers,
+                intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                intra_token_dcn_dropout=intra_token_dcn_dropout,
+                intra_token_dcn_gate_init=intra_token_dcn_gate_init,
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
@@ -1508,6 +1676,11 @@ class PCVRHyFormer(nn.Module):
                     d_model=d_model,
                     num_regular_tokens=user_ns_tokens - 1,
                     emb_skip_threshold=emb_skip_threshold,
+                    use_intra_token_dcn=use_intra_token_dcn,
+                    intra_token_dcn_layers=intra_token_dcn_layers,
+                    intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                    intra_token_dcn_dropout=intra_token_dcn_dropout,
+                    intra_token_dcn_gate_init=intra_token_dcn_gate_init,
                 )
             else:
                 if split_user_int_shared_fids:
@@ -1523,6 +1696,11 @@ class PCVRHyFormer(nn.Module):
                     d_model=d_model,
                     num_ns_tokens=user_ns_tokens,
                     emb_skip_threshold=emb_skip_threshold,
+                    use_intra_token_dcn=use_intra_token_dcn,
+                    intra_token_dcn_layers=intra_token_dcn_layers,
+                    intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                    intra_token_dcn_dropout=intra_token_dcn_dropout,
+                    intra_token_dcn_gate_init=intra_token_dcn_gate_init,
                 )
             num_user_ns = user_ns_tokens
 
@@ -1533,6 +1711,11 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                use_intra_token_dcn=use_intra_token_dcn,
+                intra_token_dcn_layers=intra_token_dcn_layers,
+                intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                intra_token_dcn_dropout=intra_token_dcn_dropout,
+                intra_token_dcn_gate_init=intra_token_dcn_gate_init,
             )
             num_item_ns = item_ns_tokens
         else:
@@ -1553,6 +1736,11 @@ class PCVRHyFormer(nn.Module):
                     feature_specs=user_dense_feature_specs or [],
                     groups=[dense_emb_group, dense_other_group],
                     d_model=d_model,
+                    use_intra_token_dcn=use_intra_token_dcn,
+                    intra_token_dcn_layers=intra_token_dcn_layers,
+                    intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                    intra_token_dcn_dropout=intra_token_dcn_dropout,
+                    intra_token_dcn_gate_init=intra_token_dcn_gate_init,
                 )
             else:
                 if use_dense_group_projector:
@@ -1561,9 +1749,14 @@ class PCVRHyFormer(nn.Module):
                         "TAAC dense fids are unavailable; falling back to a "
                         "single dense NS token."
                     )
-                self.user_dense_proj = nn.Sequential(
-                    nn.Linear(user_dense_dim, d_model),
-                    nn.LayerNorm(d_model),
+                self.user_dense_proj = make_token_projector(
+                    user_dense_dim,
+                    d_model,
+                    use_intra_token_dcn=use_intra_token_dcn,
+                    intra_token_dcn_layers=intra_token_dcn_layers,
+                    intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                    intra_token_dcn_dropout=intra_token_dcn_dropout,
+                    intra_token_dcn_gate_init=intra_token_dcn_gate_init,
                 )
             self.user_dense_num_tokens = (
                 self.user_dense_proj.num_tokens
@@ -1575,9 +1768,14 @@ class PCVRHyFormer(nn.Module):
         self.has_item_dense = item_dense_dim > 0
         self.item_dense_num_tokens = 0
         if self.has_item_dense:
-            self.item_dense_proj = nn.Sequential(
-                nn.Linear(item_dense_dim, d_model),
-                nn.LayerNorm(d_model),
+            self.item_dense_proj = make_token_projector(
+                item_dense_dim,
+                d_model,
+                use_intra_token_dcn=use_intra_token_dcn,
+                intra_token_dcn_layers=intra_token_dcn_layers,
+                intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                intra_token_dcn_dropout=intra_token_dcn_dropout,
+                intra_token_dcn_gate_init=intra_token_dcn_gate_init,
             )
             self.item_dense_num_tokens = 1
 
@@ -1697,8 +1895,15 @@ class PCVRHyFormer(nn.Module):
         if use_time_summary_features:
             time_summary_dim = self.num_sequences * 8
             self.time_summary_proj = nn.Sequential(
-                nn.Linear(time_summary_dim, d_model),
-                nn.LayerNorm(d_model),
+                make_token_projector(
+                    time_summary_dim,
+                    d_model,
+                    use_intra_token_dcn=use_intra_token_dcn,
+                    intra_token_dcn_layers=intra_token_dcn_layers,
+                    intra_token_dcn_low_rank=intra_token_dcn_low_rank,
+                    intra_token_dcn_dropout=intra_token_dcn_dropout,
+                    intra_token_dcn_gate_init=intra_token_dcn_gate_init,
+                ),
                 nn.SiLU(),
                 nn.Dropout(dropout_rate),
             )

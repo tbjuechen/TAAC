@@ -89,6 +89,11 @@ _FALLBACK_MODEL_CFG = {
     'item_ns_tokens': 0,
     'split_user_int_shared_fids': False,
     'use_dense_group_projector': False,
+    'use_intra_token_dcn': False,
+    'intra_token_dcn_layers': 1,
+    'intra_token_dcn_low_rank': 32,
+    'intra_token_dcn_dropout': 0.0,
+    'intra_token_dcn_gate_init': -4.0,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
