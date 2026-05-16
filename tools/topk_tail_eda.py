@@ -160,6 +160,12 @@ def parse_args() -> argparse.Namespace:
                         help="Comma-separated coverage cutoffs")
     parser.add_argument("--out-json", default="output/topk_tail_eda.json")
     parser.add_argument("--out-md", default="output/topk_tail_eda.md")
+    parser.add_argument("--export-topk-map", default="",
+                        help="Optional path for a TopK id map JSON used by TopK+default rescue.")
+    parser.add_argument("--export-map-targets", default="",
+                        help="Comma-separated export specs, e.g. seq_c:34:10000,seq_a:38:100000")
+    parser.add_argument("--print-topk-map-one-line", action="store_true",
+                        help="Print exported TopK map JSON as one JSON-escaped line.")
     parser.add_argument("--print-md", action="store_true",
                         help="Print the full Markdown report to stdout for platforms where output files are inaccessible.")
     parser.add_argument("--print-json", action="store_true",
@@ -561,6 +567,72 @@ def summarize_target(
     }
 
 
+def parse_export_map_targets(specs: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for raw_spec in specs.split(","):
+        spec = raw_spec.strip()
+        if not spec:
+            continue
+        parts = spec.split(":")
+        if len(parts) != 3:
+            raise ValueError(
+                f"invalid --export-map-targets spec {spec!r}; "
+                "expected domain:fid:k"
+            )
+        domain, fid_s, k_s = parts
+        key = f"{domain}:{int(fid_s)}"
+        k = int(k_s)
+        if k <= 0:
+            raise ValueError(f"invalid k for {spec!r}; k must be positive")
+        result[key] = k
+    return result
+
+
+def build_topk_map(
+    targets: dict[str, Target],
+    exact_stats: dict[str, ExactStats],
+    export_specs: dict[str, int],
+    candidate_capacity: int,
+) -> dict[str, Any]:
+    exported: dict[str, Any] = {}
+    warnings: list[str] = []
+    for key, k in sorted(export_specs.items()):
+        if key not in targets:
+            raise ValueError(f"export target {key!r} is not in --targets")
+        target = targets[key]
+        if k > candidate_capacity:
+            warnings.append(
+                f"{key}: requested k={k} exceeds candidate_capacity={candidate_capacity}; "
+                "increase --candidate-capacity for a reliable export"
+            )
+        top_items = exact_stats[key].head_counts.most_common(k)
+        ids = [int(value) for value, _ in top_items]
+        if len(ids) < k:
+            warnings.append(
+                f"{key}: requested k={k}, but only {len(ids)} candidate ids were available"
+            )
+        exported[key] = {
+            "domain": target.domain,
+            "fid": target.fid,
+            "vocab_size": target.vocab_size,
+            "k": int(k),
+            "actual_k": len(ids),
+            "padding_id": 0,
+            "default_id": len(ids) + 1,
+            "ids": ids,
+        }
+    return {
+        "version": 1,
+        "format": "taac_seq_topk_default_map",
+        "description": (
+            "For each target, remap raw ids in ids[] to 1..actual_k by rank; "
+            "raw id 0 stays padding_id=0; positive ids not in ids[] map to default_id."
+        ),
+        "targets": exported,
+        "warnings": warnings,
+    }
+
+
 def render_markdown(result: dict[str, Any]) -> str:
     lines = [
         "# TopK Tail EDA",
@@ -747,8 +819,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         summarize_target(targets[key], merged_basic[key], merged_exact[key], topks)
         for key in sorted(targets)
     ]
+    topk_map = None
+    if args.export_map_targets:
+        export_specs = parse_export_map_targets(args.export_map_targets)
+        topk_map = build_topk_map(
+            targets=targets,
+            exact_stats=merged_exact,
+            export_specs=export_specs,
+            candidate_capacity=args.candidate_capacity,
+        )
+        log_progress(
+            "topk_map built "
+            f"targets={len(topk_map['targets'])} warnings={len(topk_map['warnings'])}"
+        )
     log_progress(f"summarize done total_elapsed_sec={time.perf_counter() - started_at:.1f}")
-    return {
+    result = {
         "data_dir": str(data_dir),
         "schema_path": str(args.schema_path),
         "targets_requested": list(targets),
@@ -762,6 +847,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "elapsed_sec": time.perf_counter() - started_at,
         "targets": summaries,
     }
+    if topk_map is not None:
+        result["topk_map"] = topk_map
+    return result
 
 
 def final_summary_line(result: dict[str, Any], out_json: Path, out_md: Path) -> str:
@@ -787,6 +875,8 @@ def final_summary_line(result: dict[str, Any], out_json: Path, out_md: Path) -> 
         "json": str(out_json),
         "md": str(out_md),
     }
+    if "topk_map_path" in result:
+        payload["topk_map"] = result["topk_map_path"]
     return "TOPK_TAIL_EDA_DONE " + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -804,14 +894,32 @@ def print_one_line_file(marker: str, text: str) -> None:
     )
 
 
+def print_one_line_json(marker: str, payload: Any) -> None:
+    print(
+        marker + " " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        flush=True,
+    )
+
+
 def main() -> None:
     args = parse_args()
     result = run(args)
 
     out_json = Path(args.out_json)
     out_md = Path(args.out_md)
+    out_topk_map = Path(args.export_topk_map) if args.export_topk_map else None
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_md.parent.mkdir(parents=True, exist_ok=True)
+    if out_topk_map is not None:
+        out_topk_map.parent.mkdir(parents=True, exist_ok=True)
+        if "topk_map" not in result:
+            raise SystemExit("--export-topk-map requires --export-map-targets")
+        with out_topk_map.open("w", encoding="utf-8") as f:
+            json.dump(result["topk_map"], f, indent=2, ensure_ascii=False)
+        result["topk_map_path"] = str(out_topk_map)
+        log_progress(f"wrote_topk_map path={out_topk_map}")
+        for warning in result["topk_map"].get("warnings", []):
+            log_progress(f"topk_map_warning {warning}")
     with out_json.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     md_report = render_markdown(result)
@@ -827,6 +935,11 @@ def main() -> None:
         print_block(
             "TOPK_TAIL_EDA_JSON",
             json.dumps(result, indent=2, ensure_ascii=False),
+        )
+    if args.print_topk_map_one_line and "topk_map" in result:
+        print_one_line_json(
+            "TOPK_TAIL_EDA_TOPK_MAP_FILE",
+            result["topk_map"],
         )
 
 
