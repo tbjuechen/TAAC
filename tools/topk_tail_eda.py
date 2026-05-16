@@ -470,17 +470,26 @@ def summarize_target(
     cumulative = 0
     cumulative_pos = 0
     cumulative_pos0_50 = 0
+    counts_so_far: list[int] = []
     for rank, (value, count) in enumerate(sorted_counts, start=1):
         cumulative += count
         cumulative_pos += exact.head_pos_counts.get(value, 0)
+        counts_so_far.append(int(count))
         for bucket_name in ("pos0_10", "pos10_50"):
             cumulative_pos0_50 += exact.head_pos_bucket_counts[bucket_name].get(value, 0)
         if rank in topks:
+            counts_arr = np.asarray(counts_so_far, dtype=np.int64)
             topk_summary[f"top{rank}"] = {
                 "count": int(cumulative),
                 "coverage": pct(cumulative, total),
                 "pos_rate": pct(cumulative_pos, cumulative),
                 "pos0_50_coverage": pct(cumulative_pos0_50, total),
+                "cutoff_count": int(count),
+                "count_p10": int(np.quantile(counts_arr, 0.10)) if counts_arr.size else 0,
+                "count_p50": int(np.quantile(counts_arr, 0.50)) if counts_arr.size else 0,
+                "low_count_share_lt10": pct(int((counts_arr < 10).sum()), counts_arr.size),
+                "low_count_share_lt50": pct(int((counts_arr < 50).sum()), counts_arr.size),
+                "low_count_share_lt100": pct(int((counts_arr < 100).sum()), counts_arr.size),
             }
 
     # Fill requested TopK values that exceed candidate size with final cumulative.
@@ -490,11 +499,19 @@ def summarize_target(
     for k in topks:
         name = f"top{k}"
         if name not in topk_summary:
+            counts_arr = np.asarray(counts_so_far, dtype=np.int64)
+            cutoff_count = int(counts_arr[-1]) if counts_arr.size else 0
             topk_summary[name] = {
                 "count": int(cumulative),
                 "coverage": pct(cumulative, total),
                 "pos_rate": pct(cumulative_pos, cumulative),
                 "pos0_50_coverage": pct(pos0_50_final, total),
+                "cutoff_count": cutoff_count,
+                "count_p10": int(np.quantile(counts_arr, 0.10)) if counts_arr.size else 0,
+                "count_p50": int(np.quantile(counts_arr, 0.50)) if counts_arr.size else 0,
+                "low_count_share_lt10": pct(int((counts_arr < 10).sum()), counts_arr.size),
+                "low_count_share_lt50": pct(int((counts_arr < 50).sum()), counts_arr.size),
+                "low_count_share_lt100": pct(int((counts_arr < 100).sum()), counts_arr.size),
             }
 
     recommended_k = 0
@@ -643,8 +660,8 @@ def render_markdown(result: dict[str, Any]) -> str:
         "",
         "## Rescue Ranking",
         "",
-        "| rank | domain | fid | vocab | nonzero_tokens | top100k_cov | top200k_cov | tail_share | head_tail_lift | pos0_50_top100k | recommended_k | rescue_score |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| rank | domain | fid | vocab | nonzero_tokens | top100k_cov | top200k_cov | tail_share | head_tail_lift | pos0_50_top100k | recommended_k | count@recommended | low<50@recommended | rescue_score |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     summaries = sorted(
         result["targets"],
@@ -654,9 +671,11 @@ def render_markdown(result: dict[str, Any]) -> str:
     for idx, row in enumerate(summaries, start=1):
         top100 = row["topk"].get("top100000", {})
         top200 = row["topk"].get("top200000", {})
+        recommended = row["topk"].get(f"top{row['recommended_k']}", {})
         lines.append(
             "| {rank} | {domain} | {fid} | {vocab:,} | {tokens:,} | {top100:.2%} | "
-            "{top200:.2%} | {tail:.2%} | {lift:.3f}x | {pos50:.2%} | {rk:,} | {score:.3f} |".format(
+            "{top200:.2%} | {tail:.2%} | {lift:.3f}x | {pos50:.2%} | {rk:,} | "
+            "{cutoff:,} | {low50:.2%} | {score:.3f} |".format(
                 rank=idx,
                 domain=row["domain"],
                 fid=row["fid"],
@@ -668,6 +687,8 @@ def render_markdown(result: dict[str, Any]) -> str:
                 lift=row["recommended_head_tail_lift"],
                 pos50=top100.get("pos0_50_coverage", 0.0),
                 rk=row["recommended_k"],
+                cutoff=recommended.get("cutoff_count", 0),
+                low50=recommended.get("low_count_share_lt50", 0.0),
                 score=row["rescue_score"],
             )
         )
@@ -688,13 +709,17 @@ def render_markdown(result: dict[str, Any]) -> str:
             f"- recommended coverage: {row['recommended_coverage']:.2%}",
             f"- head/tail pos-rate lift: {row['recommended_head_tail_lift']:.3f}x",
             "",
-            "| k | coverage | pos_rate | pos0_50_coverage |",
-            "|---:|---:|---:|---:|",
+            "| k | coverage | pos_rate | pos0_50_coverage | cutoff_count | count_p10 | count_p50 | low<10 | low<50 | low<100 |",
+            "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ])
         for name, top in row["topk"].items():
             lines.append(
                 f"| {name[3:]} | {top['coverage']:.2%} | "
-                f"{top['pos_rate']:.3%} | {top['pos0_50_coverage']:.2%} |"
+                f"{top['pos_rate']:.3%} | {top['pos0_50_coverage']:.2%} | "
+                f"{top['cutoff_count']:,} | {top['count_p10']:,} | "
+                f"{top['count_p50']:,} | {top['low_count_share_lt10']:.2%} | "
+                f"{top['low_count_share_lt50']:.2%} | "
+                f"{top['low_count_share_lt100']:.2%} |"
             )
         lines.extend([
             "",
