@@ -1404,7 +1404,7 @@ class PCVRHyFormer(nn.Module):
         d_model: int = 64,
         emb_dim: int = 64,
         num_queries: int = 1,
-        num_hyformer_blocks: int = 2,
+        num_hyformer_blocks: int = 3,
         num_heads: int = 4,
         seq_encoder_type: str = 'transformer',
         hidden_mult: int = 4,

@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
                         help='Per-Embedding-table dimension (before projection)')
     parser.add_argument('--num_queries', type=int, default=1,
                         help='Number of Query tokens generated independently per sequence domain')
-    parser.add_argument('--num_hyformer_blocks', type=int, default=2,
+    parser.add_argument('--num_hyformer_blocks', type=int, default=3,
                         help='Number of stacked MultiSeqHyFormerBlock layers')
     parser.add_argument('--num_heads', type=int, default=4,
                         help='Number of attention heads (must satisfy d_model %% num_heads == 0)')
