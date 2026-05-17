@@ -386,6 +386,7 @@ class PCVRHyFormerRankingTrainer:
                         self.dense_optimizer.param_groups[0]['lr'],
                         total_step,
                     )
+                    self._log_time_diff_gates(total_step)
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
@@ -465,6 +466,25 @@ class PCVRHyFormerRankingTrainer:
                         restored += 1
                 logging.info(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
                              f"restored optimizer state for {restored} low-cardinality params")
+
+    def _log_time_diff_gates(self, total_step: int) -> None:
+        """Log per-domain recency time-diff gates when the experiment is active."""
+        if not self.writer:
+            return
+        gates = getattr(self.model, 'time_diff_gates', None)
+        if not gates:
+            return
+        values = []
+        for domain, gate in gates.items():
+            value = float(gate.detach().cpu().item())
+            self.writer.add_scalar(f'TimeDiffGate/{domain}', value, total_step)
+            values.append(value)
+        if values:
+            self.writer.add_scalar(
+                'TimeDiffGate/mean',
+                sum(values) / len(values),
+                total_step,
+            )
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
         """Construct a ``ModelInput`` NamedTuple from a device_batch dict."""
