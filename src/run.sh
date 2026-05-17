@@ -17,7 +17,8 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.9 hour-only ablation:         USE_SEQ_HOUR=1 ./run.sh
 # W2.9 dow-only ablation:          USE_SEQ_DOW=1 ./run.sh
 # W2.9b per-domain periodic:       USE_PER_DOMAIN_PERIODIC_TIME=1 ./run.sh
-# DIN global info pooling:         ./run.sh
+# DIN residual global pooling:     ./run.sh
+# Pure DIN global info pooling:    GLOBAL_INFO_POOLING=din ./run.sh
 # DIN all-NS target ablation:      DIN_TARGET_SCOPE=all_ns ./run.sh
 # Mean-pool baseline rollback:     GLOBAL_INFO_POOLING=mean ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
@@ -32,8 +33,9 @@ USE_SEQ_PERIODIC_TIME="${USE_SEQ_PERIODIC_TIME:-1}"
 USE_SEQ_HOUR="${USE_SEQ_HOUR:-0}"
 USE_SEQ_DOW="${USE_SEQ_DOW:-0}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
-GLOBAL_INFO_POOLING="${GLOBAL_INFO_POOLING:-din}"
+GLOBAL_INFO_POOLING="${GLOBAL_INFO_POOLING:-din_residual}"
 DIN_TARGET_SCOPE="${DIN_TARGET_SCOPE:-item}"
+DIN_RESIDUAL_INIT="${DIN_RESIDUAL_INIT:-0.1}"
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
         D_MODEL=68
@@ -54,6 +56,7 @@ EXTRA_FLAGS=""
 [ "${USE_PER_DOMAIN_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_seq_periodic_time_features"
 EXTRA_FLAGS="${EXTRA_FLAGS} --global_info_pooling ${GLOBAL_INFO_POOLING}"
 EXTRA_FLAGS="${EXTRA_FLAGS} --din_target_scope ${DIN_TARGET_SCOPE}"
+EXTRA_FLAGS="${EXTRA_FLAGS} --din_residual_init ${DIN_RESIDUAL_INIT}"
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
 python3 -u "${SCRIPT_DIR}/train.py" \

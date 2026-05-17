@@ -434,6 +434,7 @@ class MultiSeqQueryGenerator(nn.Module):
         hidden_mult: int = 4,
         global_info_pooling: str = 'mean',
         target_num_tokens: int = 0,
+        din_residual_init: float = 0.1,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
@@ -441,7 +442,7 @@ class MultiSeqQueryGenerator(nn.Module):
         self.d_model = d_model
         self.global_info_pooling = global_info_pooling
 
-        if global_info_pooling not in ['mean', 'din']:
+        if global_info_pooling not in ['mean', 'din', 'din_residual']:
             raise ValueError(f"Unknown global_info_pooling: {global_info_pooling}")
 
         global_info_dim = (num_ns + 1) * d_model
@@ -449,9 +450,11 @@ class MultiSeqQueryGenerator(nn.Module):
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
 
-        if global_info_pooling == 'din':
+        if global_info_pooling in ['din', 'din_residual']:
             if target_num_tokens <= 0:
-                raise ValueError("target_num_tokens must be positive when global_info_pooling='din'")
+                raise ValueError(
+                    "target_num_tokens must be positive when using DIN global_info_pooling"
+                )
             target_in_dim = target_num_tokens * d_model
             self.item_target_proj = nn.Sequential(
                 nn.Linear(target_in_dim, d_model * hidden_mult),
@@ -466,6 +469,10 @@ class MultiSeqQueryGenerator(nn.Module):
                 nn.SiLU(),
                 nn.Linear(d_model, 1),
             )
+            if global_info_pooling == 'din_residual':
+                init = min(max(din_residual_init, 1e-4), 1.0 - 1e-4)
+                init_logit = math.log(init / (1.0 - init))
+                self.din_residual_logit = nn.Parameter(torch.tensor(init_logit, dtype=torch.float))
 
         # Each sequence has N independent FFNs
         self.query_ffns_per_seq = nn.ModuleList([
@@ -503,9 +510,9 @@ class MultiSeqQueryGenerator(nn.Module):
         """
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
-        if self.global_info_pooling == 'din':
+        if self.global_info_pooling in ['din', 'din_residual']:
             if target_tokens is None:
-                raise ValueError("target_tokens is required when global_info_pooling='din'")
+                raise ValueError("target_tokens is required when using DIN global_info_pooling")
             target_emb = self.item_target_proj(target_tokens.view(B, -1))  # (B, D)
         else:
             target_emb = None
@@ -531,12 +538,9 @@ class MultiSeqQueryGenerator(nn.Module):
         seq_padding_mask: torch.Tensor,
         target_emb: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        mean_pooled = self._mean_pool_sequence(seq_tokens, seq_padding_mask)
         if self.global_info_pooling == 'mean':
-            valid_mask = ~seq_padding_mask  # True = valid
-            valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L, 1)
-            seq_sum = (seq_tokens * valid_mask_expanded).sum(dim=1)  # (B, D)
-            seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
-            return seq_sum / seq_count  # (B, D)
+            return mean_pooled
 
         B, L, D = seq_tokens.shape
         target = target_emb.unsqueeze(1).expand(B, L, D)
@@ -548,7 +552,22 @@ class MultiSeqQueryGenerator(nn.Module):
         scores = scores.masked_fill(seq_padding_mask, float('-inf'))
         weights = torch.softmax(scores, dim=1)
         weights = torch.nan_to_num(weights, nan=0.0)
-        return (seq_tokens * weights.unsqueeze(-1)).sum(dim=1)  # (B, D)
+        din_pooled = (seq_tokens * weights.unsqueeze(-1)).sum(dim=1)  # (B, D)
+        if self.global_info_pooling == 'din':
+            return din_pooled
+        gate = torch.sigmoid(self.din_residual_logit)
+        return mean_pooled + gate * (din_pooled - mean_pooled)
+
+    def _mean_pool_sequence(
+        self,
+        seq_tokens: torch.Tensor,
+        seq_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        valid_mask = ~seq_padding_mask  # True = valid
+        valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L, 1)
+        seq_sum = (seq_tokens * valid_mask_expanded).sum(dim=1)  # (B, D)
+        seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
+        return seq_sum / seq_count  # (B, D)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1487,6 +1506,7 @@ class PCVRHyFormer(nn.Module):
         use_dense_group_projector: bool = False,
         global_info_pooling: str = 'mean',
         din_target_scope: str = 'item',
+        din_residual_init: float = 0.1,
     ) -> None:
         super().__init__()
 
@@ -1775,6 +1795,7 @@ class PCVRHyFormer(nn.Module):
                 if din_target_scope == 'all_ns'
                 else num_item_ns + self.item_dense_num_tokens
             ),
+            din_residual_init=din_residual_init,
         )
 
         # MultiSeqHyFormerBlock stack

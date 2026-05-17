@@ -91,6 +91,7 @@ _FALLBACK_MODEL_CFG = {
     'use_dense_group_projector': False,
     'global_info_pooling': 'mean',
     'din_target_scope': 'item',
+    'din_residual_init': 0.1,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

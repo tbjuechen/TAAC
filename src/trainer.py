@@ -178,6 +178,18 @@ class PCVRHyFormerRankingTrainer:
         logging.info("AMP enabled=%s, dtype=bf16, grad_scaler=%s",
                      self.use_amp, self.scaler.is_enabled())
 
+    def _log_din_residual_gate(self, total_step: int) -> None:
+        """Write the learnable DIN residual gate to TensorBoard when present."""
+        if not self.writer:
+            return
+        query_generator = getattr(self.model, 'query_generator', None)
+        gate_logit = getattr(query_generator, 'din_residual_logit', None)
+        if gate_logit is None:
+            return
+        with torch.no_grad():
+            gate = torch.sigmoid(gate_logit.detach()).item()
+        self.writer.add_scalar('DIN/residual_gate', gate, total_step)
+
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
         ``global_step2500.layer=2.head=4.hidden=64[.best_model]``.
@@ -386,6 +398,7 @@ class PCVRHyFormerRankingTrainer:
                         self.dense_optimizer.param_groups[0]['lr'],
                         total_step,
                     )
+                    self._log_din_residual_gate(total_step)
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 

@@ -271,18 +271,23 @@ def parse_args() -> argparse.Namespace:
                              'fid 61/87 and fid 62/63/64/65/66/89/90/91. '
                              'When disabled, use the baseline single dense token.')
     parser.add_argument('--global_info_pooling', type=str, default='mean',
-                        choices=['mean', 'din'],
+                        choices=['mean', 'din', 'din_residual'],
                         help='Pooling used for the sequence part of GlobalInfo in '
                              'MultiSeqQueryGenerator. mean = masked mean pooling; '
                              'din = DIN-style target-aware weighted pooling where '
                              'sequence tokens are item embeddings and item-side NS '
-                             'tokens are projected to the target embedding.')
+                             'tokens are projected to the target embedding; '
+                             'din_residual = gated residual blend from mean to DIN.')
     parser.add_argument('--din_target_scope', type=str, default='item',
                         choices=['item', 'all_ns'],
                         help='Token scope used to build the DIN target embedding. '
                              'item = item NS tokens plus item dense token; '
                              'all_ns = all non-sequence tokens in GlobalInfo. '
-                             'Only effective when --global_info_pooling=din.')
+                             'Only effective when --global_info_pooling uses DIN.')
+    parser.add_argument('--din_residual_init', type=float, default=0.1,
+                        help='Initial DIN residual gate value for '
+                             '--global_info_pooling=din_residual. '
+                             '0 keeps the model near mean pooling; 1 is pure DIN.')
 
     args = parser.parse_args()
 
@@ -420,6 +425,7 @@ def main() -> None:
         "use_dense_group_projector": args.use_dense_group_projector,
         "global_info_pooling": args.global_info_pooling,
         "din_target_scope": args.din_target_scope,
+        "din_residual_init": args.din_residual_init,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
