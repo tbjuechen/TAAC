@@ -21,6 +21,7 @@ import torch
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import (
     FeatureSchema,
+    TIME_BUCKET_BOUNDARY_PRESETS,
     USER_TIME_DOW_FID,
     USER_TIME_HOD_FID,
     get_pcvr_data,
@@ -116,7 +117,7 @@ def parse_args() -> argparse.Namespace:
                         help='Per-Embedding-table dimension (before projection)')
     parser.add_argument('--num_queries', type=int, default=1,
                         help='Number of Query tokens generated independently per sequence domain')
-    parser.add_argument('--num_hyformer_blocks', type=int, default=2,
+    parser.add_argument('--num_hyformer_blocks', type=int, default=3,
                         help='Number of stacked MultiSeqHyFormerBlock layers')
     parser.add_argument('--num_heads', type=int, default=4,
                         help='Number of attention heads (must satisfy d_model %% num_heads == 0)')
@@ -153,25 +154,47 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--time_bucket_boundaries', type=str, default='original',
+                        choices=sorted(TIME_BUCKET_BOUNDARY_PRESETS),
+                        help='Recency bucket boundary preset. original reproduces '
+                             'the historical grid; hybrid_v1 keeps the same bucket '
+                             'count but reallocates resolution from seconds/minutes '
+                             'to day/month ranges.')
     parser.add_argument('--per_domain_time_embeddings', action='store_true', default=False,
                         help='Use one recency time-bucket embedding table per sequence '
                              'domain while keeping the global bucket boundaries unchanged.')
     parser.add_argument('--domain_time_residual_embeddings', action='store_true', default=False,
                         help='Add zero-initialized per-domain residual time embeddings on '
                              'top of the shared recency time embedding.')
+    parser.add_argument('--gated_time_diff_embeddings', action='store_true', default=False,
+                        help='Scale the recency time-diff embedding with one learnable '
+                             'scalar gate per sequence domain before adding it to the '
+                             'projected sequence token.')
     parser.add_argument('--use_time_summary_features', action='store_true', default=False,
                         help='Add one NS token from per-domain sequence time summary features '
                              '(last/oldest/span/density/window counts).')
     parser.add_argument('--use_seq_periodic_time_features', action='store_true', default=False,
-                        help='Concatenate hour-of-day and day-of-week embeddings to each '
-                             'sequence token before the per-domain sequence projection.')
+                        help='Concatenate hour-of-day, day-of-week, and month-of-year '
+                             'embeddings to each sequence token before the per-domain '
+                             'sequence projection. If any individual periodic feature '
+                             'flag is provided, use that selected subset for ablation.')
     parser.add_argument('--use_seq_hour_of_day_feature', action='store_true', default=False,
-                        help='Concatenate hour-of-day embeddings to each sequence token.')
+                        help='Ablation selector: concatenate hour-of-day embeddings to '
+                             'each sequence token.')
     parser.add_argument('--use_seq_day_of_week_feature', action='store_true', default=False,
-                        help='Concatenate day-of-week embeddings to each sequence token.')
+                        help='Ablation selector: concatenate day-of-week embeddings to '
+                             'each sequence token.')
+    parser.add_argument('--use_seq_month_of_year_feature', action='store_true', default=False,
+                        help='Ablation selector: concatenate month-of-year embeddings to '
+                             'each sequence token.')
     parser.add_argument('--per_domain_seq_periodic_time_features', action='store_true', default=False,
-                        help='Use per-domain hour-of-day and day-of-week embeddings for '
-                             'sequence periodic time features.')
+                        help='Use per-domain embeddings for enabled sequence periodic '
+                             'time features.')
+    parser.add_argument('--reinit_seq_periodic_time_features', action='store_true', default=False,
+                        help='When sparse embeddings are re-initialized after an epoch, '
+                             'also re-initialize only the sequence periodic time embeddings '
+                             '(hour-of-day/day-of-week/month-of-year). Other time '
+                             'embeddings remain preserved.')
     parser.add_argument('--use_delta_buckets', action='store_true', default=False,
                         help='Enable per-domain delta-t bucket embedding (W2.7). '
                              'Models adjacent-token time gaps within sequences. '
@@ -233,6 +256,9 @@ def parse_args() -> argparse.Namespace:
                         help='Cosine floor expressed as a fraction of peak --lr '
                              '(0.1 means floor lr = 0.1 * --lr). '
                              'Effective only when --use_cosine_decay is set.')
+    parser.add_argument('--ema_decay', type=float, default=0.0,
+                        help='EMA decay for validation/checkpoint weights '
+                             '(0 = disabled; try 0.999 as the first A/B).')
 
     # Embedding construction control.
     parser.add_argument('--emb_skip_threshold', type=int, default=0,
@@ -345,6 +371,7 @@ def main() -> None:
         seed=args.seed,
         seq_max_lens=seq_max_lens,
         topk_rescue_map_path=topk_rescue_map_path,
+        time_bucket_boundaries=args.time_bucket_boundaries,
     )
 
     # ---- NS groups ----
@@ -401,12 +428,15 @@ def main() -> None:
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "per_domain_time_embeddings": args.per_domain_time_embeddings,
         "domain_time_residual_embeddings": args.domain_time_residual_embeddings,
+        "gated_time_diff_embeddings": args.gated_time_diff_embeddings,
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
         "use_time_summary_features": args.use_time_summary_features,
         "use_seq_hour_of_day_feature": args.use_seq_hour_of_day_feature,
         "use_seq_day_of_week_feature": args.use_seq_day_of_week_feature,
+        "use_seq_month_of_year_feature": args.use_seq_month_of_year_feature,
         "use_seq_periodic_time_features": args.use_seq_periodic_time_features,
         "per_domain_seq_periodic_time_features": args.per_domain_seq_periodic_time_features,
+        "reinit_seq_periodic_time_features": args.reinit_seq_periodic_time_features,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
@@ -434,6 +464,11 @@ def main() -> None:
             f"shared + zero-init residual ({n_domains} x {NUM_TIME_BUCKETS} x "
             f"{args.d_model}), +{n_domains * NUM_TIME_BUCKETS * args.d_model} params"
         )
+    if model.num_time_buckets > 0 and model.gated_time_diff_embeddings:
+        logging.info(
+            f"Per-domain gated recency time embeddings enabled: "
+            f"{len(model.seq_domains)} scalar gates initialized to 1.0"
+        )
     if model.use_time_summary_features:
         logging.info(
             f"W2.8 time summary NS token enabled: "
@@ -450,10 +485,17 @@ def main() -> None:
             periodic_parts.append("hour-of-day")
         if model.use_seq_day_of_week_feature:
             periodic_parts.append("day-of-week")
+        if model.use_seq_month_of_year_feature:
+            periodic_parts.append("month-of-year")
         logging.info(
             f"W2.9 seq periodic time features enabled ({periodic_scope}): concat "
             f"{' + '.join(periodic_parts)} embeddings before seq projection"
         )
+        if model.reinit_seq_periodic_time_features:
+            logging.info(
+                "Sequence periodic time embeddings will be re-initialized "
+                "during sparse embedding reinit"
+            )
     if model.num_delta_buckets > 0:
         n_domains = len(model.seq_domains)
         logging.info(
@@ -535,6 +577,7 @@ def main() -> None:
         use_cosine_decay=args.use_cosine_decay,
         cosine_total_steps=cosine_total_steps,
         cosine_min_lr_ratio=args.cosine_min_lr_ratio,
+        ema_decay=args.ema_decay,
     )
 
     trainer.train()

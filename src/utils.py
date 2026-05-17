@@ -233,6 +233,67 @@ class EarlyStopping:
         self.best_saved_score = score
 
 
+class ModelEMA:
+    """Exponential moving average of trainable model parameters.
+
+    EMA keeps a smoothed copy of parameters for validation/checkpointing while
+    the optimizer continues updating the live model weights.
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+        if not 0.0 < decay < 1.0:
+            raise ValueError(f"EMA decay must be in (0, 1), got {decay}")
+        self.decay = decay
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.backup: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name not in self.shadow:
+                self.shadow[name] = param.detach().clone()
+                continue
+            self.shadow[name].mul_(self.decay).add_(
+                param.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: nn.Module) -> None:
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if name not in self.shadow:
+                continue
+            self.backup[name] = param.detach().clone()
+            param.data.copy_(self.shadow[name].to(device=param.device, dtype=param.dtype))
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+    @torch.no_grad()
+    def resync(self, model: nn.Module, param_ptrs: Optional["set[int]"] = None) -> None:
+        """Refresh EMA values after explicit parameter reinitialization.
+
+        Args:
+            model: Source model.
+            param_ptrs: Optional set of ``data_ptr`` values to resync. When
+                omitted, all tracked parameters are refreshed.
+        """
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param_ptrs is not None and param.data_ptr() not in param_ptrs:
+                continue
+            self.shadow[name] = param.detach().clone()
+
+
 def set_seed(seed: int) -> None:
     """Seed every RNG that can influence training reproducibility.
 

@@ -20,6 +20,7 @@ class ModelInput(NamedTuple):
     seq_delta_buckets: dict  # {domain: tensor [B, L]} - W2.7 adjacent-token delta_t buckets
     seq_hour_buckets: dict  # {domain: tensor [B, L]} - hour-of-day ids, 0=padding
     seq_dow_buckets: dict  # {domain: tensor [B, L]} - day-of-week ids, 0=padding
+    seq_moy_buckets: dict  # {domain: tensor [B, L]} - month-of-year ids, 0=padding
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1403,7 +1404,7 @@ class PCVRHyFormer(nn.Module):
         d_model: int = 64,
         emb_dim: int = 64,
         num_queries: int = 1,
-        num_hyformer_blocks: int = 2,
+        num_hyformer_blocks: int = 3,
         num_heads: int = 4,
         seq_encoder_type: str = 'transformer',
         hidden_mult: int = 4,
@@ -1415,12 +1416,15 @@ class PCVRHyFormer(nn.Module):
         num_time_buckets: int = 65,
         per_domain_time_embeddings: bool = False,
         domain_time_residual_embeddings: bool = False,
+        gated_time_diff_embeddings: bool = False,
         num_delta_buckets: int = 0,
         use_time_summary_features: bool = False,
         use_seq_hour_of_day_feature: bool = False,
         use_seq_day_of_week_feature: bool = False,
+        use_seq_month_of_year_feature: bool = False,
         use_seq_periodic_time_features: bool = False,
         per_domain_seq_periodic_time_features: bool = False,
+        reinit_seq_periodic_time_features: bool = False,
         rank_mixer_mode: str = 'full',
         use_rope: bool = False,
         rope_base: float = 10000.0,
@@ -1444,23 +1448,33 @@ class PCVRHyFormer(nn.Module):
         self.num_time_buckets = num_time_buckets
         self.per_domain_time_embeddings = per_domain_time_embeddings
         self.domain_time_residual_embeddings = domain_time_residual_embeddings
+        self.gated_time_diff_embeddings = gated_time_diff_embeddings
         self.num_delta_buckets = num_delta_buckets
         self.use_time_summary_features = use_time_summary_features
-        self.use_seq_hour_of_day_feature = (
+        seq_periodic_selector_enabled = (
             use_seq_hour_of_day_feature
-            or use_seq_periodic_time_features
+            or use_seq_day_of_week_feature
+            or use_seq_month_of_year_feature
+        )
+        seq_periodic_all_enabled = (
+            use_seq_periodic_time_features
             or per_domain_seq_periodic_time_features
         )
-        self.use_seq_day_of_week_feature = (
-            use_seq_day_of_week_feature
-            or use_seq_periodic_time_features
-            or per_domain_seq_periodic_time_features
-        )
+        if seq_periodic_all_enabled and not seq_periodic_selector_enabled:
+            self.use_seq_hour_of_day_feature = True
+            self.use_seq_day_of_week_feature = True
+            self.use_seq_month_of_year_feature = True
+        else:
+            self.use_seq_hour_of_day_feature = use_seq_hour_of_day_feature
+            self.use_seq_day_of_week_feature = use_seq_day_of_week_feature
+            self.use_seq_month_of_year_feature = use_seq_month_of_year_feature
         self.use_seq_periodic_time_features = (
             self.use_seq_hour_of_day_feature
             or self.use_seq_day_of_week_feature
+            or self.use_seq_month_of_year_feature
         )
         self.per_domain_seq_periodic_time_features = per_domain_seq_periodic_time_features
+        self.reinit_seq_periodic_time_features = reinit_seq_periodic_time_features
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
@@ -1643,6 +1657,7 @@ class PCVRHyFormer(nn.Module):
             periodic_feature_count = (
                 int(self.use_seq_hour_of_day_feature)
                 + int(self.use_seq_day_of_week_feature)
+                + int(self.use_seq_month_of_year_feature)
             )
             seq_proj_in_dim = (
                 len(vs)
@@ -1665,11 +1680,18 @@ class PCVRHyFormer(nn.Module):
                         d: nn.Embedding(8, emb_dim, padding_idx=0)
                         for d in self.seq_domains
                     })
+                if self.use_seq_month_of_year_feature:
+                    self.seq_moy_embeddings = nn.ModuleDict({
+                        d: nn.Embedding(13, emb_dim, padding_idx=0)
+                        for d in self.seq_domains
+                    })
             else:
                 if self.use_seq_hour_of_day_feature:
                     self.seq_hour_embedding = nn.Embedding(25, emb_dim, padding_idx=0)
                 if self.use_seq_day_of_week_feature:
                     self.seq_dow_embedding = nn.Embedding(8, emb_dim, padding_idx=0)
+                if self.use_seq_month_of_year_feature:
+                    self.seq_moy_embedding = nn.Embedding(13, emb_dim, padding_idx=0)
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -1685,6 +1707,11 @@ class PCVRHyFormer(nn.Module):
                         d: nn.Embedding(num_time_buckets, d_model, padding_idx=0)
                         for d in self.seq_domains
                     })
+            if gated_time_diff_embeddings:
+                self.time_diff_gates = nn.ParameterDict({
+                    d: nn.Parameter(torch.ones(1))
+                    for d in self.seq_domains
+                })
 
         # ================== Delta-t Bucket Embedding (W2.7, per-domain, optional) ==================
         if num_delta_buckets > 0:
@@ -1803,25 +1830,35 @@ class PCVRHyFormer(nn.Module):
 
         if self.num_delta_buckets > 0:
             for emb in self.delta_embeddings.values():
-                nn.init.xavier_normal_(emb.weight.data)
-                emb.weight.data[0, :] = 0
+                self._reinit_embedding(emb)
 
-        if self.use_seq_periodic_time_features:
-            if self.per_domain_seq_periodic_time_features:
-                periodic_embs = []
-                if self.use_seq_hour_of_day_feature:
-                    periodic_embs.extend(self.seq_hour_embeddings.values())
-                if self.use_seq_day_of_week_feature:
-                    periodic_embs.extend(self.seq_dow_embeddings.values())
-            else:
-                periodic_embs = []
-                if self.use_seq_hour_of_day_feature:
-                    periodic_embs.append(self.seq_hour_embedding)
-                if self.use_seq_day_of_week_feature:
-                    periodic_embs.append(self.seq_dow_embedding)
-            for emb in periodic_embs:
-                nn.init.xavier_normal_(emb.weight.data)
-                emb.weight.data[0, :] = 0
+        for emb in self._seq_periodic_time_embedding_modules():
+            self._reinit_embedding(emb)
+
+    def _seq_periodic_time_embedding_modules(self) -> List[nn.Embedding]:
+        if not self.use_seq_periodic_time_features:
+            return []
+        periodic_embs: List[nn.Embedding] = []
+        if self.per_domain_seq_periodic_time_features:
+            if self.use_seq_hour_of_day_feature:
+                periodic_embs.extend(self.seq_hour_embeddings.values())
+            if self.use_seq_day_of_week_feature:
+                periodic_embs.extend(self.seq_dow_embeddings.values())
+            if self.use_seq_month_of_year_feature:
+                periodic_embs.extend(self.seq_moy_embeddings.values())
+        else:
+            if self.use_seq_hour_of_day_feature:
+                periodic_embs.append(self.seq_hour_embedding)
+            if self.use_seq_day_of_week_feature:
+                periodic_embs.append(self.seq_dow_embedding)
+            if self.use_seq_month_of_year_feature:
+                periodic_embs.append(self.seq_moy_embedding)
+        return periodic_embs
+
+    @staticmethod
+    def _reinit_embedding(emb: nn.Embedding) -> None:
+        nn.init.xavier_normal_(emb.weight.data)
+        emb.weight.data[0, :] = 0
 
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
@@ -1885,15 +1922,14 @@ class PCVRHyFormer(nn.Module):
         if self.num_delta_buckets > 0:
             skip_count += len(self.delta_embeddings)
         if self.use_seq_periodic_time_features:
-            periodic_feature_count = (
-                int(self.use_seq_hour_of_day_feature)
-                + int(self.use_seq_day_of_week_feature)
-            )
-            skip_count += (
-                len(self.seq_domains) * periodic_feature_count
-                if self.per_domain_seq_periodic_time_features
-                else periodic_feature_count
-            )
+            periodic_embs = self._seq_periodic_time_embedding_modules()
+            if self.reinit_seq_periodic_time_features:
+                for emb in periodic_embs:
+                    self._reinit_embedding(emb)
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                reinit_count += len(periodic_embs)
+            else:
+                skip_count += len(periodic_embs)
 
         logging.info(f"Re-initialized {reinit_count} high-cardinality Embeddings "
                      f"(vocab>{cardinality_threshold}), kept {skip_count}")
@@ -1923,6 +1959,7 @@ class PCVRHyFormer(nn.Module):
         delta_bucket_ids: torch.Tensor,
         hour_bucket_ids: torch.Tensor,
         dow_bucket_ids: torch.Tensor,
+        moy_bucket_ids: torch.Tensor,
         domain_name: str,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
@@ -1945,23 +1982,30 @@ class PCVRHyFormer(nn.Module):
                     emb_list.append(self.seq_hour_embeddings[domain_name](hour_bucket_ids))
                 if self.use_seq_day_of_week_feature:
                     emb_list.append(self.seq_dow_embeddings[domain_name](dow_bucket_ids))
+                if self.use_seq_month_of_year_feature:
+                    emb_list.append(self.seq_moy_embeddings[domain_name](moy_bucket_ids))
             else:
                 if self.use_seq_hour_of_day_feature:
                     emb_list.append(self.seq_hour_embedding(hour_bucket_ids))
                 if self.use_seq_day_of_week_feature:
                     emb_list.append(self.seq_dow_embedding(dow_bucket_ids))
+                if self.use_seq_month_of_year_feature:
+                    emb_list.append(self.seq_moy_embedding(moy_bucket_ids))
         cat_emb = torch.cat(emb_list, dim=-1)  # (B, L, S*emb_dim)
         token_emb = F.gelu(proj(cat_emb))  # (B, L, D)
 
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             if self.per_domain_time_embeddings:
-                token_emb = token_emb + self.time_embeddings[domain_name](time_bucket_ids)
+                time_emb = self.time_embeddings[domain_name](time_bucket_ids)
             else:
-                token_emb = token_emb + self.time_embedding(time_bucket_ids)
+                time_emb = self.time_embedding(time_bucket_ids)
                 if self.domain_time_residual_embeddings:
-                    token_emb = token_emb + self.time_residual_embeddings[domain_name](
+                    time_emb = time_emb + self.time_residual_embeddings[domain_name](
                         time_bucket_ids)
+            if self.gated_time_diff_embeddings:
+                time_emb = time_emb * self.time_diff_gates[domain_name].view(1, 1, 1)
+            token_emb = token_emb + time_emb
 
         # Add delta-t bucket embedding (W2.7, per-domain; padding_idx=0 zeros out
         # padding positions and the last token of each seq, which has no neighbor)
@@ -2065,6 +2109,7 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_delta_buckets[domain],
                 inputs.seq_hour_buckets[domain],
                 inputs.seq_dow_buckets[domain],
+                inputs.seq_moy_buckets[domain],
                 domain)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
@@ -2114,6 +2159,7 @@ class PCVRHyFormer(nn.Module):
                 inputs.seq_delta_buckets[domain],
                 inputs.seq_hour_buckets[domain],
                 inputs.seq_dow_buckets[domain],
+                inputs.seq_moy_buckets[domain],
                 domain)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])

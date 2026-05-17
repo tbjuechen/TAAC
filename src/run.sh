@@ -12,13 +12,18 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.7 delta buckets:              USE_DELTA_BUCKETS=1 ./run.sh
 # W2.7.1 per-domain time emb:      PER_DOMAIN_TIME_EMB=1 ./run.sh
 # W2.7.2 time residual emb:        DOMAIN_TIME_RESIDUAL_EMB=1 ./run.sh
+# W2.7.3 gated time diff emb:      GATED_TIME_DIFF_EMB=1 ./run.sh
 # W2.8 time summary NS token:      USE_TIME_SUMMARY=1 ./run.sh
-# W2.9 seq periodic concat:        USE_SEQ_PERIODIC_TIME=1 ./run.sh
+# W2.9 seq periodic concat:        USE_SEQ_PERIODIC_TIME=1 ./run.sh  # HOD + DOW + MOY
 # W2.9 hour-only ablation:         USE_SEQ_HOUR=1 ./run.sh
 # W2.9 dow-only ablation:          USE_SEQ_DOW=1 ./run.sh
+# W2.9 moy-only ablation:          USE_SEQ_MONTH_OF_YEAR=1 ./run.sh
 # W2.9b per-domain periodic:       USE_PER_DOMAIN_PERIODIC_TIME=1 ./run.sh
 # TopK rescue (emb_skip=100w + compact topK/default for seq_c:34/29):
 #   USE_TOPK_RESCUE=1 ./run.sh
+# W2.9c reinit periodic time emb:  REINIT_SEQ_PERIODIC_TIME=1 ./run.sh
+# W2.10 hybrid recency buckets:    TIME_BUCKET_BOUNDARIES=hybrid_v1 ./run.sh
+# EMA validation/checkpoint:       EMA_DECAY=0.999 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
@@ -26,10 +31,13 @@ SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
 USE_DELTA_BUCKETS="${USE_DELTA_BUCKETS:-0}"
 PER_DOMAIN_TIME_EMB="${PER_DOMAIN_TIME_EMB:-0}"
 DOMAIN_TIME_RESIDUAL_EMB="${DOMAIN_TIME_RESIDUAL_EMB:-0}"
+GATED_TIME_DIFF_EMB="${GATED_TIME_DIFF_EMB:-0}"
 USE_TIME_SUMMARY="${USE_TIME_SUMMARY:-0}"
 USE_SEQ_PERIODIC_TIME="${USE_SEQ_PERIODIC_TIME:-1}"
 USE_SEQ_HOUR="${USE_SEQ_HOUR:-0}"
 USE_SEQ_DOW="${USE_SEQ_DOW:-0}"
+USE_SEQ_MOY="${USE_SEQ_MOY:-0}"
+USE_SEQ_MONTH_OF_YEAR="${USE_SEQ_MONTH_OF_YEAR:-${USE_SEQ_MOY}}"
 USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
 USE_TOPK_RESCUE="${USE_TOPK_RESCUE:-0}"
 TOPK_RESCUE_TARGETS="${TOPK_RESCUE_TARGETS:-}"
@@ -39,6 +47,9 @@ TOPK_RESCUE_AUTO_EXPORT="${TOPK_RESCUE_AUTO_EXPORT:-1}"
 TOPK_RESCUE_SOURCE_MAP="${TOPK_RESCUE_SOURCE_MAP:-}"
 TOPK_RESCUE_FULL_EDA_JSON="${TOPK_RESCUE_FULL_EDA_JSON:-}"
 TOPK_RESCUE_FULL_EDA_MD="${TOPK_RESCUE_FULL_EDA_MD:-}"
+REINIT_SEQ_PERIODIC_TIME="${REINIT_SEQ_PERIODIC_TIME:-0}"
+TIME_BUCKET_BOUNDARIES="${TIME_BUCKET_BOUNDARIES:-original}"
+EMA_DECAY="${EMA_DECAY:-0}"
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
         D_MODEL=68
@@ -56,11 +67,16 @@ EXTRA_FLAGS=""
 [ "${USE_DELTA_BUCKETS}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_delta_buckets"
 [ "${PER_DOMAIN_TIME_EMB}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_time_embeddings"
 [ "${DOMAIN_TIME_RESIDUAL_EMB}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --domain_time_residual_embeddings"
+[ "${GATED_TIME_DIFF_EMB}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --gated_time_diff_embeddings"
 [ "${USE_TIME_SUMMARY}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_time_summary_features"
 [ "${USE_SEQ_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_periodic_time_features"
 [ "${USE_SEQ_HOUR}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_hour_of_day_feature"
 [ "${USE_SEQ_DOW}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_day_of_week_feature"
+[ "${USE_SEQ_MONTH_OF_YEAR}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_month_of_year_feature"
 [ "${USE_PER_DOMAIN_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_seq_periodic_time_features"
+[ "${REINIT_SEQ_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --reinit_seq_periodic_time_features"
+EXTRA_FLAGS="${EXTRA_FLAGS} --time_bucket_boundaries ${TIME_BUCKET_BOUNDARIES}"
+[ "${EMA_DECAY}" != "0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --ema_decay ${EMA_DECAY}"
 
 if [ -n "${TOPK_RESCUE_TARGETS}" ]; then
     if [ -z "${TOPK_RESCUE_EDA_JSON}" ] || [ -z "${TOPK_RESCUE_MAP}" ]; then

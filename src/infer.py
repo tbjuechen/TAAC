@@ -73,12 +73,15 @@ _FALLBACK_MODEL_CFG = {
     'num_time_buckets': NUM_TIME_BUCKETS,
     'per_domain_time_embeddings': False,
     'domain_time_residual_embeddings': False,
+    'gated_time_diff_embeddings': False,
     'num_delta_buckets': 0,
     'use_time_summary_features': False,
     'use_seq_hour_of_day_feature': False,
     'use_seq_day_of_week_feature': False,
+    'use_seq_month_of_year_feature': False,
     'use_seq_periodic_time_features': False,
     'per_domain_seq_periodic_time_features': False,
+    'reinit_seq_periodic_time_features': False,
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
@@ -329,6 +332,7 @@ def _batch_to_model_input(
     seq_delta_buckets: Dict[str, torch.Tensor] = {}
     seq_hour_buckets: Dict[str, torch.Tensor] = {}
     seq_dow_buckets: Dict[str, torch.Tensor] = {}
+    seq_moy_buckets: Dict[str, torch.Tensor] = {}
     for domain in seq_domains:
         seq_data[domain] = device_batch[domain]
         seq_lens[domain] = device_batch[f'{domain}_len']
@@ -344,6 +348,9 @@ def _batch_to_model_input(
             torch.zeros(B, L, dtype=torch.long, device=device))
         seq_dow_buckets[domain] = device_batch.get(
             f'{domain}_dow_bucket',
+            torch.zeros(B, L, dtype=torch.long, device=device))
+        seq_moy_buckets[domain] = device_batch.get(
+            f'{domain}_moy_bucket',
             torch.zeros(B, L, dtype=torch.long, device=device))
 
     return ModelInput(
@@ -366,6 +373,7 @@ def _batch_to_model_input(
         seq_delta_buckets=seq_delta_buckets,
         seq_hour_buckets=seq_hour_buckets,
         seq_dow_buckets=seq_dow_buckets,
+        seq_moy_buckets=seq_moy_buckets,
     )
 
 
@@ -409,6 +417,7 @@ def main() -> None:
     # ---- Data loading: reuse batch_size / num_workers from training config ----
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
+    time_bucket_boundaries = train_config.get('time_bucket_boundaries', 'original')
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -419,6 +428,7 @@ def main() -> None:
         buffer_batches=0,
         is_training=False,
         topk_rescue_map_path=topk_rescue_map,
+        time_bucket_boundaries=time_bucket_boundaries,
     )
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")

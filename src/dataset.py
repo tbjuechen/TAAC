@@ -177,8 +177,8 @@ class SeqTopKRescueRemapper:
 # out of shared memory when many DataLoader workers are active.
 torch.multiprocessing.set_sharing_strategy('file_system')
 
-# Time-delta bucket boundaries (64 edges -> 65 buckets: 0=padding, 1..64).
-BUCKET_BOUNDARIES = np.array([
+# Recency bucket boundaries (63 edges -> 64 buckets: 0=padding, 1..63).
+ORIGINAL_BUCKET_BOUNDARIES = np.array([
     5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60,
     120, 180, 240, 300, 360, 420, 480, 540, 600,
     900, 1200, 1500, 1800, 2100, 2400, 2700, 3000, 3300, 3600,
@@ -190,6 +190,37 @@ BUCKET_BOUNDARIES = np.array([
     11664000, 15552000,
     31536000,
 ], dtype=np.int64)
+
+HYBRID_V1_BUCKET_BOUNDARIES = np.array([
+    60, 600, 3600, 21600, 43200, 86400,
+    126000, 259200, 403200, 547200, 687600, 990000,
+    1148400, 1303200, 1461600, 1616400, 1778400, 1936800,
+    2102400, 2271600, 2592000, 2764800, 3024000, 3196800,
+    3369600, 3542400, 3715200, 3974400, 4147200, 4406400,
+    4838400, 5011200, 5270400, 5529600, 5788800, 6048000,
+    6307200, 6566400, 6825600, 7430400, 7776000, 8121600,
+    8467200, 8726400, 9158400, 9590400, 10022400, 10540800,
+    11059200, 12096000, 12787200, 13392000, 13910400,
+    14342400, 14860800, 15465600, 15984000, 16588800,
+    17884800, 18576000, 19440000, 20390400, 21513600,
+], dtype=np.int64)
+
+TIME_BUCKET_BOUNDARY_PRESETS = {
+    "original": ORIGINAL_BUCKET_BOUNDARIES,
+    "hybrid_v1": HYBRID_V1_BUCKET_BOUNDARIES,
+}
+
+# Backward-compatible default used by existing training and inference configs.
+BUCKET_BOUNDARIES = ORIGINAL_BUCKET_BOUNDARIES
+
+
+def get_time_bucket_boundaries(name: str = "original") -> npt.NDArray[np.int64]:
+    try:
+        return TIME_BUCKET_BOUNDARY_PRESETS[name]
+    except KeyError as exc:
+        choices = ", ".join(sorted(TIME_BUCKET_BOUNDARY_PRESETS))
+        raise ValueError(f"unknown time bucket boundary preset {name!r}; choices: {choices}") from exc
+
 
 # Total number of time-bucket embedding slots (= number of boundaries + 1, with
 # padding=0 included).
@@ -247,6 +278,7 @@ class PCVRParquetDataset(IterableDataset):
         clip_vocab: bool = True,
         is_training: bool = True,
         topk_rescue_map_path: Optional[str] = None,
+        time_bucket_boundaries: str = "original",
     ) -> None:
         """
         Args:
@@ -266,6 +298,9 @@ class PCVRParquetDataset(IterableDataset):
                 if False, return an all-zeros label column.
             topk_rescue_map_path: optional map JSON that remaps selected
                 sequence fids to compact topK+default vocabularies.
+            time_bucket_boundaries: named recency boundary preset. ``original``
+                keeps the historical hand-written grid; ``hybrid_v1`` compresses
+                second/minute bins and spends more buckets on day/month ranges.
         """
         super().__init__()
 
@@ -288,6 +323,8 @@ class PCVRParquetDataset(IterableDataset):
             SeqTopKRescueRemapper(topk_rescue_map_path)
             if topk_rescue_map_path else None
         )
+        self.time_bucket_boundaries_name = time_bucket_boundaries
+        self._time_bucket_boundaries = get_time_bucket_boundaries(time_bucket_boundaries)
         # Out-of-bound statistics:
         #   {(group, col_idx): {'count': N, 'max': M, 'min_oob': M, 'vocab': V}}
         self._oob_stats: Dict[Tuple[str, int], Dict[str, int]] = {}
@@ -323,6 +360,7 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_seq_db = {}
         self._buf_seq_hour = {}
         self._buf_seq_dow = {}
+        self._buf_seq_moy = {}
         self._buf_seq_lens = {}
         self._time_summary_dim = len(self.seq_domains) * 8
         self._buf_time_summary = np.zeros((B, self._time_summary_dim), dtype=np.float32)
@@ -334,6 +372,7 @@ class PCVRParquetDataset(IterableDataset):
             self._buf_seq_db[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_hour[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_dow[domain] = np.zeros((B, max_len), dtype=np.int64)
+            self._buf_seq_moy[domain] = np.zeros((B, max_len), dtype=np.int64)
             self._buf_seq_lens[domain] = np.zeros(B, dtype=np.int64)
 
         # ---- Pre-compute (col_idx, offset, vocab_size) plans for int columns ----
@@ -790,6 +829,8 @@ class PCVRParquetDataset(IterableDataset):
             hour_bucket[:] = 0
             dow_bucket = self._buf_seq_dow[domain][:B]
             dow_bucket[:] = 0
+            moy_bucket = self._buf_seq_moy[domain][:B]
+            moy_bucket[:] = 0
             if ts_ci is not None:
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
@@ -817,8 +858,8 @@ class PCVRParquetDataset(IterableDataset):
                 # and is always a valid Embedding index. Time-diffs beyond the
                 # largest boundary collapse into the last bucket.
                 raw_buckets = np.clip(
-                    np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
-                    0, len(BUCKET_BOUNDARIES) - 1,
+                    np.searchsorted(self._time_bucket_boundaries, time_diff.ravel()),
+                    0, len(self._time_bucket_boundaries) - 1,
                 )
                 buckets = raw_buckets.reshape(B, max_len) + 1
                 buckets[ts_padded == 0] = 0
@@ -840,10 +881,18 @@ class PCVRParquetDataset(IterableDataset):
                 shifted_ts = ts_padded + PERIODIC_TIME_UTC_OFFSET_SECONDS
                 hour_ids = ((shifted_ts % 86400) // 3600) + 1
                 dow_ids = ((shifted_ts // 86400 + 3) % 7) + 1
+                month_ids = (
+                    shifted_ts.astype('datetime64[s]')
+                    .astype('datetime64[M]')
+                    .astype(np.int64)
+                    % 12
+                ) + 1
                 hour_ids[ts_padded == 0] = 0
                 dow_ids[ts_padded == 0] = 0
+                month_ids[ts_padded == 0] = 0
                 hour_bucket[:] = hour_ids
                 dow_bucket[:] = dow_ids
+                moy_bucket[:] = month_ids
 
                 valid_ts = ts_padded > 0
                 ts_lengths = valid_ts.sum(axis=1)
@@ -879,6 +928,7 @@ class PCVRParquetDataset(IterableDataset):
             result[f'{domain}_delta_bucket'] = torch.from_numpy(delta_bucket.copy())
             result[f'{domain}_hour_bucket'] = torch.from_numpy(hour_bucket.copy())
             result[f'{domain}_dow_bucket'] = torch.from_numpy(dow_bucket.copy())
+            result[f'{domain}_moy_bucket'] = torch.from_numpy(moy_bucket.copy())
 
         result['time_summary_feats'] = torch.from_numpy(time_summary.copy())
         return result
@@ -897,6 +947,7 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     topk_rescue_map_path: Optional[str] = None,
+    time_bucket_boundaries: str = "original",
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -946,6 +997,7 @@ def get_pcvr_data(
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
         topk_rescue_map_path=topk_rescue_map_path,
+        time_bucket_boundaries=time_bucket_boundaries,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -969,6 +1021,7 @@ def get_pcvr_data(
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
         topk_rescue_map_path=topk_rescue_map_path,
+        time_bucket_boundaries=time_bucket_boundaries,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
@@ -977,5 +1030,10 @@ def get_pcvr_data(
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
                  f"batch_size={batch_size}, buffer_batches={buffer_batches}")
+    logging.info(
+        "time_bucket_boundaries=%s (%d boundaries)",
+        time_bucket_boundaries,
+        len(get_time_bucket_boundaries(time_bucket_boundaries)),
+    )
 
     return train_loader, valid_loader, train_dataset
