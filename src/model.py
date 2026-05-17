@@ -1449,17 +1449,23 @@ class PCVRHyFormer(nn.Module):
         self.domain_time_residual_embeddings = domain_time_residual_embeddings
         self.num_delta_buckets = num_delta_buckets
         self.use_time_summary_features = use_time_summary_features
-        self.use_seq_hour_of_day_feature = (
+        seq_periodic_selector_enabled = (
             use_seq_hour_of_day_feature
-            or use_seq_periodic_time_features
+            or use_seq_day_of_week_feature
+            or use_seq_month_of_year_feature
+        )
+        seq_periodic_all_enabled = (
+            use_seq_periodic_time_features
             or per_domain_seq_periodic_time_features
         )
-        self.use_seq_day_of_week_feature = (
-            use_seq_day_of_week_feature
-            or use_seq_periodic_time_features
-            or per_domain_seq_periodic_time_features
-        )
-        self.use_seq_month_of_year_feature = use_seq_month_of_year_feature
+        if seq_periodic_all_enabled and not seq_periodic_selector_enabled:
+            self.use_seq_hour_of_day_feature = True
+            self.use_seq_day_of_week_feature = True
+            self.use_seq_month_of_year_feature = True
+        else:
+            self.use_seq_hour_of_day_feature = use_seq_hour_of_day_feature
+            self.use_seq_day_of_week_feature = use_seq_day_of_week_feature
+            self.use_seq_month_of_year_feature = use_seq_month_of_year_feature
         self.use_seq_periodic_time_features = (
             self.use_seq_hour_of_day_feature
             or self.use_seq_day_of_week_feature

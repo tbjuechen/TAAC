@@ -158,22 +158,27 @@ def parse_args() -> argparse.Namespace:
                         help='Add one NS token from per-domain sequence time summary features '
                              '(last/oldest/span/density/window counts).')
     parser.add_argument('--use_seq_periodic_time_features', action='store_true', default=False,
-                        help='Concatenate hour-of-day and day-of-week embeddings to each '
-                             'sequence token before the per-domain sequence projection.')
+                        help='Concatenate hour-of-day, day-of-week, and month-of-year '
+                             'embeddings to each sequence token before the per-domain '
+                             'sequence projection. If any individual periodic feature '
+                             'flag is provided, use that selected subset for ablation.')
     parser.add_argument('--use_seq_hour_of_day_feature', action='store_true', default=False,
-                        help='Concatenate hour-of-day embeddings to each sequence token.')
+                        help='Ablation selector: concatenate hour-of-day embeddings to '
+                             'each sequence token.')
     parser.add_argument('--use_seq_day_of_week_feature', action='store_true', default=False,
-                        help='Concatenate day-of-week embeddings to each sequence token.')
+                        help='Ablation selector: concatenate day-of-week embeddings to '
+                             'each sequence token.')
     parser.add_argument('--use_seq_month_of_year_feature', action='store_true', default=False,
-                        help='Concatenate month-of-year embeddings to each sequence token.')
+                        help='Ablation selector: concatenate month-of-year embeddings to '
+                             'each sequence token.')
     parser.add_argument('--per_domain_seq_periodic_time_features', action='store_true', default=False,
-                        help='Use per-domain hour-of-day, day-of-week, and enabled extra '
-                             'periodic embeddings for '
-                             'sequence periodic time features.')
+                        help='Use per-domain embeddings for enabled sequence periodic '
+                             'time features.')
     parser.add_argument('--reinit_seq_periodic_time_features', action='store_true', default=False,
                         help='When sparse embeddings are re-initialized after an epoch, '
                              'also re-initialize only the sequence periodic time embeddings '
-                             '(hour-of-day/day-of-week). Other time embeddings remain preserved.')
+                             '(hour-of-day/day-of-week/month-of-year). Other time '
+                             'embeddings remain preserved.')
     parser.add_argument('--use_delta_buckets', action='store_true', default=False,
                         help='Enable per-domain delta-t bucket embedding (W2.7). '
                              'Models adjacent-token time gaps within sequences. '
