@@ -21,6 +21,7 @@ import torch
 from utils import set_seed, EarlyStopping, create_logger
 from dataset import (
     FeatureSchema,
+    TIME_BUCKET_BOUNDARY_PRESETS,
     USER_TIME_DOW_FID,
     USER_TIME_HOD_FID,
     get_pcvr_data,
@@ -148,12 +149,22 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--time_bucket_boundaries', type=str, default='original',
+                        choices=sorted(TIME_BUCKET_BOUNDARY_PRESETS),
+                        help='Recency bucket boundary preset. original reproduces '
+                             'the historical grid; hybrid_v1 keeps the same bucket '
+                             'count but reallocates resolution from seconds/minutes '
+                             'to day/month ranges.')
     parser.add_argument('--per_domain_time_embeddings', action='store_true', default=False,
                         help='Use one recency time-bucket embedding table per sequence '
                              'domain while keeping the global bucket boundaries unchanged.')
     parser.add_argument('--domain_time_residual_embeddings', action='store_true', default=False,
                         help='Add zero-initialized per-domain residual time embeddings on '
                              'top of the shared recency time embedding.')
+    parser.add_argument('--gated_time_diff_embeddings', action='store_true', default=False,
+                        help='Scale the recency time-diff embedding with one learnable '
+                             'scalar gate per sequence domain before adding it to the '
+                             'projected sequence token.')
     parser.add_argument('--use_time_summary_features', action='store_true', default=False,
                         help='Add one NS token from per-domain sequence time summary features '
                              '(last/oldest/span/density/window counts).')
@@ -345,6 +356,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        time_bucket_boundaries=args.time_bucket_boundaries,
     )
 
     # ---- NS groups ----
@@ -401,6 +413,7 @@ def main() -> None:
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "per_domain_time_embeddings": args.per_domain_time_embeddings,
         "domain_time_residual_embeddings": args.domain_time_residual_embeddings,
+        "gated_time_diff_embeddings": args.gated_time_diff_embeddings,
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
         "use_time_summary_features": args.use_time_summary_features,
         "use_seq_hour_of_day_feature": args.use_seq_hour_of_day_feature,
@@ -435,6 +448,11 @@ def main() -> None:
             f"W2.7.2 domain residual recency time embeddings enabled: "
             f"shared + zero-init residual ({n_domains} x {NUM_TIME_BUCKETS} x "
             f"{args.d_model}), +{n_domains * NUM_TIME_BUCKETS * args.d_model} params"
+        )
+    if model.num_time_buckets > 0 and model.gated_time_diff_embeddings:
+        logging.info(
+            f"Per-domain gated recency time embeddings enabled: "
+            f"{len(model.seq_domains)} scalar gates initialized to 1.0"
         )
     if model.use_time_summary_features:
         logging.info(
