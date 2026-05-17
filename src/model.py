@@ -1415,6 +1415,7 @@ class PCVRHyFormer(nn.Module):
         num_time_buckets: int = 65,
         per_domain_time_embeddings: bool = False,
         domain_time_residual_embeddings: bool = False,
+        gated_time_diff_embeddings: bool = False,
         num_delta_buckets: int = 0,
         use_time_summary_features: bool = False,
         use_seq_hour_of_day_feature: bool = False,
@@ -1444,6 +1445,7 @@ class PCVRHyFormer(nn.Module):
         self.num_time_buckets = num_time_buckets
         self.per_domain_time_embeddings = per_domain_time_embeddings
         self.domain_time_residual_embeddings = domain_time_residual_embeddings
+        self.gated_time_diff_embeddings = gated_time_diff_embeddings
         self.num_delta_buckets = num_delta_buckets
         self.use_time_summary_features = use_time_summary_features
         self.use_seq_hour_of_day_feature = (
@@ -1685,6 +1687,11 @@ class PCVRHyFormer(nn.Module):
                         d: nn.Embedding(num_time_buckets, d_model, padding_idx=0)
                         for d in self.seq_domains
                     })
+            if gated_time_diff_embeddings:
+                self.time_diff_gates = nn.ParameterDict({
+                    d: nn.Parameter(torch.ones(1))
+                    for d in self.seq_domains
+                })
 
         # ================== Delta-t Bucket Embedding (W2.7, per-domain, optional) ==================
         if num_delta_buckets > 0:
@@ -1956,12 +1963,15 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             if self.per_domain_time_embeddings:
-                token_emb = token_emb + self.time_embeddings[domain_name](time_bucket_ids)
+                time_emb = self.time_embeddings[domain_name](time_bucket_ids)
             else:
-                token_emb = token_emb + self.time_embedding(time_bucket_ids)
+                time_emb = self.time_embedding(time_bucket_ids)
                 if self.domain_time_residual_embeddings:
-                    token_emb = token_emb + self.time_residual_embeddings[domain_name](
+                    time_emb = time_emb + self.time_residual_embeddings[domain_name](
                         time_bucket_ids)
+            if self.gated_time_diff_embeddings:
+                time_emb = time_emb * self.time_diff_gates[domain_name].view(1, 1, 1)
+            token_emb = token_emb + time_emb
 
         # Add delta-t bucket embedding (W2.7, per-domain; padding_idx=0 zeros out
         # padding positions and the last token of each seq, which has no neighbor)

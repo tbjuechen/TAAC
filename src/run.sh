@@ -12,6 +12,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.7 delta buckets:              USE_DELTA_BUCKETS=1 ./run.sh
 # W2.7.1 per-domain time emb:      PER_DOMAIN_TIME_EMB=1 ./run.sh
 # W2.7.2 time residual emb:        DOMAIN_TIME_RESIDUAL_EMB=1 ./run.sh
+# W2.7.3 gated time diff emb:      GATED_TIME_DIFF_EMB=1 ./run.sh
 # W2.8 time summary NS token:      USE_TIME_SUMMARY=1 ./run.sh
 # W2.9 seq periodic concat:        USE_SEQ_PERIODIC_TIME=1 ./run.sh
 # W2.9 hour-only ablation:         USE_SEQ_HOUR=1 ./run.sh
@@ -25,6 +26,7 @@ SEQ_MAX_LENS="${SEQ_MAX_LENS:-seq_a:256,seq_b:256,seq_c:512,seq_d:512}"
 USE_DELTA_BUCKETS="${USE_DELTA_BUCKETS:-0}"
 PER_DOMAIN_TIME_EMB="${PER_DOMAIN_TIME_EMB:-0}"
 DOMAIN_TIME_RESIDUAL_EMB="${DOMAIN_TIME_RESIDUAL_EMB:-0}"
+GATED_TIME_DIFF_EMB="${GATED_TIME_DIFF_EMB:-0}"
 USE_TIME_SUMMARY="${USE_TIME_SUMMARY:-0}"
 USE_SEQ_PERIODIC_TIME="${USE_SEQ_PERIODIC_TIME:-1}"
 USE_SEQ_HOUR="${USE_SEQ_HOUR:-0}"
@@ -44,6 +46,7 @@ EXTRA_FLAGS=""
 [ "${USE_DELTA_BUCKETS}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_delta_buckets"
 [ "${PER_DOMAIN_TIME_EMB}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --per_domain_time_embeddings"
 [ "${DOMAIN_TIME_RESIDUAL_EMB}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --domain_time_residual_embeddings"
+[ "${GATED_TIME_DIFF_EMB}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --gated_time_diff_embeddings"
 [ "${USE_TIME_SUMMARY}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_time_summary_features"
 [ "${USE_SEQ_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_periodic_time_features"
 [ "${USE_SEQ_HOUR}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --use_seq_hour_of_day_feature"

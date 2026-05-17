@@ -161,6 +161,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--domain_time_residual_embeddings', action='store_true', default=False,
                         help='Add zero-initialized per-domain residual time embeddings on '
                              'top of the shared recency time embedding.')
+    parser.add_argument('--gated_time_diff_embeddings', action='store_true', default=False,
+                        help='Scale the recency time-diff embedding with one learnable '
+                             'scalar gate per sequence domain before adding it to the '
+                             'projected sequence token.')
     parser.add_argument('--use_time_summary_features', action='store_true', default=False,
                         help='Add one NS token from per-domain sequence time summary features '
                              '(last/oldest/span/density/window counts).')
@@ -397,6 +401,7 @@ def main() -> None:
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "per_domain_time_embeddings": args.per_domain_time_embeddings,
         "domain_time_residual_embeddings": args.domain_time_residual_embeddings,
+        "gated_time_diff_embeddings": args.gated_time_diff_embeddings,
         "num_delta_buckets": NUM_DELTA_BUCKETS if args.use_delta_buckets else 0,
         "use_time_summary_features": args.use_time_summary_features,
         "use_seq_hour_of_day_feature": args.use_seq_hour_of_day_feature,
@@ -429,6 +434,11 @@ def main() -> None:
             f"W2.7.2 domain residual recency time embeddings enabled: "
             f"shared + zero-init residual ({n_domains} x {NUM_TIME_BUCKETS} x "
             f"{args.d_model}), +{n_domains * NUM_TIME_BUCKETS * args.d_model} params"
+        )
+    if model.num_time_buckets > 0 and model.gated_time_diff_embeddings:
+        logging.info(
+            f"Per-domain gated recency time embeddings enabled: "
+            f"{len(model.seq_domains)} scalar gates initialized to 1.0"
         )
     if model.use_time_summary_features:
         logging.info(

@@ -73,6 +73,7 @@ _FALLBACK_MODEL_CFG = {
     'num_time_buckets': NUM_TIME_BUCKETS,
     'per_domain_time_embeddings': False,
     'domain_time_residual_embeddings': False,
+    'gated_time_diff_embeddings': False,
     'num_delta_buckets': 0,
     'use_time_summary_features': False,
     'use_seq_hour_of_day_feature': False,
