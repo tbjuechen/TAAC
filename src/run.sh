@@ -24,6 +24,7 @@ export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 # W2.9c reinit periodic time emb:  REINIT_SEQ_PERIODIC_TIME=1 ./run.sh
 # W2.10 hybrid recency buckets:    TIME_BUCKET_BOUNDARIES=hybrid_v1 ./run.sh
 # EMA validation/checkpoint:       EMA_DECAY=0.999 ./run.sh
+# User/history token dropout:      USER_TOKEN_DROPOUT_RATE=0.03 SEQ_TOKEN_DROPOUT_RATE=0.03 ./run.sh
 SEQ_ENCODER_TYPE="${SEQ_ENCODER_TYPE:-transformer}"
 GATHER_SIDE="${GATHER_SIDE:-head}"
 SEQ_TOP_K="${SEQ_TOP_K:-50}"
@@ -50,6 +51,8 @@ TOPK_RESCUE_FULL_EDA_MD="${TOPK_RESCUE_FULL_EDA_MD:-}"
 REINIT_SEQ_PERIODIC_TIME="${REINIT_SEQ_PERIODIC_TIME:-0}"
 TIME_BUCKET_BOUNDARIES="${TIME_BUCKET_BOUNDARIES:-original}"
 EMA_DECAY="${EMA_DECAY:-0}"
+USER_TOKEN_DROPOUT_RATE="${USER_TOKEN_DROPOUT_RATE:-0}"
+SEQ_TOKEN_DROPOUT_RATE="${SEQ_TOKEN_DROPOUT_RATE:-0}"
 if [ -z "${D_MODEL+x}" ]; then
     if [ "${USE_TIME_SUMMARY}" = "1" ]; then
         D_MODEL=68
@@ -77,6 +80,8 @@ EXTRA_FLAGS=""
 [ "${REINIT_SEQ_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --reinit_seq_periodic_time_features"
 EXTRA_FLAGS="${EXTRA_FLAGS} --time_bucket_boundaries ${TIME_BUCKET_BOUNDARIES}"
 [ "${EMA_DECAY}" != "0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --ema_decay ${EMA_DECAY}"
+[ "${USER_TOKEN_DROPOUT_RATE}" != "0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --user_token_dropout_rate ${USER_TOKEN_DROPOUT_RATE}"
+[ "${SEQ_TOKEN_DROPOUT_RATE}" != "0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --seq_token_dropout_rate ${SEQ_TOKEN_DROPOUT_RATE}"
 
 if [ -n "${TOPK_RESCUE_TARGETS}" ]; then
     if [ -z "${TOPK_RESCUE_EDA_JSON}" ] || [ -z "${TOPK_RESCUE_MAP}" ]; then
