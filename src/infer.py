@@ -69,6 +69,8 @@ _FALLBACK_MODEL_CFG = {
     'dropout_rate': 0.01,
     'seq_top_k': 50,
     'seq_causal': False,
+    'user_token_dropout_rate': 0.0,
+    'seq_token_dropout_rate': 0.0,
     'action_num': 1,
     'num_time_buckets': NUM_TIME_BUCKETS,
     'per_domain_time_embeddings': False,

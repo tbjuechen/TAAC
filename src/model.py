@@ -1412,6 +1412,8 @@ class PCVRHyFormer(nn.Module):
         seq_top_k: int = 50,
         seq_causal: bool = False,
         seq_longer_gather_side: str = 'head',
+        user_token_dropout_rate: float = 0.0,
+        seq_token_dropout_rate: float = 0.0,
         action_num: int = 1,
         num_time_buckets: int = 65,
         per_domain_time_embeddings: bool = False,
@@ -1445,6 +1447,8 @@ class PCVRHyFormer(nn.Module):
         self.num_queries = num_queries
         self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
         self.num_sequences = len(self.seq_domains)
+        self.user_token_dropout_rate = user_token_dropout_rate
+        self.seq_token_dropout_rate = seq_token_dropout_rate
         self.num_time_buckets = num_time_buckets
         self.per_domain_time_embeddings = per_domain_time_embeddings
         self.domain_time_residual_embeddings = domain_time_residual_embeddings
@@ -1596,6 +1600,7 @@ class PCVRHyFormer(nn.Module):
             self.item_dense_num_tokens = 1
 
         # Total NS token count
+        self.num_user_tokens = num_user_ns + self.user_dense_num_tokens
         self.num_ns = (num_user_ns + self.user_dense_num_tokens
                        + num_item_ns + self.item_dense_num_tokens)
         if use_time_summary_features:
@@ -1773,6 +1778,8 @@ class PCVRHyFormer(nn.Module):
 
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
+        self.user_token_dropout = nn.Dropout(user_token_dropout_rate)
+        self.seq_token_dropout = nn.Dropout(seq_token_dropout_rate)
 
         # Classifier
         self.clsfier = nn.Sequential(
@@ -2032,6 +2039,19 @@ class PCVRHyFormer(nn.Module):
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection."""
         if apply_dropout:
+            if self.user_token_dropout_rate > 0 and self.num_user_tokens > 0:
+                user_tokens = self.user_token_dropout(
+                    ns_tokens[:, :self.num_user_tokens, :]
+                )
+                ns_tokens = torch.cat(
+                    [user_tokens, ns_tokens[:, self.num_user_tokens:, :]],
+                    dim=1
+                )
+            if self.seq_token_dropout_rate > 0:
+                seq_tokens_list = [
+                    self.seq_token_dropout(s)
+                    for s in seq_tokens_list
+                ]
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
             ns_tokens = self.emb_dropout(ns_tokens)
             seq_tokens_list = [self.emb_dropout(s) for s in seq_tokens_list]
