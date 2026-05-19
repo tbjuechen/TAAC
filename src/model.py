@@ -353,12 +353,12 @@ class RankMixerBlock(nn.Module):
             self.d_sub = d_model // n_total
 
         # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = nn.RMSNorm(d_model)
         self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
         self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
         self.dropout = nn.Dropout(dropout)
-        # Post-LN after residual to stabilize stacked block outputs
-        self.post_norm = nn.LayerNorm(d_model)
+        # Post-RMSNorm after residual to stabilize stacked block outputs
+        self.post_norm = nn.RMSNorm(d_model)
 
     def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
         """Performs parameter-free token mixing via reshape and transpose.
@@ -407,7 +407,7 @@ class RankMixerBlock(nn.Module):
         # Per-token FFN
         x = self.norm(Q_hat)
         x = self.fc1(x)
-        x = F.gelu(x)
+        x = F.silu(x)
         x = self.dropout(x)
         Q_e = self.fc2(x)
 
