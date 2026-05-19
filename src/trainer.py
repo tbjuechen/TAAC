@@ -47,6 +47,7 @@ class PCVRHyFormerRankingTrainer:
         save_dir: str,
         early_stopping: EarlyStopping,
         loss_type: str = 'bce',
+        label_smoothing: float = 0.0,
         focal_alpha: float = 0.1,
         focal_gamma: float = 2.0,
         sparse_lr: float = 0.05,
@@ -108,6 +109,11 @@ class PCVRHyFormerRankingTrainer:
         self.save_dir: str = save_dir
         self.early_stopping: EarlyStopping = early_stopping
         self.loss_type: str = loss_type
+        if not 0.0 <= label_smoothing < 0.5:
+            raise ValueError(
+                f"label_smoothing must be in [0, 0.5), got {label_smoothing}"
+            )
+        self.label_smoothing: float = label_smoothing
         self.focal_alpha: float = focal_alpha
         self.focal_gamma: float = focal_gamma
         self.reinit_sparse_after_epoch: int = reinit_sparse_after_epoch
@@ -182,6 +188,7 @@ class PCVRHyFormerRankingTrainer:
             logging.info("LR scheduler: disabled (warmup_steps=0); dense AdamW uses constant lr")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
+                     f"label_smoothing={label_smoothing}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
         logging.info("AMP enabled=%s, dtype=bf16, grad_scaler=%s",
@@ -583,11 +590,14 @@ class PCVRHyFormerRankingTrainer:
         ):
             logits = self.model(model_input)  # (B, 1)
             logits = logits.squeeze(-1)  # (B,)
+            loss_label = label
+            if self.label_smoothing > 0.0:
+                loss_label = label * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
 
             if self.loss_type == 'focal':
-                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+                loss = sigmoid_focal_loss(logits, loss_label, alpha=self.focal_alpha, gamma=self.focal_gamma)
             else:
-                loss = F.binary_cross_entropy_with_logits(logits, label)
+                loss = F.binary_cross_entropy_with_logits(logits, loss_label)
 
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.dense_optimizer)

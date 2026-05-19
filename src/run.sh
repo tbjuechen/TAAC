@@ -26,6 +26,7 @@ USE_PER_DOMAIN_PERIODIC_TIME="${USE_PER_DOMAIN_PERIODIC_TIME:-0}"
 REINIT_SEQ_PERIODIC_TIME="${REINIT_SEQ_PERIODIC_TIME:-0}"
 TIME_BUCKET_BOUNDARIES="${TIME_BUCKET_BOUNDARIES:-hybrid_v1}"
 EMA_DECAY="${EMA_DECAY:-0.999}"
+LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.05}"
 
 D_MODEL="${D_MODEL:-64}"
 NUM_HYFORMER_BLOCKS="${NUM_HYFORMER_BLOCKS:-2}"
@@ -42,6 +43,7 @@ echo "[run.sh] OUT_MAP=${OUT_MAP}"
 echo "[run.sh] EMB_SKIP_THRESHOLD=${EMB_SKIP_THRESHOLD}"
 echo "[run.sh] NUM_HYFORMER_BLOCKS=${NUM_HYFORMER_BLOCKS}"
 echo "[run.sh] TIME_BUCKET_BOUNDARIES=${TIME_BUCKET_BOUNDARIES}"
+echo "[run.sh] LABEL_SMOOTHING=${LABEL_SMOOTHING}"
 
 python3 -u -c "import json; src='${SOURCE_MAP}'; out='${OUT_MAP}'; keep={'seq_a:38','seq_b:74','seq_b:76','seq_b:88','seq_c:34','seq_d:22'}; d=json.load(open(src)); d['targets']={k:v for k,v in d['targets'].items() if k in keep}; assert set(d['targets'])==keep, set(d['targets']); json.dump(d, open(out,'w'), ensure_ascii=False, separators=(',',':')); print('TOPK_RESCUE_COUNT100_6TARGETS_DONE '+json.dumps({'out_json':out,'num_targets':len(d['targets']),'targets':sorted(d['targets']),'embedding_rows_sum':sum(int(v.get('vocab_size_for_model',v.get('default_id',0))) for v in d['targets'].values())},ensure_ascii=False,separators=(',',':')), flush=True)"
 
@@ -59,6 +61,7 @@ EXTRA_FLAGS=""
 [ "${REINIT_SEQ_PERIODIC_TIME}" = "1" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --reinit_seq_periodic_time_features"
 EXTRA_FLAGS="${EXTRA_FLAGS} --time_bucket_boundaries ${TIME_BUCKET_BOUNDARIES}"
 [ "${EMA_DECAY}" != "0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --ema_decay ${EMA_DECAY}"
+[ "${LABEL_SMOOTHING}" != "0" ] && [ "${LABEL_SMOOTHING}" != "0.0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --label_smoothing ${LABEL_SMOOTHING}"
 
 echo "[run.sh] start training"
 

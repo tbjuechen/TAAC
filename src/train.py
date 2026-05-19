@@ -221,6 +221,10 @@ def parse_args() -> argparse.Namespace:
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
                         help='Loss type: bce = BCEWithLogits, focal = Focal Loss')
+    parser.add_argument('--label_smoothing', type=float, default=0.0,
+                        help='Binary label smoothing for training loss only. '
+                             'Targets become y*(1-s)+0.5*s; validation metrics '
+                             'still use raw labels. Must be in [0, 0.5).')
     parser.add_argument('--focal_alpha', type=float, default=0.1,
                         help='Focal Loss positive-class weight alpha '
                              '(effective only when --loss_type=focal)')
@@ -319,6 +323,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--per_domain_time_embeddings and --domain_time_residual_embeddings "
             "are mutually exclusive")
+    if not 0.0 <= args.label_smoothing < 0.5:
+        parser.error("--label_smoothing must be in [0, 0.5)")
 
     return args
 
@@ -571,6 +577,7 @@ def main() -> None:
         save_dir=args.ckpt_dir,
         early_stopping=early_stopping,
         loss_type=args.loss_type,
+        label_smoothing=args.label_smoothing,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
         sparse_lr=args.sparse_lr,
