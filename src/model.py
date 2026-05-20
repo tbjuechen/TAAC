@@ -353,12 +353,11 @@ class RankMixerBlock(nn.Module):
             self.d_sub = d_model // n_total
 
         # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
-        self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
+        self.norm = nn.RMSNorm(d_model)
+        self.value_proj = nn.Linear(d_model, d_model * hidden_mult)
+        self.gate_proj = nn.Linear(d_model, d_model * hidden_mult)
         self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
         self.dropout = nn.Dropout(dropout)
-        # Post-LN after residual to stabilize stacked block outputs
-        self.post_norm = nn.LayerNorm(d_model)
 
     def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
         """Performs parameter-free token mixing via reshape and transpose.
@@ -406,14 +405,11 @@ class RankMixerBlock(nn.Module):
 
         # Per-token FFN
         x = self.norm(Q_hat)
-        x = self.fc1(x)
-        x = F.gelu(x)
-        x = self.dropout(x)
+        x = self.value_proj(x) * F.silu(self.gate_proj(x))
         Q_e = self.fc2(x)
 
         # Residual from original Q
-        Q_boost = Q + Q_e
-        Q_boost = self.post_norm(Q_boost)
+        Q_boost = Q + self.dropout(Q_e)
         return Q_boost
 
 
@@ -1573,16 +1569,16 @@ class PCVRHyFormer(nn.Module):
         self.has_user_dense = user_dense_dim > 0
         self.user_dense_num_tokens = 0
         if self.has_user_dense:
-            dense_emb_group = [61, 87]
-            dense_other_group = [62, 63, 64, 65, 66, 89, 90, 91]
+            dense_heat_group = [61, 89, 90]
+            dense_profile_group = [62, 63, 64, 65, 66, 87, 91]
             dense_fids = {
                 fid for fid, _, _ in (user_dense_feature_specs or [])
             }
             if (use_dense_group_projector
-                    and set(dense_emb_group + dense_other_group).issubset(dense_fids)):
+                    and set(dense_heat_group + dense_profile_group).issubset(dense_fids)):
                 self.user_dense_proj = DenseGroupProjector(
                     feature_specs=user_dense_feature_specs or [],
-                    groups=[dense_emb_group, dense_other_group],
+                    groups=[dense_heat_group, dense_profile_group],
                     d_model=d_model,
                 )
             else:

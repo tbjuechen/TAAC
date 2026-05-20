@@ -5,8 +5,8 @@
 
   "_comment": "NS token groups for parquet data. Values are fids (the numeric suffix in column names, e.g. user_int_feats_{fid}); train.py converts them to schema entry indices at load time.",
   "_note_T": "T = num_queries * num_sequences + num_ns. Active RankMixer config uses 4 user_int tokens (1 selected-fid MLP + 3 regular RankMixer), 2 user_dense tokens, and 2 item_int tokens: num_ns=8, so num_queries=2 gives T=16.",
-  "_note_user_dense": "User dense features are projected by code into 2 NS tokens: emb group fid 61/87 and the remaining dense group fid 62/63/64/65/66/89/90/91. Not configured here.",
-  "_note_shared_fids": "Fids 62/63/64/65/66/89/90/91 appear in both user_int_feats and user_dense_feats. In RankMixer mode, their user-int embeddings are extracted into one dedicated MLP token; their dense values are included in the second user_dense NS token.",
+  "_note_user_dense": "User dense features are projected by code into 2 NS tokens: heat group fid 61/89/90 and profile group fid 62/63/64/65/66/87/91. Not configured here.",
+  "_note_shared_fids": "Fids 62/63/64/65/66/89/90/91 appear in both user_int_feats and user_dense_feats. In RankMixer mode, their user-int embeddings are extracted into one dedicated MLP token; their dense values are split across the two user_dense NS tokens.",
 
   "user_ns_groups": {
     "U1": [1, 15],
