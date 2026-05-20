@@ -14,7 +14,7 @@ import json
 import argparse
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -44,6 +44,36 @@ def build_feature_specs(
         vs = max(per_position_vocab_sizes[offset:offset + length])
         specs.append((vs, offset, length))
     return specs
+
+
+def parse_rank_mixer_swiglu_groups(spec: str) -> Optional[List[List[int]]]:
+    """Parse RankMixer SwiGLU groups from JSON or a compact CLI form.
+
+    Supported examples:
+      - ``[[0, 1], [2, 3, 4]]``
+      - ``0,1|2,3,4``
+    """
+    if not spec:
+        return None
+
+    text = spec.strip()
+    if not text:
+        return None
+
+    if text.startswith('['):
+        groups = json.loads(text)
+    else:
+        groups = [
+            [int(item.strip()) for item in group.split(',') if item.strip()]
+            for group in text.split('|')
+        ]
+
+    if not isinstance(groups, list) or not all(isinstance(g, list) for g in groups):
+        raise ValueError(
+            "--rank_mixer_swiglu_groups must be a list of lists, e.g. "
+            "'[[0,1],[2,3]]' or '0,1|2,3'."
+        )
+    return [[int(idx) for idx in group] for group in groups]
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,6 +243,17 @@ def parse_args() -> argparse.Namespace:
                              'full = token mixing + per-token FFN (requires d_model divisible by T), '
                              'ffn_only = per-token FFN only, '
                              'none = identity passthrough')
+    parser.add_argument('--rank_mixer_swiglu_type', type=str, default='shared',
+                        choices=['shared', 'per_token', 'pertoken', 'group'],
+                        help='RankMixer SwiGLU parameter sharing: '
+                             'shared = one SwiGLU shared by all tokens (baseline), '
+                             'per_token/pertoken = one SwiGLU per token, '
+                             'group = one SwiGLU per configured token group')
+    parser.add_argument('--rank_mixer_swiglu_groups', type=str, default='',
+                        help='Token groups used when --rank_mixer_swiglu_type=group. '
+                             'Accepts JSON like [[0,1],[2,3]] or compact form '
+                             '0,1|2,3. If empty, group mode defaults to '
+                             'query tokens vs NS tokens.')
     parser.add_argument('--use_rope', action='store_true', default=False,
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
@@ -331,6 +372,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.rank_mixer_swiglu_type == 'pertoken':
+        args.rank_mixer_swiglu_type = 'per_token'
+    rank_mixer_swiglu_groups = parse_rank_mixer_swiglu_groups(
+        args.rank_mixer_swiglu_groups
+    )
+    args.rank_mixer_swiglu_groups = rank_mixer_swiglu_groups
 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision('high')
@@ -452,6 +499,8 @@ def main() -> None:
         "per_domain_seq_periodic_time_features": args.per_domain_seq_periodic_time_features,
         "reinit_seq_periodic_time_features": args.reinit_seq_periodic_time_features,
         "rank_mixer_mode": args.rank_mixer_mode,
+        "rank_mixer_swiglu_type": args.rank_mixer_swiglu_type,
+        "rank_mixer_swiglu_groups": rank_mixer_swiglu_groups,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
         "emb_skip_threshold": args.emb_skip_threshold,
@@ -534,6 +583,8 @@ def main() -> None:
     logging.info(
         f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
         f"rank_mixer_mode={args.rank_mixer_mode}, "
+        f"rank_mixer_swiglu_type={args.rank_mixer_swiglu_type}, "
+        f"rank_mixer_swiglu_groups={rank_mixer_swiglu_groups}, "
         f"user_token_dropout_rate={args.user_token_dropout_rate}, "
         f"seq_token_dropout_rate={args.seq_token_dropout_rate}"
     )

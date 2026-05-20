@@ -2,6 +2,7 @@
 
 import logging
 import math
+import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -334,12 +335,18 @@ class RankMixerBlock(nn.Module):
         n_total: int,  # T = Nq + Nns
         hidden_mult: int = 4,
         dropout: float = 0.0,
-        mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
+        mode: str = 'full',  # 'full' | 'ffn_only' | 'none'
+        swiglu_type: str = 'shared',  # 'shared' | 'per_token' | 'group'
+        swiglu_groups: Optional[List[List[int]]] = None,
+        query_token_count: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.T = n_total
         self.D = d_model
         self.mode = mode
+        if swiglu_type == 'pertoken':
+            swiglu_type = 'per_token'
+        self.swiglu_type = swiglu_type
 
         if mode == 'none':
             # Pure identity mapping, no submodules created
@@ -352,12 +359,98 @@ class RankMixerBlock(nn.Module):
                 )
             self.d_sub = d_model // n_total
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
-        self.norm = nn.RMSNorm(d_model)
-        self.value_proj = nn.Linear(d_model, d_model * hidden_mult)
-        self.gate_proj = nn.Linear(d_model, d_model * hidden_mult)
-        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
         self.dropout = nn.Dropout(dropout)
+
+        if swiglu_type not in {'shared', 'per_token', 'group'}:
+            raise ValueError(
+                f"Unknown RankMixer SwiGLU type: {swiglu_type}. "
+                "Expected one of: shared, per_token, group."
+            )
+
+        if swiglu_type == 'shared':
+            # Shared SwiGLU. Attribute names are kept checkpoint-compatible
+            # with the original RankMixerBlock implementation.
+            self.norm = nn.RMSNorm(d_model)
+            self.value_proj = nn.Linear(d_model, d_model * hidden_mult)
+            self.gate_proj = nn.Linear(d_model, d_model * hidden_mult)
+            self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
+        elif swiglu_type == 'per_token':
+            self.token_swiglus = nn.ModuleList([
+                nn.ModuleDict({
+                    'norm': nn.RMSNorm(d_model),
+                    'value_proj': nn.Linear(d_model, d_model * hidden_mult),
+                    'gate_proj': nn.Linear(d_model, d_model * hidden_mult),
+                    'fc2': nn.Linear(d_model * hidden_mult, d_model),
+                })
+                for _ in range(n_total)
+            ])
+        else:
+            self.swiglu_groups = self._resolve_swiglu_groups(
+                n_total=n_total,
+                swiglu_groups=swiglu_groups,
+                query_token_count=query_token_count,
+            )
+            self.group_swiglus = nn.ModuleList([
+                nn.ModuleDict({
+                    'norm': nn.RMSNorm(d_model),
+                    'value_proj': nn.Linear(d_model, d_model * hidden_mult),
+                    'gate_proj': nn.Linear(d_model, d_model * hidden_mult),
+                    'fc2': nn.Linear(d_model * hidden_mult, d_model),
+                })
+                for _ in self.swiglu_groups
+            ])
+
+    @staticmethod
+    def _resolve_swiglu_groups(
+        n_total: int,
+        swiglu_groups: Optional[List[List[int]]],
+        query_token_count: Optional[int],
+    ) -> List[List[int]]:
+        """Validate RankMixer SwiGLU token groups.
+
+        If groups are omitted, use a conservative role split:
+        all query tokens share one SwiGLU and all NS tokens share another.
+        """
+        if swiglu_groups == '':
+            swiglu_groups = None
+        elif isinstance(swiglu_groups, str):
+            text = swiglu_groups.strip()
+            if text.startswith('['):
+                swiglu_groups = json.loads(text)
+            else:
+                swiglu_groups = [
+                    [int(item.strip()) for item in group.split(',') if item.strip()]
+                    for group in text.split('|')
+                ]
+
+        if swiglu_groups is None:
+            q = int(query_token_count or 0)
+            groups: List[List[int]] = []
+            if q > 0:
+                groups.append(list(range(0, min(q, n_total))))
+            if q < n_total:
+                groups.append(list(range(max(q, 0), n_total)))
+            if not groups:
+                groups = [list(range(n_total))]
+        else:
+            groups = [[int(i) for i in group] for group in swiglu_groups]
+
+        flat = [idx for group in groups for idx in group]
+        expected = list(range(n_total))
+        if sorted(flat) != expected:
+            raise ValueError(
+                f"RankMixer SwiGLU groups must cover token indices 0..{n_total - 1} "
+                f"exactly once; got {groups}."
+            )
+        if any(len(group) == 0 for group in groups):
+            raise ValueError(f"RankMixer SwiGLU groups cannot be empty: {groups}")
+        return groups
+
+    @staticmethod
+    def _apply_swiglu(swiglu: nn.ModuleDict, x: torch.Tensor) -> torch.Tensor:
+        x = swiglu['norm'](x)
+        x = swiglu['value_proj'](x) * F.silu(swiglu['gate_proj'](x))
+        return swiglu['fc2'](x)
 
     def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
         """Performs parameter-free token mixing via reshape and transpose.
@@ -403,10 +496,21 @@ class RankMixerBlock(nn.Module):
         else:  # 'ffn_only'
             Q_hat = Q
 
-        # Per-token FFN
-        x = self.norm(Q_hat)
-        x = self.value_proj(x) * F.silu(self.gate_proj(x))
-        Q_e = self.fc2(x)
+        # SwiGLU. The original path uses shared weights across all tokens;
+        # per_token/group variants allocate separate weights per token/group.
+        if self.swiglu_type == 'shared':
+            x = self.norm(Q_hat)
+            x = self.value_proj(x) * F.silu(self.gate_proj(x))
+            Q_e = self.fc2(x)
+        elif self.swiglu_type == 'per_token':
+            Q_e = torch.stack([
+                self._apply_swiglu(swiglu, Q_hat[:, i, :])
+                for i, swiglu in enumerate(self.token_swiglus)
+            ], dim=1)
+        else:
+            Q_e = torch.empty_like(Q_hat)
+            for group, swiglu in zip(self.swiglu_groups, self.group_swiglus):
+                Q_e[:, group, :] = self._apply_swiglu(swiglu, Q_hat[:, group, :])
 
         # Residual from original Q
         Q_boost = Q + self.dropout(Q_e)
@@ -883,7 +987,9 @@ class MultiSeqHyFormerBlock(nn.Module):
         top_k: int = 50,
         causal: bool = False,
         longer_gather_side: str = 'head',
-        rank_mixer_mode: str = 'full'
+        rank_mixer_mode: str = 'full',
+        rank_mixer_swiglu_type: str = 'shared',
+        rank_mixer_swiglu_groups: Optional[List[List[int]]] = None,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -923,7 +1029,10 @@ class MultiSeqHyFormerBlock(nn.Module):
             n_total=n_total,
             hidden_mult=hidden_mult,
             dropout=dropout,
-            mode=rank_mixer_mode
+            mode=rank_mixer_mode,
+            swiglu_type=rank_mixer_swiglu_type,
+            swiglu_groups=rank_mixer_swiglu_groups,
+            query_token_count=num_queries * num_sequences,
         )
 
     def forward(
@@ -1424,6 +1533,8 @@ class PCVRHyFormer(nn.Module):
         per_domain_seq_periodic_time_features: bool = False,
         reinit_seq_periodic_time_features: bool = False,
         rank_mixer_mode: str = 'full',
+        rank_mixer_swiglu_type: str = 'shared',
+        rank_mixer_swiglu_groups: Optional[List[List[int]]] = None,
         use_rope: bool = False,
         rope_base: float = 10000.0,
         emb_skip_threshold: int = 0,
@@ -1476,6 +1587,8 @@ class PCVRHyFormer(nn.Module):
         self.per_domain_seq_periodic_time_features = per_domain_seq_periodic_time_features
         self.reinit_seq_periodic_time_features = reinit_seq_periodic_time_features
         self.rank_mixer_mode = rank_mixer_mode
+        self.rank_mixer_swiglu_type = rank_mixer_swiglu_type
+        self.rank_mixer_swiglu_groups = rank_mixer_swiglu_groups
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
@@ -1755,6 +1868,8 @@ class PCVRHyFormer(nn.Module):
                 causal=seq_causal,
                 longer_gather_side=seq_longer_gather_side,
                 rank_mixer_mode=rank_mixer_mode,
+                rank_mixer_swiglu_type=rank_mixer_swiglu_type,
+                rank_mixer_swiglu_groups=rank_mixer_swiglu_groups,
             )
             for _ in range(num_hyformer_blocks)
         ])

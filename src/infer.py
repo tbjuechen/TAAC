@@ -85,6 +85,8 @@ _FALLBACK_MODEL_CFG = {
     'per_domain_seq_periodic_time_features': False,
     'reinit_seq_periodic_time_features': False,
     'rank_mixer_mode': 'full',
+    'rank_mixer_swiglu_type': 'shared',
+    'rank_mixer_swiglu_groups': None,
     'use_rope': False,
     'rope_base': 10000.0,
     'emb_skip_threshold': 0,
