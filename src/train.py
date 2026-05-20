@@ -139,6 +139,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seq_token_dropout_rate', type=float, default=0.0,
                         help='Extra dropout applied only to sequence tokens '
                              'before the shared input dropout')
+    parser.add_argument('--seq_recency_token_dropout_rate', type=float, default=0.0,
+                        help='Max whole-token dropout rate for sequence tokens. '
+                             'Drop probability grows from recent to old positions.')
+    parser.add_argument('--seq_recency_token_dropout_min_rate', type=float, default=0.0,
+                        help='Min whole-token dropout rate for the most recent '
+                             'sequence token.')
+    parser.add_argument('--seq_recency_token_dropout_gamma', type=float, default=1.0,
+                        help='Shape parameter for recency token dropout. >1 keeps '
+                             'recent tokens safer and concentrates dropout on older '
+                             'positions.')
     parser.add_argument('--seq_top_k', type=int, default=50,
                         help='Number of most-recent tokens kept by LongerEncoder '
                              '(only effective when --seq_encoder_type=longer)')
@@ -325,6 +335,12 @@ def parse_args() -> argparse.Namespace:
             "are mutually exclusive")
     if not 0.0 <= args.label_smoothing < 0.5:
         parser.error("--label_smoothing must be in [0, 0.5)")
+    if not 0.0 <= args.seq_recency_token_dropout_min_rate <= args.seq_recency_token_dropout_rate < 1.0:
+        parser.error(
+            "--seq_recency_token_dropout must satisfy "
+            "0 <= min_rate <= rate < 1")
+    if args.seq_recency_token_dropout_gamma <= 0.0:
+        parser.error("--seq_recency_token_dropout_gamma must be > 0")
 
     return args
 
@@ -438,6 +454,9 @@ def main() -> None:
         "seq_longer_gather_side": args.longer_gather_side,
         "user_token_dropout_rate": args.user_token_dropout_rate,
         "seq_token_dropout_rate": args.seq_token_dropout_rate,
+        "seq_recency_token_dropout_rate": args.seq_recency_token_dropout_rate,
+        "seq_recency_token_dropout_min_rate": args.seq_recency_token_dropout_min_rate,
+        "seq_recency_token_dropout_gamma": args.seq_recency_token_dropout_gamma,
         "action_num": args.action_num,
         "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
         "per_domain_time_embeddings": args.per_domain_time_embeddings,
@@ -535,7 +554,10 @@ def main() -> None:
         f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, "
         f"rank_mixer_mode={args.rank_mixer_mode}, "
         f"user_token_dropout_rate={args.user_token_dropout_rate}, "
-        f"seq_token_dropout_rate={args.seq_token_dropout_rate}"
+        f"seq_token_dropout_rate={args.seq_token_dropout_rate}, "
+        f"seq_recency_token_dropout_rate={args.seq_recency_token_dropout_rate}, "
+        f"seq_recency_token_dropout_min_rate={args.seq_recency_token_dropout_min_rate}, "
+        f"seq_recency_token_dropout_gamma={args.seq_recency_token_dropout_gamma}"
     )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")

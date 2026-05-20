@@ -1414,6 +1414,9 @@ class PCVRHyFormer(nn.Module):
         seq_longer_gather_side: str = 'head',
         user_token_dropout_rate: float = 0.0,
         seq_token_dropout_rate: float = 0.0,
+        seq_recency_token_dropout_rate: float = 0.0,
+        seq_recency_token_dropout_min_rate: float = 0.0,
+        seq_recency_token_dropout_gamma: float = 1.0,
         action_num: int = 1,
         num_time_buckets: int = 65,
         per_domain_time_embeddings: bool = False,
@@ -1449,6 +1452,16 @@ class PCVRHyFormer(nn.Module):
         self.num_sequences = len(self.seq_domains)
         self.user_token_dropout_rate = user_token_dropout_rate
         self.seq_token_dropout_rate = seq_token_dropout_rate
+        if not 0.0 <= seq_recency_token_dropout_min_rate <= seq_recency_token_dropout_rate < 1.0:
+            raise ValueError(
+                "seq_recency_token_dropout must satisfy "
+                "0 <= min_rate <= rate < 1"
+            )
+        if seq_recency_token_dropout_gamma <= 0.0:
+            raise ValueError("seq_recency_token_dropout_gamma must be > 0")
+        self.seq_recency_token_dropout_rate = seq_recency_token_dropout_rate
+        self.seq_recency_token_dropout_min_rate = seq_recency_token_dropout_min_rate
+        self.seq_recency_token_dropout_gamma = seq_recency_token_dropout_gamma
         self.num_time_buckets = num_time_buckets
         self.per_domain_time_embeddings = per_domain_time_embeddings
         self.domain_time_residual_embeddings = domain_time_residual_embeddings
@@ -2029,6 +2042,53 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _apply_recency_token_dropout(
+        self,
+        seq_tokens: torch.Tensor,
+        padding_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Drop whole sequence tokens with a higher rate for older positions.
+
+        Sequences are reverse-time ordered, so position 0 is most recent. The
+        dropout rate follows:
+            p = p_min + (p_max - p_min) * (pos / (valid_len - 1)) ** gamma
+        Padding positions stay masked, and at least the most recent valid token
+        is kept for every non-empty sequence.
+        """
+        if (
+            not self.training
+            or self.seq_recency_token_dropout_rate <= 0.0
+            or seq_tokens.shape[1] == 0
+        ):
+            return seq_tokens, padding_mask
+
+        valid_mask = ~padding_mask
+        if not valid_mask.any():
+            return seq_tokens, padding_mask
+
+        B, L, _ = seq_tokens.shape
+        device = seq_tokens.device
+        valid_len = valid_mask.sum(dim=1)
+        denom = (valid_len - 1).clamp(min=1).to(seq_tokens.dtype).unsqueeze(1)
+        pos = torch.arange(L, device=device, dtype=seq_tokens.dtype).unsqueeze(0)
+        rel_pos = (pos / denom).clamp(0.0, 1.0)
+
+        p_min = self.seq_recency_token_dropout_min_rate
+        p_max = self.seq_recency_token_dropout_rate
+        drop_prob = p_min + (p_max - p_min) * (
+            rel_pos ** self.seq_recency_token_dropout_gamma
+        )
+        keep_mask = torch.rand(B, L, device=device) >= drop_prob
+        kept_valid = valid_mask & keep_mask
+
+        dropped_all = valid_mask.any(dim=1) & ~kept_valid.any(dim=1)
+        if dropped_all.any():
+            kept_valid[dropped_all, 0] = True
+
+        new_padding_mask = ~kept_valid
+        seq_tokens = seq_tokens * kept_valid.unsqueeze(-1).to(seq_tokens.dtype)
+        return seq_tokens, new_padding_mask
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -2134,6 +2194,16 @@ class PCVRHyFormer(nn.Module):
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
+
+        if self.seq_recency_token_dropout_rate > 0.0:
+            dropped_tokens = []
+            dropped_masks = []
+            for tokens, mask in zip(seq_tokens_list, seq_masks_list):
+                tokens, mask = self._apply_recency_token_dropout(tokens, mask)
+                dropped_tokens.append(tokens)
+                dropped_masks.append(mask)
+            seq_tokens_list = dropped_tokens
+            seq_masks_list = dropped_masks
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
