@@ -508,9 +508,16 @@ class RankMixerBlock(nn.Module):
                 for i, swiglu in enumerate(self.token_swiglus)
             ], dim=1)
         else:
-            Q_e = torch.empty_like(Q_hat)
+            Q_e = None
             for group, swiglu in zip(self.swiglu_groups, self.group_swiglus):
-                Q_e[:, group, :] = self._apply_swiglu(swiglu, Q_hat[:, group, :])
+                group_out = self._apply_swiglu(swiglu, Q_hat[:, group, :])
+                if Q_e is None:
+                    Q_e = torch.empty(
+                        Q_hat.shape,
+                        device=Q_hat.device,
+                        dtype=group_out.dtype,
+                    )
+                Q_e[:, group, :] = group_out
 
         # Residual from original Q
         Q_boost = Q + self.dropout(Q_e)
