@@ -1048,11 +1048,16 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
             int_feats: (B, total_int_dim), concatenated integer features.
+            dense_feats: Optional dense features. Unused by this tokenizer.
 
         Returns:
             Tokens of shape (B, num_groups, D).
@@ -1162,11 +1167,16 @@ class RankMixerNSTokenizer(nn.Module):
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
+            dense_feats: Optional dense features. Unused by this tokenizer.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1207,18 +1217,25 @@ class RankMixerNSTokenizer(nn.Module):
 
 
 class SplitUserIntNSTokenizer(nn.Module):
-    """User-int tokenizer with one selected-fid token plus RankMixer tokens."""
+    """User-int tokenizer with one selected-fid token plus RankMixer tokens.
+
+    For paired TAAC fids, the selected multi-value int features can be pooled
+    with learned gates generated from same-fid dense values. Gate layers are
+    zero-initialized, so the initial behavior matches mean pooling.
+    """
 
     def __init__(
         self,
         feature_specs: List[Tuple[int, int, int]],
         feature_ids: List[int],
         special_fids: List[int],
+        dense_feature_specs: Optional[List[Tuple[int, int, int]]],
         groups: List[List[int]],
         emb_dim: int,
         d_model: int,
         num_regular_tokens: int,
         emb_skip_threshold: int = 0,
+        time_fids: Optional[List[int]] = None,
     ) -> None:
         super().__init__()
         self.feature_specs = feature_specs
@@ -1230,9 +1247,17 @@ class SplitUserIntNSTokenizer(nn.Module):
 
         fid_to_idx = {fid: idx for idx, fid in enumerate(feature_ids)}
         self.special_indices = [fid_to_idx[fid] for fid in special_fids]
+        self.time_indices = [
+            fid_to_idx[fid] for fid in (time_fids or []) if fid in fid_to_idx
+        ]
         special_index_set = set(self.special_indices)
+        time_index_set = set(self.time_indices)
+        self._fid_by_index = {idx: fid for fid, idx in fid_to_idx.items()}
         self.regular_groups = [
-            [fid_idx for fid_idx in group if fid_idx not in special_index_set]
+            [
+                fid_idx for fid_idx in group
+                if fid_idx not in special_index_set and fid_idx not in time_index_set
+            ]
             for group in groups
         ]
         self.regular_groups = [group for group in self.regular_groups if group]
@@ -1254,6 +1279,31 @@ class SplitUserIntNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
+        dense_fid_to_spec = {
+            fid: (offset, length)
+            for fid, offset, length in (dense_feature_specs or [])
+        }
+        self._dense_gate_specs = {}
+        self.dense_gates = nn.ModuleDict()
+        for fid_idx in self.special_indices:
+            fid = self._fid_by_index[fid_idx]
+            _, _, int_length = self.feature_specs[fid_idx]
+            dense_spec = dense_fid_to_spec.get(fid)
+            if dense_spec is None:
+                continue
+            dense_offset, dense_length = dense_spec
+            if dense_length != int_length:
+                logging.warning(
+                    f"SplitUserIntNSTokenizer: skip dense gate for fid={fid}, "
+                    f"int_length={int_length} != dense_length={dense_length}"
+                )
+                continue
+            gate = nn.Linear(dense_length, dense_length)
+            nn.init.zeros_(gate.weight)
+            nn.init.zeros_(gate.bias)
+            self.dense_gates[str(fid)] = gate
+            self._dense_gate_specs[fid_idx] = (dense_offset, dense_length, str(fid))
+
         special_dim = len(self.special_indices) * emb_dim
         self.special_proj = nn.Sequential(
             nn.Linear(special_dim, d_model * 2),
@@ -1261,6 +1311,12 @@ class SplitUserIntNSTokenizer(nn.Module):
             nn.Linear(d_model * 2, d_model),
             nn.LayerNorm(d_model),
         )
+        self.time_proj = None
+        if self.time_indices:
+            self.time_proj = nn.Sequential(
+                nn.Linear(len(self.time_indices) * emb_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
 
         total_regular_fids = sum(len(g) for g in self.regular_groups)
         total_regular_dim = total_regular_fids * emb_dim
@@ -1277,12 +1333,19 @@ class SplitUserIntNSTokenizer(nn.Module):
 
         logging.info(
             f"SplitUserIntNSTokenizer: special_fids={special_fids}, "
+            f"time_fids={time_fids or []}, "
             f"regular_fids={total_regular_fids}, special_dim={special_dim}, "
             f"regular_chunk_dim={self.chunk_dim}, regular_tokens={num_regular_tokens}, "
+            f"dense_gated_fids={sorted(self.dense_gates.keys())}, "
             f"pad={self._pad_size}"
         )
 
-    def _embed_feature(self, int_feats: torch.Tensor, fid_idx: int) -> torch.Tensor:
+    def _embed_feature(
+        self,
+        int_feats: torch.Tensor,
+        fid_idx: int,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         vs, offset, length = self.feature_specs[fid_idx]
         emb_real_idx = self._emb_index[fid_idx]
         if emb_real_idx == -1:
@@ -1295,17 +1358,40 @@ class SplitUserIntNSTokenizer(nn.Module):
         vals = int_feats[:, offset:offset + length].long()
         emb_all = emb_layer(vals)
         mask = (vals != 0).float().unsqueeze(-1)
+        if dense_feats is not None and fid_idx in self._dense_gate_specs:
+            dense_offset, dense_length, gate_key = self._dense_gate_specs[fid_idx]
+            dense_vals = dense_feats[:, dense_offset:dense_offset + dense_length]
+            gates = torch.sigmoid(self.dense_gates[gate_key](dense_vals)).unsqueeze(-1)
+            weights = gates * mask
+            weight_sum = weights.sum(dim=1).clamp(min=1e-6)
+            return (emb_all * weights).sum(dim=1) / weight_sum
+
         count = mask.sum(dim=1).clamp(min=1)
         return (emb_all * mask).sum(dim=1) / count
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        int_feats: torch.Tensor,
+        dense_feats: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         special_embs = [
-            self._embed_feature(int_feats, fid_idx)
+            self._embed_feature(int_feats, fid_idx, dense_feats=dense_feats)
             for fid_idx in self.special_indices
         ]
         special_token = F.silu(
             self.special_proj(torch.cat(special_embs, dim=-1))
         ).unsqueeze(1)
+
+        tokens = [special_token]
+        if self.time_proj is not None:
+            time_embs = [
+                self._embed_feature(int_feats, fid_idx)
+                for fid_idx in self.time_indices
+            ]
+            time_token = F.silu(
+                self.time_proj(torch.cat(time_embs, dim=-1))
+            ).unsqueeze(1)
+            tokens.append(time_token)
 
         regular_embs = []
         for group in self.regular_groups:
@@ -1320,7 +1406,7 @@ class SplitUserIntNSTokenizer(nn.Module):
         for chunk, proj in zip(cat_emb.split(self.chunk_dim, dim=-1), self.token_projs):
             regular_tokens.append(F.silu(proj(chunk)).unsqueeze(1))
 
-        return torch.cat([special_token] + regular_tokens, dim=1)
+        return torch.cat(tokens + regular_tokens, dim=1)
 
 
 class DenseGroupProjector(nn.Module):
@@ -1434,6 +1520,7 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         split_user_int_shared_fids: bool = False,
         use_dense_group_projector: bool = False,
+        use_pair_feature_gate_layout: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1510,13 +1597,30 @@ class PCVRHyFormer(nn.Module):
             if item_ns_tokens <= 0:
                 item_ns_tokens = len(item_ns_groups)
             split_user_int_fids = [62, 63, 64, 65, 66, 89, 90, 91]
+            user_time_fids = [900001, 900002]
             user_int_fid_set = set(user_int_feature_ids or [])
-            if (split_user_int_shared_fids and user_ns_tokens > 1
+            if (use_pair_feature_gate_layout
+                    and set(split_user_int_fids + user_time_fids).issubset(user_int_fid_set)
+                    and user_ns_tokens >= 3):
+                self.user_ns_tokenizer = SplitUserIntNSTokenizer(
+                    feature_specs=user_int_feature_specs,
+                    feature_ids=user_int_feature_ids or [],
+                    special_fids=split_user_int_fids,
+                    dense_feature_specs=user_dense_feature_specs,
+                    groups=user_ns_groups,
+                    emb_dim=emb_dim,
+                    d_model=d_model,
+                    num_regular_tokens=user_ns_tokens - 2,
+                    emb_skip_threshold=emb_skip_threshold,
+                    time_fids=user_time_fids,
+                )
+            elif (split_user_int_shared_fids and user_ns_tokens > 1
                     and set(split_user_int_fids).issubset(user_int_fid_set)):
                 self.user_ns_tokenizer = SplitUserIntNSTokenizer(
                     feature_specs=user_int_feature_specs,
                     feature_ids=user_int_feature_ids or [],
                     special_fids=split_user_int_fids,
+                    dense_feature_specs=user_dense_feature_specs,
                     groups=user_ns_groups,
                     emb_dim=emb_dim,
                     d_model=d_model,
@@ -1524,7 +1628,13 @@ class PCVRHyFormer(nn.Module):
                     emb_skip_threshold=emb_skip_threshold,
                 )
             else:
-                if split_user_int_shared_fids:
+                if use_pair_feature_gate_layout:
+                    logging.warning(
+                        "use_pair_feature_gate_layout is enabled but the expected "
+                        "TAAC user-int fids are unavailable or user_ns_tokens < 3; "
+                        "falling back to baseline RankMixer user-int tokenizer."
+                    )
+                elif split_user_int_shared_fids:
                     logging.warning(
                         "split_user_int_shared_fids is enabled but the expected "
                         "TAAC user-int fids are unavailable or user_ns_tokens <= 1; "
@@ -1558,10 +1668,18 @@ class PCVRHyFormer(nn.Module):
         if self.has_user_dense:
             dense_heat_group = [61, 89, 90]
             dense_profile_group = [62, 63, 64, 65, 66, 87, 91]
+            dense_remaining_group = [61, 87]
             dense_fids = {
                 fid for fid, _, _ in (user_dense_feature_specs or [])
             }
-            if (use_dense_group_projector
+            if (use_pair_feature_gate_layout
+                    and set(dense_remaining_group).issubset(dense_fids)):
+                self.user_dense_proj = DenseGroupProjector(
+                    feature_specs=user_dense_feature_specs or [],
+                    groups=[dense_remaining_group],
+                    d_model=d_model,
+                )
+            elif (use_dense_group_projector
                     and set(dense_heat_group + dense_profile_group).issubset(dense_fids)):
                 self.user_dense_proj = DenseGroupProjector(
                     feature_specs=user_dense_feature_specs or [],
@@ -1569,7 +1687,13 @@ class PCVRHyFormer(nn.Module):
                     d_model=d_model,
                 )
             else:
-                if use_dense_group_projector:
+                if use_pair_feature_gate_layout:
+                    logging.warning(
+                        "use_pair_feature_gate_layout is enabled but user dense "
+                        "fid 61/87 are unavailable; falling back to a single "
+                        "dense NS token over all user dense features."
+                    )
+                elif use_dense_group_projector:
                     logging.warning(
                         "use_dense_group_projector is enabled but the expected "
                         "TAAC dense fids are unavailable; falling back to a "
@@ -2096,7 +2220,10 @@ class PCVRHyFormer(nn.Module):
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats,
+            inputs.user_dense_feats,
+        )   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
 
         ns_parts = [user_ns]
@@ -2147,7 +2274,10 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        user_ns = self.user_ns_tokenizer(
+            inputs.user_int_feats,
+            inputs.user_dense_feats,
+        )
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
 
         ns_parts = [user_ns]

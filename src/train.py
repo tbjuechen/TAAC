@@ -311,6 +311,12 @@ def parse_args() -> argparse.Namespace:
                         help='Project TAAC user dense features into two tokens: '
                              'fid 61/89/90 and fid 62/63/64/65/66/87/91. '
                              'When disabled, use the baseline single dense token.')
+    parser.add_argument('--use_pair_feature_gate_layout', action='store_true',
+                        help='Use the paired-feature gate experiment layout: '
+                             'user-int fids 62-66/89-91 as one gated token, '
+                             'user time fids as one token, remaining user-int '
+                             'features split across the other user NS tokens, '
+                             'and user-dense fids 61/87 as the only dense token.')
 
     args = parser.parse_args()
 
@@ -461,6 +467,7 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "split_user_int_shared_fids": args.split_user_int_shared_fids,
         "use_dense_group_projector": args.use_dense_group_projector,
+        "use_pair_feature_gate_layout": args.use_pair_feature_gate_layout,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
