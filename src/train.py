@@ -181,6 +181,16 @@ def parse_args() -> argparse.Namespace:
                              'head = newest top_k tokens (correct semantic, default), '
                              'tail = oldest top_k tokens (legacy bugged behavior, kept for A/B). '
                              '(only effective when --seq_encoder_type=longer)')
+    parser.add_argument('--seq_semilocal_causal', action='store_true', default=False,
+                        help='Enable reverse-time causal semilocal attention in '
+                             'TransformerEncoder sequence blocks. Sequences are stored '
+                             'with pos 0 = newest, so each token attends only to itself '
+                             'and older positions.')
+    parser.add_argument('--seq_semilocal_recent_window', type=int, default=256,
+                        help='Dense recent/local window size for --seq_semilocal_causal.')
+    parser.add_argument('--seq_semilocal_old_stride', type=int, default=64,
+                        help='Stride for sparse old-history keys beyond the recent '
+                             'window when --seq_semilocal_causal is enabled.')
     parser.add_argument('--action_num', type=int, default=1,
                         help='Classifier output dimension '
                              '(1 = single binary-classification logit; >1 = multi-label)')
@@ -483,6 +493,9 @@ def main() -> None:
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "seq_longer_gather_side": args.longer_gather_side,
+        "seq_semilocal_causal": args.seq_semilocal_causal,
+        "seq_semilocal_recent_window": args.seq_semilocal_recent_window,
+        "seq_semilocal_old_stride": args.seq_semilocal_old_stride,
         "user_token_dropout_rate": args.user_token_dropout_rate,
         "seq_token_dropout_rate": args.seq_token_dropout_rate,
         "action_num": args.action_num,

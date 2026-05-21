@@ -664,9 +664,23 @@ class TransformerEncoder(nn.Module):
         d_model: int,
         num_heads: int,
         hidden_mult: int = 4,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        semilocal_causal: bool = False,
+        semilocal_recent_window: int = 256,
+        semilocal_old_stride: int = 64,
     ) -> None:
         super().__init__()
+        if semilocal_recent_window <= 0:
+            raise ValueError(
+                f"semilocal_recent_window must be positive, got {semilocal_recent_window}"
+            )
+        if semilocal_old_stride <= 0:
+            raise ValueError(
+                f"semilocal_old_stride must be positive, got {semilocal_old_stride}"
+            )
+        self.semilocal_causal = semilocal_causal
+        self.semilocal_recent_window = semilocal_recent_window
+        self.semilocal_old_stride = semilocal_old_stride
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -685,6 +699,30 @@ class TransformerEncoder(nn.Module):
             nn.Linear(hidden_dim, d_model),
             nn.Dropout(dropout)
         )
+
+    def _build_semilocal_causal_mask(self, L: int, device: torch.device) -> torch.Tensor:
+        """Build a reverse-time causal mask with recent-dense and old-sparse keys.
+
+        TAAC sequences are stored in reverse-time order: position 0 is the most
+        recent event, and larger positions are older. Causality therefore means
+        a query at position i may attend only to keys j >= i.
+        """
+        idx = torch.arange(L, device=device)
+        q = idx.unsqueeze(1)
+        k = idx.unsqueeze(0)
+        distance = k - q
+
+        reverse_causal = distance >= 0
+        local = distance < self.semilocal_recent_window
+        recent_block = (q < self.semilocal_recent_window) & (k < self.semilocal_recent_window)
+        old_sparse = (
+            (k >= self.semilocal_recent_window)
+            & ((k - self.semilocal_recent_window) % self.semilocal_old_stride == 0)
+        )
+        allow = reverse_causal & (local | recent_block | old_sparse)
+
+        attn_mask = torch.zeros((L, L), device=device)
+        return attn_mask.masked_fill(~allow, float("-inf"))
 
     def forward(
         self,
@@ -707,11 +745,15 @@ class TransformerEncoder(nn.Module):
         # Self-Attention (Pre-LN) with RoPE
         residual = x
         x = self.norm1(x)
+        attn_mask = None
+        if self.semilocal_causal:
+            attn_mask = self._build_semilocal_causal_mask(x.shape[1], x.device)
         x, _ = self.self_attn(
             query=x,
             key=x,
             value=x,
             key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
         )
@@ -940,6 +982,9 @@ def create_sequence_encoder(
     top_k: int = 50,
     causal: bool = False,
     gather_side: str = 'head',
+    semilocal_causal: bool = False,
+    semilocal_recent_window: int = 256,
+    semilocal_old_stride: int = 64,
 ) -> nn.Module:
     """Creates a sequence encoder of the specified type.
 
@@ -961,7 +1006,15 @@ def create_sequence_encoder(
     if encoder_type == 'swiglu':
         return SwiGLUEncoder(d_model, hidden_mult, dropout)
     elif encoder_type == 'transformer':
-        return TransformerEncoder(d_model, num_heads, hidden_mult, dropout)
+        return TransformerEncoder(
+            d_model,
+            num_heads,
+            hidden_mult,
+            dropout,
+            semilocal_causal=semilocal_causal,
+            semilocal_recent_window=semilocal_recent_window,
+            semilocal_old_stride=semilocal_old_stride,
+        )
     elif encoder_type == 'longer':
         return LongerEncoder(d_model, num_heads, top_k, hidden_mult, dropout, causal, gather_side)
     else:
@@ -994,6 +1047,9 @@ class MultiSeqHyFormerBlock(nn.Module):
         top_k: int = 50,
         causal: bool = False,
         longer_gather_side: str = 'head',
+        semilocal_causal: bool = False,
+        semilocal_recent_window: int = 256,
+        semilocal_old_stride: int = 64,
         rank_mixer_mode: str = 'full',
         rank_mixer_swiglu_type: str = 'shared',
         rank_mixer_swiglu_groups: Optional[List[List[int]]] = None,
@@ -1014,6 +1070,9 @@ class MultiSeqHyFormerBlock(nn.Module):
                 top_k=top_k,
                 causal=causal,
                 gather_side=longer_gather_side,
+                semilocal_causal=semilocal_causal,
+                semilocal_recent_window=semilocal_recent_window,
+                semilocal_old_stride=semilocal_old_stride,
             )
             for _ in range(num_sequences)
         ])
@@ -1524,6 +1583,9 @@ class PCVRHyFormer(nn.Module):
         seq_top_k: int = 50,
         seq_causal: bool = False,
         seq_longer_gather_side: str = 'head',
+        seq_semilocal_causal: bool = False,
+        seq_semilocal_recent_window: int = 256,
+        seq_semilocal_old_stride: int = 64,
         user_token_dropout_rate: float = 0.0,
         seq_token_dropout_rate: float = 0.0,
         action_num: int = 1,
@@ -1874,6 +1936,9 @@ class PCVRHyFormer(nn.Module):
                 top_k=seq_top_k,
                 causal=seq_causal,
                 longer_gather_side=seq_longer_gather_side,
+                semilocal_causal=seq_semilocal_causal,
+                semilocal_recent_window=seq_semilocal_recent_window,
+                semilocal_old_stride=seq_semilocal_old_stride,
                 rank_mixer_mode=rank_mixer_mode,
                 rank_mixer_swiglu_type=rank_mixer_swiglu_type,
                 rank_mixer_swiglu_groups=rank_mixer_swiglu_groups,
