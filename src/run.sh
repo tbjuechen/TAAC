@@ -27,8 +27,9 @@ REINIT_SEQ_PERIODIC_TIME="${REINIT_SEQ_PERIODIC_TIME:-0}"
 TIME_BUCKET_BOUNDARIES="${TIME_BUCKET_BOUNDARIES:-hybrid_v1}"
 EMA_DECAY="${EMA_DECAY:-0.999}"
 LABEL_SMOOTHING="${LABEL_SMOOTHING:-0.05}"
-RANK_MIXER_SWIGLU_TYPE="${RANK_MIXER_SWIGLU_TYPE:-shared}"
+RANK_MIXER_SWIGLU_TYPE="${RANK_MIXER_SWIGLU_TYPE:-per_token}"
 RANK_MIXER_SWIGLU_GROUPS="${RANK_MIXER_SWIGLU_GROUPS:-}"
+DENSE_WEIGHT_DECAY="${DENSE_WEIGHT_DECAY:-0.02}"
 
 D_MODEL="${D_MODEL:-64}"
 NUM_HYFORMER_BLOCKS="${NUM_HYFORMER_BLOCKS:-2}"
@@ -48,6 +49,7 @@ echo "[run.sh] TIME_BUCKET_BOUNDARIES=${TIME_BUCKET_BOUNDARIES}"
 echo "[run.sh] LABEL_SMOOTHING=${LABEL_SMOOTHING}"
 echo "[run.sh] RANK_MIXER_SWIGLU_TYPE=${RANK_MIXER_SWIGLU_TYPE}"
 echo "[run.sh] RANK_MIXER_SWIGLU_GROUPS=${RANK_MIXER_SWIGLU_GROUPS}"
+echo "[run.sh] DENSE_WEIGHT_DECAY=${DENSE_WEIGHT_DECAY}"
 
 python3 -u -c "import json; src='${SOURCE_MAP}'; out='${OUT_MAP}'; keep={'seq_a:38','seq_b:74','seq_b:76','seq_b:88','seq_c:34','seq_d:22'}; d=json.load(open(src)); d['targets']={k:v for k,v in d['targets'].items() if k in keep}; assert set(d['targets'])==keep, set(d['targets']); json.dump(d, open(out,'w'), ensure_ascii=False, separators=(',',':')); print('TOPK_RESCUE_COUNT100_6TARGETS_DONE '+json.dumps({'out_json':out,'num_targets':len(d['targets']),'targets':sorted(d['targets']),'embedding_rows_sum':sum(int(v.get('vocab_size_for_model',v.get('default_id',0))) for v in d['targets'].values())},ensure_ascii=False,separators=(',',':')), flush=True)"
 
@@ -68,6 +70,7 @@ EXTRA_FLAGS="${EXTRA_FLAGS} --time_bucket_boundaries ${TIME_BUCKET_BOUNDARIES}"
 [ "${LABEL_SMOOTHING}" != "0" ] && [ "${LABEL_SMOOTHING}" != "0.0" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --label_smoothing ${LABEL_SMOOTHING}"
 EXTRA_FLAGS="${EXTRA_FLAGS} --rank_mixer_swiglu_type ${RANK_MIXER_SWIGLU_TYPE}"
 [ -n "${RANK_MIXER_SWIGLU_GROUPS}" ] && EXTRA_FLAGS="${EXTRA_FLAGS} --rank_mixer_swiglu_groups ${RANK_MIXER_SWIGLU_GROUPS}"
+EXTRA_FLAGS="${EXTRA_FLAGS} --dense_weight_decay ${DENSE_WEIGHT_DECAY}"
 
 echo "[run.sh] start training"
 
