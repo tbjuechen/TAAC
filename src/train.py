@@ -352,6 +352,10 @@ def parse_args() -> argparse.Namespace:
                         help='Project TAAC user dense features into two tokens: '
                              'fid 61/89/90 and fid 62/63/64/65/66/87/91. '
                              'When disabled, use the baseline single dense token.')
+    parser.add_argument('--use_din', action='store_true',
+                        help='Use a DIN-style item-conditioned history readout '
+                             'for the final prediction representation instead '
+                             'of the legacy flattened query-token projection.')
 
     args = parser.parse_args()
 
@@ -510,6 +514,7 @@ def main() -> None:
         "item_ns_tokens": args.item_ns_tokens,
         "split_user_int_shared_fids": args.split_user_int_shared_fids,
         "use_dense_group_projector": args.use_dense_group_projector,
+        "use_din": args.use_din,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -586,7 +591,8 @@ def main() -> None:
         f"rank_mixer_swiglu_type={args.rank_mixer_swiglu_type}, "
         f"rank_mixer_swiglu_groups={rank_mixer_swiglu_groups}, "
         f"user_token_dropout_rate={args.user_token_dropout_rate}, "
-        f"seq_token_dropout_rate={args.seq_token_dropout_rate}"
+        f"seq_token_dropout_rate={args.seq_token_dropout_rate}, "
+        f"use_din={args.use_din}"
     )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")

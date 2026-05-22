@@ -1552,6 +1552,7 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         split_user_int_shared_fids: bool = False,
         use_dense_group_projector: bool = False,
+        use_din: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1600,6 +1601,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_din = use_din
 
         # ================== NS Tokens Construction ==================
 
@@ -1717,6 +1719,11 @@ class PCVRHyFormer(nn.Module):
 
         # Total NS token count
         self.num_user_tokens = num_user_ns + self.user_dense_num_tokens
+        self.num_item_tokens = num_item_ns + self.item_dense_num_tokens
+        self.user_token_start = 0
+        self.user_token_end = self.num_user_tokens
+        self.item_token_start = self.user_token_end
+        self.item_token_end = self.item_token_start + self.num_item_tokens
         self.num_ns = (num_user_ns + self.user_dense_num_tokens
                        + num_item_ns + self.item_dense_num_tokens)
         if use_time_summary_features:
@@ -1894,6 +1901,22 @@ class PCVRHyFormer(nn.Module):
             nn.LayerNorm(d_model),
         )
 
+        if self.use_din:
+            self.readout_query_norm = nn.LayerNorm(d_model)
+            self.readout_memory_norm = nn.LayerNorm(d_model)
+            self.readout_query = nn.Linear(d_model, d_model, bias=False)
+            self.readout_key = nn.Linear(d_model, d_model, bias=False)
+            self.readout_value = nn.Linear(d_model, d_model, bias=False)
+            self.readout_merge = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+            )
+            classifier_in_dim = d_model * 3
+        else:
+            classifier_in_dim = d_model
+
         # Dropout
         self.emb_dropout = nn.Dropout(dropout_rate)
         self.user_token_dropout = nn.Dropout(user_token_dropout_rate)
@@ -1901,7 +1924,7 @@ class PCVRHyFormer(nn.Module):
 
         # Classifier
         self.clsfier = nn.Sequential(
-            nn.Linear(d_model, d_model),
+            nn.Linear(classifier_in_dim, d_model),
             nn.LayerNorm(d_model),
             nn.SiLU(),
             nn.Dropout(dropout_rate),
@@ -2153,9 +2176,14 @@ class PCVRHyFormer(nn.Module):
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
-        apply_dropout: bool = True
-    ) -> torch.Tensor:
-        """Runs the multi-sequence block stack with dropout and output projection."""
+        apply_dropout: bool = True,
+        expose_tokens: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, list, list]]:
+        """Runs the multi-sequence block stack.
+
+        By default this returns the legacy Q-token projection. The optional
+        token-return path is used by the DIN-style readout branch.
+        """
         if apply_dropout:
             if self.user_token_dropout_rate > 0 and self.num_user_tokens > 0:
                 user_tokens = self.user_token_dropout(
@@ -2202,6 +2230,9 @@ class PCVRHyFormer(nn.Module):
                 rope_sin_list=rope_sin_list,
             )
 
+        if expose_tokens:
+            return curr_ns, curr_seqs, curr_masks
+
         # Output: concatenate all sequences' Q tokens then project via MLP
         B = curr_qs[0].shape[0]
         all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
@@ -2214,6 +2245,54 @@ class PCVRHyFormer(nn.Module):
         if isinstance(self.user_dense_proj, DenseGroupProjector):
             return self.user_dense_proj(user_dense_feats)
         return F.silu(self.user_dense_proj(user_dense_feats)).unsqueeze(1)
+
+    def _mean_token_range(
+        self, tokens: torch.Tensor, start: int, end: int
+    ) -> torch.Tensor:
+        if end <= start:
+            return tokens.new_zeros(tokens.shape[0], self.d_model)
+        return tokens[:, start:end, :].mean(dim=1)
+
+    def _read_sequence_memory(
+        self,
+        item_context: torch.Tensor,
+        seq_tokens_list: list,
+        seq_masks_list: list,
+    ) -> torch.Tensor:
+        memory = torch.cat(seq_tokens_list, dim=1)
+        memory_mask = torch.cat(seq_masks_list, dim=1)
+
+        query = self.readout_query(
+            self.readout_query_norm(item_context)
+        ).unsqueeze(1)
+        keys = self.readout_key(self.readout_memory_norm(memory))
+        values = self.readout_value(memory)
+
+        score = torch.bmm(query, keys.transpose(1, 2)) / math.sqrt(self.d_model)
+        score = score.masked_fill(memory_mask.unsqueeze(1), -1e4)
+        weight = F.softmax(score, dim=-1)
+        weight = weight.masked_fill(memory_mask.unsqueeze(1), 0.0)
+        weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        history_context = torch.bmm(weight, values).squeeze(1)
+        return self.readout_merge(history_context)
+
+    def _build_readout_features(
+        self,
+        ns_tokens: torch.Tensor,
+        seq_tokens_list: list,
+        seq_masks_list: list,
+    ) -> torch.Tensor:
+        user_context = self._mean_token_range(
+            ns_tokens, self.user_token_start, self.user_token_end
+        )
+        item_context = self._mean_token_range(
+            ns_tokens, self.item_token_start, self.item_token_end
+        )
+        history_context = self._read_sequence_memory(
+            item_context, seq_tokens_list, seq_masks_list
+        )
+        return torch.cat([user_context, item_context, history_context], dim=-1)
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
@@ -2256,11 +2335,19 @@ class PCVRHyFormer(nn.Module):
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
-        output = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=self.training
-        )
+        # 4. Dropout + MultiSeqHyFormerBlock stack + final representation
+        if self.use_din:
+            curr_ns, curr_seqs, curr_masks = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=self.training,
+                expose_tokens=True,
+            )
+            output = self._build_readout_features(curr_ns, curr_seqs, curr_masks)
+        else:
+            output = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=self.training
+            )
 
         # 5. Classifier
         logits = self.clsfier(output)  # (B, action_num)
@@ -2305,10 +2392,18 @@ class PCVRHyFormer(nn.Module):
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
-        output = self._run_multi_seq_blocks(
-            q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=False
-        )
+        if self.use_din:
+            curr_ns, curr_seqs, curr_masks = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=False,
+                expose_tokens=True,
+            )
+            output = self._build_readout_features(curr_ns, curr_seqs, curr_masks)
+        else:
+            output = self._run_multi_seq_blocks(
+                q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+                apply_dropout=False
+            )
 
         logits = self.clsfier(output)
         return logits, output

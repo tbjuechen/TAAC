@@ -96,6 +96,7 @@ _FALLBACK_MODEL_CFG = {
     'item_ns_tokens': 0,
     'split_user_int_shared_fids': False,
     'use_dense_group_projector': False,
+    'use_din': False,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -188,6 +189,17 @@ def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
                 logging.warning(
                     f"train_config missing both 'num_delta_buckets' and 'use_delta_buckets', "
                     f"using fallback = {cfg[key]}")
+            continue
+        if key == 'use_din':
+            if 'use_din' in train_config:
+                cfg[key] = train_config['use_din']
+            elif 'use_item_history_readout' in train_config:
+                cfg[key] = train_config['use_item_history_readout']
+            else:
+                cfg[key] = _FALLBACK_MODEL_CFG[key]
+                logging.warning(
+                    f"train_config missing both 'use_din' and "
+                    f"'use_item_history_readout', using fallback = {cfg[key]}")
             continue
 
         if key in train_config:
