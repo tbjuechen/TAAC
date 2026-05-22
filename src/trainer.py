@@ -85,9 +85,15 @@ class PCVRHyFormerRankingTrainer:
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
+        ema_param_names = None
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
             dense_params = model.get_dense_params()
+            dense_param_ptrs = {p.data_ptr() for p in dense_params}
+            ema_param_names = {
+                name for name, param in model.named_parameters()
+                if param.requires_grad and param.data_ptr() in dense_param_ptrs
+            }
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
@@ -130,8 +136,14 @@ class PCVRHyFormerRankingTrainer:
         )
         self.ema: Optional[ModelEMA] = None
         if ema_decay > 0.0:
-            self.ema = ModelEMA(model, decay=ema_decay)
-            logging.info(f"EMA enabled: decay={ema_decay}")
+            self.ema = ModelEMA(model, decay=ema_decay, param_names=ema_param_names)
+            if ema_param_names is None:
+                logging.info(f"EMA enabled: decay={ema_decay}")
+            else:
+                logging.info(
+                    f"EMA enabled for dense params only: decay={ema_decay}, "
+                    f"tracked_tensors={len(ema_param_names)}"
+                )
         else:
             logging.info("EMA disabled")
 

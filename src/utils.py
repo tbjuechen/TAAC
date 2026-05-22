@@ -4,7 +4,7 @@ import copy
 import logging
 import time
 from datetime import timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 
 import numpy as np
 import torch
@@ -240,20 +240,31 @@ class ModelEMA:
     the optimizer continues updating the live model weights.
     """
 
-    def __init__(self, model: nn.Module, decay: float = 0.999) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.999,
+        param_names: Optional[Set[str]] = None,
+    ) -> None:
         if not 0.0 < decay < 1.0:
             raise ValueError(f"EMA decay must be in (0, 1), got {decay}")
         self.decay = decay
+        self.param_names = param_names
         self.shadow: Dict[str, torch.Tensor] = {}
         self.backup: Dict[str, torch.Tensor] = {}
         for name, param in model.named_parameters():
-            if param.requires_grad:
+            if self._should_track(name, param):
                 self.shadow[name] = param.detach().clone()
+
+    def _should_track(self, name: str, param: nn.Parameter) -> bool:
+        if not param.requires_grad:
+            return False
+        return self.param_names is None or name in self.param_names
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
         for name, param in model.named_parameters():
-            if not param.requires_grad:
+            if not self._should_track(name, param):
                 continue
             if name not in self.shadow:
                 self.shadow[name] = param.detach().clone()
@@ -287,7 +298,7 @@ class ModelEMA:
                 omitted, all tracked parameters are refreshed.
         """
         for name, param in model.named_parameters():
-            if not param.requires_grad:
+            if not self._should_track(name, param):
                 continue
             if param_ptrs is not None and param.data_ptr() not in param_ptrs:
                 continue
