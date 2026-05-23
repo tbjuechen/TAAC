@@ -356,6 +356,9 @@ def parse_args() -> argparse.Namespace:
                         help='Use a DIN-style item-conditioned history readout '
                              'for the final prediction representation instead '
                              'of the legacy flattened query-token projection.')
+    parser.add_argument('--din_attention_dropout_rate', type=float, default=0.0,
+                        help='Dropout rate applied to DIN attention weights '
+                             'after softmax; effective only with --use_din.')
 
     args = parser.parse_args()
 
@@ -370,6 +373,8 @@ def parse_args() -> argparse.Namespace:
             "are mutually exclusive")
     if not 0.0 <= args.label_smoothing < 0.5:
         parser.error("--label_smoothing must be in [0, 0.5)")
+    if not 0.0 <= args.din_attention_dropout_rate < 1.0:
+        parser.error("--din_attention_dropout_rate must be in [0, 1)")
 
     return args
 
@@ -515,6 +520,7 @@ def main() -> None:
         "split_user_int_shared_fids": args.split_user_int_shared_fids,
         "use_dense_group_projector": args.use_dense_group_projector,
         "use_din": args.use_din,
+        "din_attention_dropout_rate": args.din_attention_dropout_rate,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -592,7 +598,8 @@ def main() -> None:
         f"rank_mixer_swiglu_groups={rank_mixer_swiglu_groups}, "
         f"user_token_dropout_rate={args.user_token_dropout_rate}, "
         f"seq_token_dropout_rate={args.seq_token_dropout_rate}, "
-        f"use_din={args.use_din}"
+        f"use_din={args.use_din}, "
+        f"din_attention_dropout_rate={args.din_attention_dropout_rate}"
     )
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")

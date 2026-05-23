@@ -97,6 +97,7 @@ _FALLBACK_MODEL_CFG = {
     'split_user_int_shared_fids': False,
     'use_dense_group_projector': False,
     'use_din': False,
+    'din_attention_dropout_rate': 0.0,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

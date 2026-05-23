@@ -1553,6 +1553,7 @@ class PCVRHyFormer(nn.Module):
         split_user_int_shared_fids: bool = False,
         use_dense_group_projector: bool = False,
         use_din: bool = False,
+        din_attention_dropout_rate: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -1602,6 +1603,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_din = use_din
+        self.din_attention_dropout_rate = din_attention_dropout_rate
 
         # ================== NS Tokens Construction ==================
 
@@ -1907,6 +1909,7 @@ class PCVRHyFormer(nn.Module):
             self.readout_query = nn.Linear(d_model, d_model, bias=False)
             self.readout_key = nn.Linear(d_model, d_model, bias=False)
             self.readout_value = nn.Linear(d_model, d_model, bias=False)
+            self.readout_weight_dropout = nn.Dropout(din_attention_dropout_rate)
             self.readout_merge = nn.Sequential(
                 nn.Linear(d_model, d_model),
                 nn.LayerNorm(d_model),
@@ -2272,6 +2275,7 @@ class PCVRHyFormer(nn.Module):
         score = score.masked_fill(memory_mask.unsqueeze(1), -1e4)
         weight = F.softmax(score, dim=-1)
         weight = weight.masked_fill(memory_mask.unsqueeze(1), 0.0)
+        weight = self.readout_weight_dropout(weight)
         weight = weight / weight.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         history_context = torch.bmm(weight, values).squeeze(1)
