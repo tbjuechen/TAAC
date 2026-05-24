@@ -9,7 +9,7 @@ import math
 import glob
 import shutil
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,41 @@ class PCVRHyFormerRankingTrainer:
     Loss: BCEWithLogitsLoss or Focal Loss.
     Metrics: BinaryAUROC + binary logloss.
     """
+
+    @staticmethod
+    def _build_dense_adamw_param_groups(
+        model: nn.Module,
+        dense_params: List[nn.Parameter],
+        dense_weight_decay: float,
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
+        """Split dense AdamW params so LayerNorm weights/biases get no decay."""
+        layer_norm_param_ptrs = {
+            param.data_ptr()
+            for module in model.modules()
+            if isinstance(module, nn.LayerNorm)
+            for param in module.parameters(recurse=False)
+        }
+
+        decay_params: List[nn.Parameter] = []
+        no_decay_params: List[nn.Parameter] = []
+        for param in dense_params:
+            if param.data_ptr() in layer_norm_param_ptrs:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+        param_groups: List[Dict[str, Any]] = []
+        if decay_params:
+            param_groups.append({
+                'params': decay_params,
+                'weight_decay': dense_weight_decay,
+            })
+        if no_decay_params:
+            param_groups.append({
+                'params': no_decay_params,
+                'weight_decay': 0.0,
+            })
+        return param_groups, len(no_decay_params), sum(p.numel() for p in no_decay_params)
 
     def __init__(
         self,
@@ -96,18 +131,27 @@ class PCVRHyFormerRankingTrainer:
             }
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
+            dense_param_groups, ln_param_tensors, ln_param_count = self._build_dense_adamw_param_groups(
+                model, dense_params, dense_weight_decay
+            )
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
             logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr}, wd={dense_weight_decay})")
+            logging.info(f"Dense LayerNorm no-decay params: {ln_param_tensors} tensors, {ln_param_count:,} parameters")
             self.sparse_optimizer = torch.optim.Adagrad(
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
             self.dense_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-                dense_params, lr=lr, betas=(0.9, 0.98), weight_decay=dense_weight_decay
+                dense_param_groups, lr=lr, betas=(0.9, 0.98)
             )
         else:
             self.sparse_optimizer = None
+            dense_params = list(model.parameters())
+            dense_param_groups, ln_param_tensors, ln_param_count = self._build_dense_adamw_param_groups(
+                model, dense_params, dense_weight_decay
+            )
+            logging.info(f"Dense LayerNorm no-decay params: {ln_param_tensors} tensors, {ln_param_count:,} parameters")
             self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98), weight_decay=dense_weight_decay
+                dense_param_groups, lr=lr, betas=(0.9, 0.98)
             )
 
         self.num_epochs: int = num_epochs
